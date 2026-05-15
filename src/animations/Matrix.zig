@@ -94,10 +94,30 @@ fn lerpColor(a: u32, b: u32, t: f32) u32 {
     const b_r: f32 = @floatFromInt((b >> 16) & 0xFF);
     const b_g: f32 = @floatFromInt((b >> 8) & 0xFF);
     const b_b: f32 = @floatFromInt(b & 0xFF);
-    const r: u32 = @intFromFloat(a_r + t_clamped * (b_r - a_r));
-    const g: u32 = @intFromFloat(a_g + t_clamped * (b_g - a_g));
-    const bl: u32 = @intFromFloat(a_b + t_clamped * (b_b - a_b));
+    const r_raw: f32 = a_r + t_clamped * (b_r - a_r);
+    const g_raw: f32 = a_g + t_clamped * (b_g - a_g);
+    const b_raw: f32 = a_b + t_clamped * (b_b - a_b);
+    // Snap each channel onto the 256-color cube ladder (0, 95, 135, 175,
+    // 215, 255). Doing this in-house gives a guaranteed-distinct ramp on
+    // the Linux VT framebuffer, whose console driver collapses many
+    // 24-bit values to the same palette index. With raw lerp we'd often
+    // see only two visible shades (full and "the other one"); snapping
+    // forces six discrete stops that the framebuffer reliably renders.
+    const r: u32 = snapToCube(r_raw);
+    const g: u32 = snapToCube(g_raw);
+    const bl: u32 = snapToCube(b_raw);
     return (a & 0xFF000000) | (r << 16) | (g << 8) | bl;
+}
+
+fn snapToCube(v: f32) u32 {
+    const clamped: f32 = if (v < 0) 0 else if (v > 255) 255 else v;
+    // Boundaries chosen as midpoints between cube stops.
+    if (clamped < 47.5) return 0;
+    if (clamped < 115) return 95;
+    if (clamped < 155) return 135;
+    if (clamped < 195) return 175;
+    if (clamped < 235) return 215;
+    return 255;
 }
 
 pub fn widget(self: *Matrix) *Widget {

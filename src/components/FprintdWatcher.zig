@@ -43,6 +43,13 @@ pub const Callbacks = struct {
     /// watcher tears down its subprocess so it doesn't race the in-PAM
     /// fprintd module.
     is_auth_busy: *const fn (ctx: *anyopaque) bool,
+    /// Returns Ly's owning VT number. The watcher pauses its subprocess
+    /// when the kernel's active VT (/sys/class/tty/tty0/active) doesn't
+    /// match — otherwise an accidental finger touch from another TTY
+    /// would trigger autologin against an inactive VT, which logind
+    /// rejects with "VirtualTerminalAlreadyTaken" and which also wastes
+    /// the user's swipe.
+    get_my_vt: *const fn (ctx: *anyopaque) u8,
     ctx: *anyopaque,
 };
 
@@ -103,6 +110,31 @@ fn calculateTimeout(_: *FprintdWatcher, _: *anyopaque) !?usize {
     return POLL_INTERVAL_MS;
 }
 
+/// Compare the kernel's current active VT (`/sys/class/tty/tty0/active`,
+/// e.g. "tty1\n") against the VT this Ly instance was bound to.
+fn activeVtMatchesMine(self: *FprintdWatcher) bool {
+    const my_vt = self.callbacks.get_my_vt(self.callbacks.ctx);
+
+    var buf: [16]u8 = undefined;
+    const fd_raw = std.posix.system.open("/sys/class/tty/tty0/active", .{ .ACCMODE = .RDONLY }, @as(std.posix.mode_t, 0));
+    if (fd_raw < 0) return true; // can't tell — assume ours
+    const fd: i32 = @intCast(fd_raw);
+    defer _ = std.posix.system.close(fd);
+
+    const n_raw = std.posix.system.read(fd, &buf, buf.len);
+    if (n_raw <= 0) return true;
+    const n: usize = @intCast(n_raw);
+    const raw = buf[0..n];
+    // strip trailing newline / whitespace
+    var end: usize = raw.len;
+    while (end > 0 and (raw[end - 1] == '\n' or raw[end - 1] == ' ')) end -= 1;
+    const active = raw[0..end];
+    // active looks like "tty1" — pull digits.
+    if (active.len < 4 or !std.mem.eql(u8, active[0..3], "tty")) return true;
+    const active_num = std.fmt.parseInt(u8, active[3..], 10) catch return true;
+    return active_num == my_vt;
+}
+
 fn nowUs() i64 {
     const t = interop.getTimeOfDay() catch return 0;
     return @as(i64, @intCast(t.seconds)) * std.time.us_per_s + @as(i64, @intCast(t.microseconds));
@@ -111,6 +143,16 @@ fn nowUs() i64 {
 fn update(self: *FprintdWatcher, _: *anyopaque) !void {
     // Host-side auth in progress — stand down so we don't fight for the sensor.
     if (self.callbacks.is_auth_busy(self.callbacks.ctx)) {
+        self.stop();
+        return;
+    }
+
+    // Only listen for swipes while we're the visible VT. Otherwise a
+    // finger brush would consume the swipe (fprintd-verify pulls one
+    // event per invocation) and on success trigger an autologin path
+    // against a non-active VT, which logind rejects with
+    // "VirtualTerminalAlreadyTaken".
+    if (!self.activeVtMatchesMine()) {
         self.stop();
         return;
     }

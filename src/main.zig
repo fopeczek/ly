@@ -654,6 +654,7 @@ pub fn main(init: std.process.Init) !void {
         .get_user = &fprintdGetUser,
         .trigger_autologin = &fprintdTriggerAutologin,
         .is_auth_busy = &fprintdIsBusy,
+        .get_my_vt = &fprintdGetMyVt,
         .ctx = @ptrCast(&state),
     });
     defer state.fprintd_watcher.deinit();
@@ -1398,6 +1399,11 @@ fn fprintdIsBusy(ctx: *anyopaque) bool {
     return state.auth_busy;
 }
 
+fn fprintdGetMyVt(ctx: *anyopaque) u8 {
+    const state: *UiState = @ptrCast(@alignCast(ctx));
+    return state.active_tty;
+}
+
 fn fprintdTriggerAutologin(ctx: *anyopaque) anyerror!void {
     const state: *UiState = @ptrCast(@alignCast(ctx));
     // Make sure we don't recurse if `authenticate` triggers another
@@ -1422,6 +1428,12 @@ fn pamMessageCallback(msg: [*c]const u8, kind: auth.PamMsgKind, ctx: ?*anyopaque
     if (msg == null) return;
     const msg_slice = std.mem.span(@as([*:0]const u8, @ptrCast(msg)));
     if (msg_slice.len == 0) return;
+
+    // Skip info messages (TEXT_INFO) when the user has typed a password —
+    // pam_fprintd's "Place your finger" prompt is just noise on a manual
+    // password submit. Errors still surface so the user sees real failures.
+    if (kind == .info and state.password.text.items.len > 0) return;
+
     // Dupe — PAM frees the original after convo returns.
     const owned = state.allocator.dupe(u8, msg_slice) catch return;
     const bg = if (kind == .err) state.config.error_bg else state.config.bg;
