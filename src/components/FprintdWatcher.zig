@@ -50,6 +50,13 @@ pub const Callbacks = struct {
     /// rejects with "VirtualTerminalAlreadyTaken" and which also wastes
     /// the user's swipe.
     get_my_vt: *const fn (ctx: *anyopaque) u8,
+    /// Called when the kernel's active VT transitions to ours (the user
+    /// just Ctrl+Alt+Fn'd back to us). The host should mark its
+    /// TerminalBuffer dirty so it fully redraws — Linux's framebuffer
+    /// console doesn't preserve 24-bit color attributes across VT
+    /// switches, so cells that we wrote in green can come back gray
+    /// until we paint them again.
+    on_vt_acquired: *const fn (ctx: *anyopaque) void,
     ctx: *anyopaque,
 };
 
@@ -65,6 +72,7 @@ pid: ?std.posix.pid_t = null,
 current_user_owned: ?[:0]u8 = null,
 consecutive_failures: u8 = 0,
 backoff_until_us: ?i64 = null,
+vt_was_mine: bool = true,
 
 pub fn init(allocator: Allocator, callbacks: Callbacks) FprintdWatcher {
     return .{
@@ -152,7 +160,15 @@ fn update(self: *FprintdWatcher, _: *anyopaque) !void {
     // event per invocation) and on success trigger an autologin path
     // against a non-active VT, which logind rejects with
     // "VirtualTerminalAlreadyTaken".
-    if (!self.activeVtMatchesMine()) {
+    const vt_mine_now = self.activeVtMatchesMine();
+    if (!self.vt_was_mine and vt_mine_now) {
+        // VT-focus transition false→true: the user just switched back
+        // to us. Force a full redraw so post-switch gray cells get
+        // overwritten with the proper green.
+        self.callbacks.on_vt_acquired(self.callbacks.ctx);
+    }
+    self.vt_was_mine = vt_mine_now;
+    if (!vt_mine_now) {
         self.stop();
         return;
     }

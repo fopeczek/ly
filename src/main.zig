@@ -655,6 +655,7 @@ pub fn main(init: std.process.Init) !void {
         .trigger_autologin = &fprintdTriggerAutologin,
         .is_auth_busy = &fprintdIsBusy,
         .get_my_vt = &fprintdGetMyVt,
+        .on_vt_acquired = &fprintdOnVtAcquired,
         .ctx = @ptrCast(&state),
     });
     defer state.fprintd_watcher.deinit();
@@ -1402,6 +1403,14 @@ fn fprintdIsBusy(ctx: *anyopaque) bool {
 fn fprintdGetMyVt(ctx: *anyopaque) u8 {
     const state: *UiState = @ptrCast(@alignCast(ctx));
     return state.active_tty;
+}
+
+fn fprintdOnVtAcquired(ctx: *anyopaque) void {
+    const state: *UiState = @ptrCast(@alignCast(ctx));
+    // Force the event loop to redraw the next iteration; clearScreen +
+    // widget.draw will overwrite the stale-gray cells the framebuffer
+    // restored on VT-switch-in.
+    state.buffer.drawNextFrame(true);
 }
 
 fn fprintdTriggerAutologin(ctx: *anyopaque) anyerror!void {
