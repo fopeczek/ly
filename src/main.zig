@@ -31,6 +31,7 @@ const GameOfLife = @import("animations/GameOfLife.zig");
 const Matrix = @import("animations/Matrix.zig");
 const auth = @import("auth.zig");
 const InfoLine = @import("components/InfoLine.zig");
+const FprintdWatcher = @import("components/FprintdWatcher.zig");
 const Session = @import("components/Session.zig");
 const UserList = @import("components/UserList.zig");
 const Config = @import("config/Config.zig");
@@ -125,6 +126,8 @@ const UiState = struct {
     bigclock_buf: [32:0]u8,
     custom_binds: std.ArrayList(CustomBindLabel),
     custom_info: std.ArrayList(CustomInfoLabel),
+    fprintd_watcher: FprintdWatcher,
+    auth_busy: bool,
 };
 
 var shutdown = false;
@@ -633,6 +636,15 @@ pub fn main(init: std.process.Init) !void {
 
     try state.buffer.registerKeybind(state.io, &state.info_line.label.keybinds, "H", &viGoLeft, &state);
     try state.buffer.registerKeybind(state.io, &state.info_line.label.keybinds, "L", &viGoRight, &state);
+
+    state.auth_busy = false;
+    state.fprintd_watcher = FprintdWatcher.init(state.allocator, .{
+        .get_user = &fprintdGetUser,
+        .trigger_autologin = &fprintdTriggerAutologin,
+        .is_auth_busy = &fprintdIsBusy,
+        .ctx = @ptrCast(&state),
+    });
+    defer state.fprintd_watcher.deinit();
 
     if (maybe_res == null) {
         var longest = diag.name.longest();
@@ -1244,6 +1256,10 @@ pub fn main(init: std.process.Init) !void {
         try layer2.append(state.allocator, state.capslock_label.widget());
     }
     try layer2.append(state.allocator, state.box.widget());
+    // Invisible widget that polls fprintd-verify and trips autologin on
+    // a successful swipe. Must be in a drawable layer so its update()
+    // gets the ~250 ms poll cadence from the event loop.
+    try layer2.append(state.allocator, state.fprintd_watcher.widget());
     try layer2.append(state.allocator, info_line_widget);
     try layer2.append(state.allocator, state.session_specifier_label.widget());
     try layer2.append(state.allocator, session_widget);
@@ -1351,6 +1367,39 @@ fn maxWidths(labels: [][]const u8) usize {
     }
 
     return max_width;
+}
+
+// ──── FprintdWatcher host callbacks ─────────────────────────────────
+//
+// These three functions plug FprintdWatcher into UiState. They're at
+// file scope (rather than as methods) because Widget.init takes
+// comptime function pointers, so capturing state via a closure isn't
+// available.
+
+fn fprintdGetUser(ctx: *anyopaque) []const u8 {
+    const state: *UiState = @ptrCast(@alignCast(ctx));
+    return state.login.getCurrentUsername();
+}
+
+fn fprintdIsBusy(ctx: *anyopaque) bool {
+    const state: *UiState = @ptrCast(@alignCast(ctx));
+    return state.auth_busy;
+}
+
+fn fprintdTriggerAutologin(ctx: *anyopaque) anyerror!void {
+    const state: *UiState = @ptrCast(@alignCast(ctx));
+    // Make sure we don't recurse if `authenticate` triggers another
+    // event-loop tick that re-enters this callback before auth_busy is set.
+    if (state.auth_busy) return;
+
+    // Override the service_name + autologin flag for one auth pass so
+    // /etc/pam.d/ly-autologin (pam_permit) runs in place of /etc/pam.d/ly.
+    // No password is needed; the fprintd-verify subprocess already
+    // proved the user has a valid finger.
+    const prev_autologin = state.is_autologin;
+    state.is_autologin = true;
+    defer state.is_autologin = prev_autologin;
+    _ = try authenticate(@ptrCast(state));
 }
 
 // Relay pam_fprintd / pam_unix info+error messages from PAM's conversation
@@ -1479,6 +1528,12 @@ fn customCommand(ptr: *anyopaque) !bool {
 
 fn authenticate(ptr: *anyopaque) !bool {
     var state: *UiState = @ptrCast(@alignCast(ptr));
+
+    // Mark auth busy so FprintdWatcher.update tears down its bg subprocess
+    // (otherwise it'd race the in-PAM pam_fprintd module for the sensor).
+    state.auth_busy = true;
+    state.fprintd_watcher.stop();
+    defer state.auth_busy = false;
 
     try state.log_file.info(state.io, "auth", "starting authentication", .{});
 
