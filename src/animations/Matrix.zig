@@ -207,35 +207,55 @@ fn draw(self: *Matrix) void {
         }
     }
 
+    // Stack-allocated buffer for per-column head positions. A column can
+    // host multiple concurrent trails; without per-cell head lookup the
+    // fade gets the wrong reference point and cells in lower trails
+    // render as full fg (the "bright bottom row" complaint).
+    var heads_buf: [512]usize = undefined;
+
     var x: usize = 0;
     while (x < buf_width) : (x += 2) {
-        // Pre-scan: locate the head for this column (if any) for trail-fade.
-        var head_y: ?usize = null;
+        // Pre-scan all heads in this column (top-to-bottom == ascending y).
+        var heads_count: usize = 0;
         if (self.tail_fade) {
             var sy: usize = 1;
             while (sy <= buf_height) : (sy += 1) {
-                if (self.dots[buf_width * sy + x].is_head) {
-                    head_y = sy;
-                    break;
+                if (self.dots[buf_width * sy + x].is_head and heads_count < heads_buf.len) {
+                    heads_buf[heads_count] = sy;
+                    heads_count += 1;
                 }
             }
         }
+        const heads = heads_buf[0..heads_count];
+        var head_idx: usize = 0;
 
         var y: usize = 1;
         while (y <= buf_height) : (y += 1) {
+            // Advance to the first head >= current y. That's THIS cell's trail head.
+            while (head_idx < heads.len and heads[head_idx] < y) head_idx += 1;
+
             const dot = self.dots[buf_width * y + x];
             const cell = if (dot.value == null or dot.value == ' ') self.default_cell else cell_blk: {
                 const fg_color: u32 = blk: {
-                    if (dot.is_head) break :blk self.head_col;
-                    if (!self.tail_fade) break :blk self.fg;
-                    const hy = head_y orelse break :blk self.fg;
-                    // Tail extends UP from head (smaller y). Cells below head shouldn't exist for active trails.
-                    if (y >= hy) break :blk self.fg;
+                    if (!self.tail_fade) {
+                        // Classic cmatrix: bright head, uniform trail.
+                        if (dot.is_head) break :blk self.head_col;
+                        break :blk self.fg;
+                    }
+                    // tail_fade: smooth gradient from fg at head down to bg at
+                    // tail end. head_col ignored — a discrete white pop on
+                    // the head breaks the smoothness.
+                    if (head_idx >= heads.len) break :blk self.fg;
+                    const hy = heads[head_idx];
                     const distance = hy - y;
-                    // Fade across the configured column length so tails look uniform.
                     const tail_len = self.lines[x].length;
                     const denom: f32 = if (tail_len == 0) 1 else @floatFromInt(tail_len);
-                    const t = @as(f32, @floatFromInt(distance)) / denom;
+                    // Quadratic ease-out: stays bright near the head, then
+                    // ramps down quickly. Helps the visible fade on the
+                    // linux VT (whose color palette quantizes hard near
+                    // black so a linear ramp looks stepped).
+                    const lin = @as(f32, @floatFromInt(distance)) / denom;
+                    const t = lin * lin;
                     break :blk lerpColor(self.fg, self.terminal_buffer.bg, t);
                 };
                 break :cell_blk Cell{

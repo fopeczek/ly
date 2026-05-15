@@ -1615,7 +1615,7 @@ fn authenticate(ptr: *anyopaque) !bool {
                 state.login.getCurrentUsername(),
                 password_text,
                 pamMessageCallback,
-                @ptrCast(&state),
+                @ptrCast(state),
             ) catch |err| {
                 shared_err.writeError(err);
 
