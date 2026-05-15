@@ -426,6 +426,18 @@ pub fn main(init: std.process.Init) !void {
     };
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 
+    // Ignore SIGINT — keystroke Ctrl+C would otherwise drop the user out of
+    // the greeter onto a bare console with no way back in. ly@tty1 has
+    // TTYVHangup=yes so a fresh start would need a service restart.
+    const sigint_ignore = std.posix.Sigaction{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &sigint_ignore, null);
+    std.posix.sigaction(std.posix.SIG.QUIT, &sigint_ignore, null);
+    std.posix.sigaction(std.posix.SIG.TSTP, &sigint_ignore, null);
+
     // Initialize components
     state.shutdown_label = Label.init(
         "",

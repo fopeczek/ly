@@ -245,17 +245,20 @@ fn draw(self: *Matrix) void {
                     // tail_fade: smooth gradient from fg at head down to bg at
                     // tail end. head_col ignored — a discrete white pop on
                     // the head breaks the smoothness.
-                    if (head_idx >= heads.len) break :blk self.fg;
+                    // Orphan cell (its trail's head has scrolled off-screen).
+                    // Render as fully faded — these are the oldest cells of
+                    // a dying trail, so they should already be invisible.
+                    if (head_idx >= heads.len) break :blk self.terminal_buffer.bg;
                     const hy = heads[head_idx];
                     const distance = hy - y;
                     const tail_len = self.lines[x].length;
                     const denom: f32 = if (tail_len == 0) 1 else @floatFromInt(tail_len);
-                    // Quadratic ease-out: stays bright near the head, then
-                    // ramps down quickly. Helps the visible fade on the
-                    // linux VT (whose color palette quantizes hard near
-                    // black so a linear ramp looks stepped).
-                    const lin = @as(f32, @floatFromInt(distance)) / denom;
-                    const t = lin * lin;
+                    // Linear interpolation along the trail. With 24-bit
+                    // truecolor enabled (full_color=true, default) the kernel
+                    // TTY does render intermediate shades — quadratic
+                    // easing made the fade too concentrated at the very
+                    // top of the trail; linear gives a more visible ramp.
+                    const t = @as(f32, @floatFromInt(distance)) / denom;
                     break :blk lerpColor(self.fg, self.terminal_buffer.bg, t);
                 };
                 break :cell_blk Cell{
