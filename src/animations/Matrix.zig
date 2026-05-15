@@ -45,6 +45,7 @@ animate: *bool,
 timeout_sec: u12,
 frame_delay: u16,
 default_cell: Cell,
+tail_fade: bool,
 
 pub fn init(
     allocator: Allocator,
@@ -56,6 +57,7 @@ pub fn init(
     animate: *bool,
     timeout_sec: u12,
     frame_delay: u16,
+    tail_fade: bool,
 ) !Matrix {
     const dots = try allocator.alloc(Dot, terminal_buffer.width * (terminal_buffer.height + 1));
     const lines = try allocator.alloc(Line, terminal_buffer.width);
@@ -79,7 +81,23 @@ pub fn init(
         .timeout_sec = timeout_sec,
         .frame_delay = frame_delay,
         .default_cell = .{ .ch = ' ', .fg = fg, .bg = terminal_buffer.bg },
+        .tail_fade = tail_fade,
     };
+}
+
+// Linear interpolation between two RGBA-ish u32 colors. Preserves alpha/styling byte from `a`.
+fn lerpColor(a: u32, b: u32, t: f32) u32 {
+    const t_clamped: f32 = if (t < 0) 0 else if (t > 1) 1 else t;
+    const a_r: f32 = @floatFromInt((a >> 16) & 0xFF);
+    const a_g: f32 = @floatFromInt((a >> 8) & 0xFF);
+    const a_b: f32 = @floatFromInt(a & 0xFF);
+    const b_r: f32 = @floatFromInt((b >> 16) & 0xFF);
+    const b_g: f32 = @floatFromInt((b >> 8) & 0xFF);
+    const b_b: f32 = @floatFromInt(b & 0xFF);
+    const r: u32 = @intFromFloat(a_r + t_clamped * (b_r - a_r));
+    const g: u32 = @intFromFloat(a_g + t_clamped * (b_g - a_g));
+    const bl: u32 = @intFromFloat(a_b + t_clamped * (b_b - a_b));
+    return (a & 0xFF000000) | (r << 16) | (g << 8) | bl;
 }
 
 pub fn widget(self: *Matrix) *Widget {
@@ -191,13 +209,40 @@ fn draw(self: *Matrix) void {
 
     var x: usize = 0;
     while (x < buf_width) : (x += 2) {
+        // Pre-scan: locate the head for this column (if any) for trail-fade.
+        var head_y: ?usize = null;
+        if (self.tail_fade) {
+            var sy: usize = 1;
+            while (sy <= buf_height) : (sy += 1) {
+                if (self.dots[buf_width * sy + x].is_head) {
+                    head_y = sy;
+                    break;
+                }
+            }
+        }
+
         var y: usize = 1;
         while (y <= buf_height) : (y += 1) {
             const dot = self.dots[buf_width * y + x];
-            const cell = if (dot.value == null or dot.value == ' ') self.default_cell else Cell{
-                .ch = @intCast(dot.value.?),
-                .fg = if (dot.is_head) self.head_col else self.fg,
-                .bg = self.terminal_buffer.bg,
+            const cell = if (dot.value == null or dot.value == ' ') self.default_cell else cell_blk: {
+                const fg_color: u32 = blk: {
+                    if (dot.is_head) break :blk self.head_col;
+                    if (!self.tail_fade) break :blk self.fg;
+                    const hy = head_y orelse break :blk self.fg;
+                    // Tail extends UP from head (smaller y). Cells below head shouldn't exist for active trails.
+                    if (y >= hy) break :blk self.fg;
+                    const distance = hy - y;
+                    // Fade across the configured column length so tails look uniform.
+                    const tail_len = self.lines[x].length;
+                    const denom: f32 = if (tail_len == 0) 1 else @floatFromInt(tail_len);
+                    const t = @as(f32, @floatFromInt(distance)) / denom;
+                    break :blk lerpColor(self.fg, self.terminal_buffer.bg, t);
+                };
+                break :cell_blk Cell{
+                    .ch = @intCast(dot.value.?),
+                    .fg = fg_color,
+                    .bg = self.terminal_buffer.bg,
+                };
             };
 
             cell.put(x, y - 1);

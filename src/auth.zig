@@ -36,7 +36,40 @@ pub fn sessionSignalHandler(sig: std.posix.SIG) callconv(.c) void {
     if (child_pid > 0) _ = std.c.kill(child_pid, sig);
 }
 
-pub fn authenticate(allocator: std.mem.Allocator, io: std.Io, log_file: *LogFile, options: AuthOptions, current_environment: Environment, login: []const u8, password: []const u8) !void {
+// Kind of message the PAM convo wants to show the user. Used to route
+// pam_fprintd's "Place finger on the sensor" (info) and any module's
+// error messages back into Ly's info_line.
+pub const PamMsgKind = enum(c_int) {
+    info = 0,
+    err = 1,
+};
+
+// Callback signature for relaying PAM_TEXT_INFO / PAM_ERROR_MSG payloads
+// out of loginConv to Ly's UI layer.  `msg` is owned by PAM and will be
+// freed once the convo returns, so the receiver must dupe the string if
+// it needs to outlive the call.
+pub const PamMsgCallback = ?*const fn (msg: [*c]const u8, kind: PamMsgKind, ctx: ?*anyopaque) callconv(.c) void;
+
+// Layout matches what loginConv expects. Stays internal but is referenced
+// by `authenticate` to build the appdata blob handed to PAM.
+const ConvAppdata = extern struct {
+    username: ?[*:0]const u8,
+    password: ?[*:0]const u8,
+    msg_cb: PamMsgCallback,
+    msg_ctx: ?*anyopaque,
+};
+
+pub fn authenticate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    log_file: *LogFile,
+    options: AuthOptions,
+    current_environment: Environment,
+    login: []const u8,
+    password: []const u8,
+    msg_cb: PamMsgCallback,
+    msg_ctx: ?*anyopaque,
+) !void {
     var tty_buffer: [3]u8 = undefined;
     const tty_str = try std.fmt.bufPrint(&tty_buffer, "{d}", .{options.tty});
 
@@ -55,11 +88,16 @@ pub fn authenticate(allocator: std.mem.Allocator, io: std.Io, log_file: *LogFile
     const password_z = try allocator.dupeZ(u8, password);
     defer allocator.free(password_z);
 
-    var credentials = [_:null]?[*:0]const u8{ login_z, password_z };
+    var appdata = ConvAppdata{
+        .username = login_z.ptr,
+        .password = password_z.ptr,
+        .msg_cb = msg_cb,
+        .msg_ctx = msg_ctx,
+    };
 
     const conv = interop.pam.pam_conv{
         .conv = loginConv,
-        .appdata_ptr = @ptrCast(&credentials),
+        .appdata_ptr = @ptrCast(&appdata),
     };
     var handle: ?*interop.pam.pam_handle = undefined;
 
@@ -281,27 +319,35 @@ fn loginConv(
     var password: ?[:0]u8 = null;
     var status: c_int = interop.pam.PAM_SUCCESS;
 
+    const appdata: *ConvAppdata = @ptrCast(@alignCast(appdata_ptr));
+
     for (0..message_count) |i| set_credentials: {
         switch (messages[i].?.msg_style) {
             interop.pam.PAM_PROMPT_ECHO_ON => {
-                const data: [*][*:0]u8 = @ptrCast(@alignCast(appdata_ptr));
-                username = allocator.dupeZ(u8, std.mem.span(data[0])) catch {
+                const user_ptr = appdata.username orelse break :set_credentials;
+                username = allocator.dupeZ(u8, std.mem.span(user_ptr)) catch {
                     status = interop.pam.PAM_BUF_ERR;
                     break :set_credentials;
                 };
                 response[i].resp = username.?;
             },
             interop.pam.PAM_PROMPT_ECHO_OFF => {
-                const data: [*][*:0]u8 = @ptrCast(@alignCast(appdata_ptr));
-                password = allocator.dupeZ(u8, std.mem.span(data[1])) catch {
+                const pass_ptr = appdata.password orelse break :set_credentials;
+                password = allocator.dupeZ(u8, std.mem.span(pass_ptr)) catch {
                     status = interop.pam.PAM_BUF_ERR;
                     break :set_credentials;
                 };
                 response[i].resp = password.?;
             },
+            // Surface info / error messages to the UI (e.g. pam_fprintd's
+            // "Place your finger on the sensor"). Without this Ly's
+            // greeter silently dropped them and fingerprint auth gave no
+            // feedback.
+            interop.pam.PAM_TEXT_INFO => {
+                if (appdata.msg_cb) |cb| cb(messages[i].?.msg, .info, appdata.msg_ctx);
+            },
             interop.pam.PAM_ERROR_MSG => {
-                status = interop.pam.PAM_CONV_ERR;
-                break :set_credentials;
+                if (appdata.msg_cb) |cb| cb(messages[i].?.msg, .err, appdata.msg_ctx);
             },
             else => {},
         }

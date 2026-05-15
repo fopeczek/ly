@@ -1052,6 +1052,7 @@ pub fn main(init: std.process.Init) !void {
                 &state.animate,
                 state.config.animation_timeout_sec,
                 state.config.animation_frame_delay,
+                state.config.cmatrix_tail_fade,
             );
             animation = matrix.widget();
         },
@@ -1352,6 +1353,24 @@ fn maxWidths(labels: [][]const u8) usize {
     return max_width;
 }
 
+// Relay pam_fprintd / pam_unix info+error messages from PAM's conversation
+// callback into the info_line. Runs in the auth child process, so any
+// allocations made here die with the child — no need to free.
+fn pamMessageCallback(msg: [*c]const u8, kind: auth.PamMsgKind, ctx: ?*anyopaque) callconv(.c) void {
+    const state: *UiState = @ptrCast(@alignCast(ctx orelse return));
+    if (msg == null) return;
+    const msg_slice = std.mem.span(@as([*:0]const u8, @ptrCast(msg)));
+    if (msg_slice.len == 0) return;
+    // Dupe — PAM frees the original after convo returns.
+    const owned = state.allocator.dupe(u8, msg_slice) catch return;
+    const bg = if (kind == .err) state.config.error_bg else state.config.bg;
+    const fg = if (kind == .err) state.config.error_fg else state.config.fg;
+    state.info_line.addMessage(owned, bg, fg) catch return;
+    state.info_line.clearRendered(state.allocator) catch {};
+    state.info_line.label.draw();
+    TerminalBuffer.presentBuffer();
+}
+
 fn uiErrorHandler(err: anyerror, ctx: *anyopaque) anyerror!void {
     var state: *UiState = @ptrCast(@alignCast(ctx));
 
@@ -1595,6 +1614,8 @@ fn authenticate(ptr: *anyopaque) !bool {
                 current_environment,
                 state.login.getCurrentUsername(),
                 password_text,
+                pamMessageCallback,
+                @ptrCast(&state),
             ) catch |err| {
                 shared_err.writeError(err);
 
