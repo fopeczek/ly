@@ -264,14 +264,12 @@ fn draw(self: *Matrix) void {
             const dot = self.dots[buf_width * y + x];
             const cell = if (dot.value == null or dot.value == ' ') self.default_cell else cell_blk: {
                 const fg_color: u32 = blk: {
-                    if (!self.tail_fade) {
-                        // Classic cmatrix: bright head, uniform trail.
-                        if (dot.is_head) break :blk self.head_col;
-                        break :blk self.fg;
-                    }
-                    // tail_fade: smooth gradient from fg at head down to bg at
-                    // tail end. head_col ignored — a discrete white pop on
-                    // the head breaks the smoothness.
+                    // Bright head (white-by-default cmatrix_head_col) on
+                    // BOTH modes — it's the iconic Matrix look and the
+                    // user wants it. tail_fade now only affects the trail
+                    // body, not the head.
+                    if (dot.is_head) break :blk self.head_col;
+                    if (!self.tail_fade) break :blk self.fg;
                     // Orphan cell (its trail's head has scrolled off-screen).
                     // Render as fully faded — these are the oldest cells of
                     // a dying trail, so they should already be invisible.
@@ -280,11 +278,9 @@ fn draw(self: *Matrix) void {
                     const distance = hy - y;
                     const tail_len = self.lines[x].length;
                     const denom: f32 = if (tail_len == 0) 1 else @floatFromInt(tail_len);
-                    // Linear interpolation along the trail. With 24-bit
-                    // truecolor enabled (full_color=true, default) the kernel
-                    // TTY does render intermediate shades — quadratic
-                    // easing made the fade too concentrated at the very
-                    // top of the trail; linear gives a more visible ramp.
+                    // Linear interpolation along the trail. lerpColor snaps
+                    // each channel to the 3 stops the kernel VT actually
+                    // distinguishes (bright/medium/black).
                     const t = @as(f32, @floatFromInt(distance)) / denom;
                     break :blk lerpColor(self.fg, self.terminal_buffer.bg, t);
                 };
