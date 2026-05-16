@@ -16,6 +16,40 @@ pub const FRAME_DELAY: usize = 4;
 // Characters change mid-scroll
 pub const MID_SCROLL_CHANGE = true;
 
+// Curated glyph pool for a Matrix-movie aesthetic. The cmatrix_*_codepoint
+// config entries are intentionally ignored — a contiguous Unicode range
+// produces ASCII-printable or pure-Katakana monocultures that don't feel
+// like the movie. This pool is ~70% Halfwidth Katakana (the iconic
+// "alien Japanese" look — fontconfig falls back to Noto Sans CJK JP since
+// JetBrainsMono does not ship Katakana) with digits, math/geometric
+// symbols, Greek, and Cyrillic letters mixed in for visual variety.
+const GLYPH_POOL = [_]u32{
+    // Halfwidth Katakana (U+FF66–U+FF9D) — primary Matrix-y body.
+    // Duplicated entries weight the pool toward Katakana without
+    // needing a separate weighted-sampling routine.
+    0xFF66, 0xFF67, 0xFF68, 0xFF69, 0xFF6A, 0xFF6B, 0xFF6C, 0xFF6D,
+    0xFF6E, 0xFF6F, 0xFF70, 0xFF71, 0xFF72, 0xFF73, 0xFF74, 0xFF75,
+    0xFF76, 0xFF77, 0xFF78, 0xFF79, 0xFF7A, 0xFF7B, 0xFF7C, 0xFF7D,
+    0xFF7E, 0xFF7F, 0xFF80, 0xFF81, 0xFF82, 0xFF83, 0xFF84, 0xFF85,
+    0xFF86, 0xFF87, 0xFF88, 0xFF89, 0xFF8A, 0xFF8B, 0xFF8C, 0xFF8D,
+    0xFF8E, 0xFF8F, 0xFF90, 0xFF91, 0xFF92, 0xFF93, 0xFF94, 0xFF95,
+    0xFF96, 0xFF97, 0xFF98, 0xFF99, 0xFF9A, 0xFF9B, 0xFF9C, 0xFF9D,
+    // Second pass on Katakana to bias weighting (60%+ katakana).
+    0xFF71, 0xFF72, 0xFF73, 0xFF77, 0xFF7B, 0xFF80, 0xFF85, 0xFF8A,
+    0xFF8F, 0xFF94, 0xFF98, 0xFF9D, 0xFF6F, 0xFF89, 0xFF82, 0xFF88,
+    // Latin digits 0-9 — present in the movie font too.
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+    // Math / set / logic operators (JetBrainsMono ships these).
+    0x2200, 0x2202, 0x2203, 0x2205, 0x2207, 0x2208, 0x220B, 0x2211,
+    0x221E, 0x222B, 0x2248, 0x2260, 0x2295, 0x2297,
+    // Greek capitals + a couple lowercase — the "weird Latin" look.
+    0x0394, 0x03A3, 0x03A6, 0x03A8, 0x03A9, 0x03BB, 0x03C0,
+    // Cyrillic capitals with distinctive shapes.
+    0x0414, 0x0416, 0x041B, 0x0424, 0x042F, 0x0401,
+    // Misc decorative symbols — sparse, draw the eye.
+    0x2605, 0x25CA, 0x25C6, 0x203B, 0x00A6,
+};
+
 const Matrix = @This();
 
 pub const Dot = struct {
@@ -201,7 +235,7 @@ fn draw(self: *Matrix) void {
                         const randint = self.terminal_buffer.random.int(u16);
                         const h = buf_height;
                         line.length = @mod(randint, h - 3) + 3;
-                        self.dots[x].value = @mod(randint, self.max_codepoint) + self.min_codepoint;
+                        self.dots[x].value = GLYPH_POOL[@mod(randint, GLYPH_POOL.len)];
                         line.space = @mod(randint, h + 1);
                     }
                 }
@@ -227,7 +261,7 @@ fn draw(self: *Matrix) void {
                     if (MID_SCROLL_CHANGE) {
                         const randint = self.terminal_buffer.random.int(u16);
                         if (@mod(randint, 8) == 0) {
-                            dot.value = @mod(randint, self.max_codepoint) + self.min_codepoint;
+                            dot.value = GLYPH_POOL[@mod(randint, GLYPH_POOL.len)];
                         }
                     }
 
@@ -251,7 +285,7 @@ fn draw(self: *Matrix) void {
                 }
 
                 const randint = self.terminal_buffer.random.int(u16);
-                dot.value = @mod(randint, self.max_codepoint) + self.min_codepoint;
+                dot.value = GLYPH_POOL[@mod(randint, GLYPH_POOL.len)];
                 dot.is_head = true;
                 line.virtual_head_y = y;
 
