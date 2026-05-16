@@ -39,15 +39,18 @@ const GLYPH_POOL = [_]u32{
     0xFF8F, 0xFF94, 0xFF98, 0xFF9D, 0xFF6F, 0xFF89, 0xFF82, 0xFF88,
     // Latin digits 0-9 — present in the movie font too.
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
-    // Math / set / logic operators (JetBrainsMono ships these).
-    0x2200, 0x2202, 0x2203, 0x2205, 0x2207, 0x2208, 0x220B, 0x2211,
-    0x221E, 0x222B, 0x2248, 0x2260, 0x2295, 0x2297,
+    // Math / set / logic operators — open line-art only.
+    // Removed: ⊕ ⊗ ∅ (circled/slashed shapes read as UI icons).
+    0x2200, 0x2202, 0x2203, 0x2207, 0x2208, 0x220B, 0x2211,
+    0x221E, 0x222B, 0x2248, 0x2260,
     // Greek capitals + a couple lowercase — the "weird Latin" look.
     0x0394, 0x03A3, 0x03A6, 0x03A8, 0x03A9, 0x03BB, 0x03C0,
-    // Cyrillic capitals with distinctive shapes.
-    0x0414, 0x0416, 0x041B, 0x0424, 0x042F, 0x0401,
-    // Misc decorative symbols — sparse, draw the eye.
-    0x2605, 0x25CA, 0x25C6, 0x203B, 0x00A6,
+    // Cyrillic capitals with distinctive open shapes.
+    // Removed: Ё (the diaeresis dots float oddly).
+    0x0414, 0x0416, 0x041B, 0x0424, 0x042F,
+    // Decorative symbols were removed wholesale (※ ★ ◆ ◊ ¦) —
+    // they read as logos/icons against the line-art glyphs and
+    // break the raindrop visual rhythm.
 };
 
 const Matrix = @This();
