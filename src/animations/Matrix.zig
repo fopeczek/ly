@@ -264,11 +264,19 @@ fn draw(self: *Matrix) void {
             const dot = self.dots[buf_width * y + x];
             const cell = if (dot.value == null or dot.value == ' ') self.default_cell else cell_blk: {
                 const fg_color: u32 = blk: {
-                    // Bright head (white-by-default cmatrix_head_col) on
-                    // BOTH modes — it's the iconic Matrix look and the
-                    // user wants it. tail_fade now only affects the trail
-                    // body, not the head.
-                    if (dot.is_head) break :blk self.head_col;
+                    // A column can have multiple is_head cells active at
+                    // once (old trail still alive when a new one starts
+                    // at the top). Only the BOTTOMMOST head — the leading
+                    // edge of the most recent drop — should render as
+                    // the white head. Other is_head cells are stale
+                    // markers; treat them as normal trail cells so we
+                    // don't get a stray white pop near the top of the
+                    // column.
+                    const is_leading_head =
+                        heads.len > 0 and
+                        heads[heads.len - 1] == y and
+                        dot.is_head;
+                    if (is_leading_head) break :blk self.head_col;
                     if (!self.tail_fade) break :blk self.fg;
                     // Orphan cell (its trail's head has scrolled off-screen).
                     // Render as fully faded — these are the oldest cells of

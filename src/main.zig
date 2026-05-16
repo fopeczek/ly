@@ -1727,6 +1727,15 @@ fn authenticate(ptr: *anyopaque) !bool {
 
     try state.buffer.reclaim();
 
+    // Wipe the framebuffer before the greeter re-renders. The session
+    // process tree just exited — waybar's "Broken pipe" / sway's
+    // "Exiting due to channel error" stderr ends up scribbled across
+    // /dev/tty1, and termbox2's diff-rendering won't overwrite cells
+    // where it thinks nothing changed. RIS (Reset to Initial State)
+    // clears the framebuffer hard so the next greeter draw is clean.
+    _ = std.posix.system.write(1, "\x1bc", 2);
+    state.buffer.drawNextFrame(true);
+
     const auth_err = shared_err.readError();
     if (auth_err) |err| {
         state.auth_fails += 1;
