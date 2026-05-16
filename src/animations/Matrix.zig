@@ -118,6 +118,16 @@ fn perceptualT(t_linear: f32) f32 {
     return 1.0 - std.math.pow(f32, 1.0 - tc, GAMMA);
 }
 
+// Compress fg's RGB channels to ~60% so the trail body's brightest cell
+// is clearly dimmer than the head_col (typically pure white).
+fn shiftedBodyColor(fg: u32) u32 {
+    const SHIFT: f32 = 0.60;
+    const r: u32 = @intFromFloat(@as(f32, @floatFromInt((fg >> 16) & 0xFF)) * SHIFT);
+    const g: u32 = @intFromFloat(@as(f32, @floatFromInt((fg >> 8) & 0xFF)) * SHIFT);
+    const b: u32 = @intFromFloat(@as(f32, @floatFromInt(fg & 0xFF)) * SHIFT);
+    return (r << 16) | (g << 8) | b;
+}
+
 pub fn widget(self: *Matrix) *Widget {
     if (self.instance) |*instance| return instance;
     self.instance = Widget.init(
@@ -167,14 +177,32 @@ fn draw(self: *Matrix) void {
             if (self.frame <= line.update) continue;
 
             if (self.dots[x].value == null and self.dots[buf_width + x].value == ' ') {
-                if (line.space > 0) {
-                    line.space -= 1;
-                } else {
-                    const randint = self.terminal_buffer.random.int(u16);
-                    const h = buf_height;
-                    line.length = @mod(randint, h - 3) + 3;
-                    self.dots[x].value = @mod(randint, self.max_codepoint) + self.min_codepoint;
-                    line.space = @mod(randint, h + 1);
+                // Deep fix: only spawn a new trail if the column is truly empty.
+                // The original cmatrix algorithm would happily start a new
+                // raindrop while an old one was still mid-fall, producing
+                // two heads per column simultaneously and a visually-busy
+                // multi-trail column the user reads as "stray whites".
+                var column_has_content = false;
+                {
+                    var scan_y: usize = 1;
+                    while (scan_y <= buf_height) : (scan_y += 1) {
+                        const v = self.dots[buf_width * scan_y + x].value;
+                        if (v != null and v != ' ') {
+                            column_has_content = true;
+                            break;
+                        }
+                    }
+                }
+                if (!column_has_content) {
+                    if (line.space > 0) {
+                        line.space -= 1;
+                    } else {
+                        const randint = self.terminal_buffer.random.int(u16);
+                        const h = buf_height;
+                        line.length = @mod(randint, h - 3) + 3;
+                        self.dots[x].value = @mod(randint, self.max_codepoint) + self.min_codepoint;
+                        line.space = @mod(randint, h + 1);
+                    }
                 }
             }
 
@@ -255,26 +283,15 @@ fn draw(self: *Matrix) void {
             const dot = self.dots[buf_width * y + x];
             const cell = if (dot.value == null or dot.value == ' ') self.default_cell else cell_blk: {
                 const fg_color: u32 = blk: {
-                    // A column can have multiple is_head cells active at
-                    // once (old trail still alive when a new one starts
-                    // at the top). Only the BOTTOMMOST head — the leading
-                    // edge of the most recent drop — renders as the
-                    // white head. Other is_head cells are NOT regular
-                    // trail cells either: in the fade math they have
-                    // distance=0 to themselves so they'd come out as
-                    // full fg (bright green), which looks identical to
-                    // the white head on this display and produces stray
-                    // "white" pops near the top of the column. Render
-                    // them at a fixed mid-fade green to defuse that.
-                    const is_any_head = dot.is_head;
-                    const is_leading_head =
-                        is_any_head and
-                        heads.len > 0 and
-                        heads[heads.len - 1] == y;
-                    if (is_leading_head) break :blk self.head_col;
-                    if (is_any_head and self.tail_fade) {
-                        // Non-leading head — mid-fade green, not full fg.
-                        break :blk lerpColor(self.fg, self.terminal_buffer.bg, 0.55);
+                    // With single-trail-per-column enforced above, there
+                    // is at most ONE is_head=true cell in a column at
+                    // any time. That cell renders as the bright white
+                    // head. Every other body cell renders from a
+                    // DIMMER green palette than the head_col, so it can
+                    // never be confused with "white" on the user's
+                    // display — only the leading head is bright.
+                    if (dot.is_head and heads.len > 0 and heads[heads.len - 1] == y) {
+                        break :blk self.head_col;
                     }
                     if (!self.tail_fade) break :blk self.fg;
                     // Orphan cell (its trail's head has scrolled off-screen).
@@ -286,7 +303,12 @@ fn draw(self: *Matrix) void {
                     const t_linear = @as(f32, @floatFromInt(distance)) / denom;
                     // Perceptual gamma curve — bright end drops faster.
                     const t = perceptualT(t_linear);
-                    break :blk lerpColor(self.fg, self.terminal_buffer.bg, t);
+                    // Body palette: max ~60% of fg's green. Even at
+                    // distance=0 (which can only occur for non-leading
+                    // is_head edge cases) the body cell sits at g=153,
+                    // visibly different from the white head_col=(255,255,255).
+                    const body_fg: u32 = (self.fg & 0xFF000000) | shiftedBodyColor(self.fg);
+                    break :blk lerpColor(body_fg, self.terminal_buffer.bg, t);
                 };
                 break :cell_blk Cell{
                     .ch = @intCast(dot.value.?),
