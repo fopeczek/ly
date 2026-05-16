@@ -317,12 +317,7 @@ fn draw(self: *Matrix) void {
                     // had no green tail. Wait one tick for the body
                     // to scroll into visible y>=1 territory.
                     if (dot.is_head and heads.len > 0 and heads[heads.len - 1] == y and y > 1) {
-                        // DIAGNOSTIC: render head as BRIGHT RED instead of
-                        // head_col (white). If the cells the user calls
-                        // "white ends" come out red with this binary, the
-                        // is_head→head_col path is the source. If they
-                        // come out white, the bug is elsewhere.
-                        break :inner 0x01FF0000;  // bold + (255, 0, 0) = bright red
+                        break :inner self.head_col;
                     }
                     if (!self.tail_fade) break :inner self.fg;
                     const distance = head_y_for_fade - y;
@@ -331,7 +326,19 @@ fn draw(self: *Matrix) void {
                     const t_linear = @as(f32, @floatFromInt(distance)) / denom;
                     if (t_linear >= 1.0) break :cell_blk self.default_cell;
                     const t = perceptualT(t_linear);
-                    break :inner lerpColor(self.fg, self.terminal_buffer.bg, t);
+                    const faded = lerpColor(self.fg, self.terminal_buffer.bg, t);
+                    // Pango/kmscon renders a non-space glyph with a default
+                    // (often white) foreground when the requested fg matches
+                    // bg, on the theory that fg==bg would make the char
+                    // invisible. At the tail end of our fade lerpColor's
+                    // truncation produces fg == bg (raw RGB collapse to 0),
+                    // and those cells then surface as bright-white tail
+                    // ends. Substitute default_cell (a space) so there's no
+                    // glyph for Pango to "rescue" with default fg.
+                    if ((faded & 0x00FFFFFF) == (self.terminal_buffer.bg & 0x00FFFFFF)) {
+                        break :cell_blk self.default_cell;
+                    }
+                    break :inner faded;
                 };
                 break :cell_blk Cell{
                     .ch = @intCast(dot.value.?),
