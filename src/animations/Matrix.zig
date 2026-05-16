@@ -85,7 +85,13 @@ pub fn init(
     };
 }
 
-// Linear interpolation between two RGBA-ish u32 colors. Preserves alpha/styling byte from `a`.
+// Linear interpolation between two RGBA-ish u32 colors. Preserves
+// alpha/styling byte from `a`. Outputs raw 24-bit values — no snapping
+// to a coarse palette. The kernel VT framebuffer console will still
+// collapse most of these to the 16-color VGA palette (so the gradient
+// looks 2-3 stops on a raw TTY), but when ly-dm runs inside kmscon
+// (which renders truecolor via Pango/freetype), the full continuous
+// fade is visible.
 fn lerpColor(a: u32, b: u32, t: f32) u32 {
     const t_clamped: f32 = if (t < 0) 0 else if (t > 1) 1 else t;
     const a_r: f32 = @floatFromInt((a >> 16) & 0xFF);
@@ -94,34 +100,22 @@ fn lerpColor(a: u32, b: u32, t: f32) u32 {
     const b_r: f32 = @floatFromInt((b >> 16) & 0xFF);
     const b_g: f32 = @floatFromInt((b >> 8) & 0xFF);
     const b_b: f32 = @floatFromInt(b & 0xFF);
-    const r_raw: f32 = a_r + t_clamped * (b_r - a_r);
-    const g_raw: f32 = a_g + t_clamped * (b_g - a_g);
-    const b_raw: f32 = a_b + t_clamped * (b_b - a_b);
-    // Snap each channel onto the 256-color cube ladder (0, 95, 135, 175,
-    // 215, 255). Doing this in-house gives a guaranteed-distinct ramp on
-    // the Linux VT framebuffer, whose console driver collapses many
-    // 24-bit values to the same palette index. With raw lerp we'd often
-    // see only two visible shades (full and "the other one"); snapping
-    // forces six discrete stops that the framebuffer reliably renders.
-    const r: u32 = snapToCube(r_raw);
-    const g: u32 = snapToCube(g_raw);
-    const bl: u32 = snapToCube(b_raw);
+    const r: u32 = @intFromFloat(a_r + t_clamped * (b_r - a_r));
+    const g: u32 = @intFromFloat(a_g + t_clamped * (b_g - a_g));
+    const bl: u32 = @intFromFloat(a_b + t_clamped * (b_b - a_b));
     return (a & 0xFF000000) | (r << 16) | (g << 8) | bl;
 }
 
-fn snapToCube(v: f32) u32 {
-    // Collapse trail-body colors to just 2 stops: medium green (100) and
-    // black (0). The "bright green" stop (255) was visually
-    // indistinguishable from head_col=white on the linux framebuffer
-    // console, so every cell at distance=0 through a non-leading head
-    // produced a stray "white pop" near the top of older trails.
-    //
-    // Now: the only thing that renders as white is the actual leading
-    // head (handled before snap is called, via head_col). Everything
-    // else fades through medium → black.
-    const clamped: f32 = if (v < 0) 0 else if (v > 255) 255 else v;
-    if (clamped < 70) return 0;
-    return 100;
+// Perceptual-gamma remap. Brightness = (1-t)^gamma so the bright end of
+// the trail drops faster than linear, matching how the human visual
+// system perceives intensity. User-verified at gamma=1.5 on truecolor
+// kmscon rendering — values 255, 213, 174, 138, 105, 75, 49, 26, 9, 0
+// for 10 evenly-spaced stops.
+fn perceptualT(t_linear: f32) f32 {
+    const GAMMA: f32 = 1.5;
+    const tc: f32 = if (t_linear < 0) 0 else if (t_linear > 1) 1 else t_linear;
+    // t' such that lerp(bright, dark, t') = bright * (1 - t_linear)^gamma
+    return 1.0 - std.math.pow(f32, 1.0 - tc, GAMMA);
 }
 
 pub fn widget(self: *Matrix) *Widget {
@@ -283,10 +277,9 @@ fn draw(self: *Matrix) void {
                     const distance = hy - y;
                     const tail_len = self.lines[x].length;
                     const denom: f32 = if (tail_len == 0) 1 else @floatFromInt(tail_len);
-                    // Linear interpolation along the trail. lerpColor snaps
-                    // each channel to the 3 stops the kernel VT actually
-                    // distinguishes (bright/medium/black).
-                    const t = @as(f32, @floatFromInt(distance)) / denom;
+                    const t_linear = @as(f32, @floatFromInt(distance)) / denom;
+                    // Perceptual gamma curve — bright end drops faster.
+                    const t = perceptualT(t_linear);
                     break :blk lerpColor(self.fg, self.terminal_buffer.bg, t);
                 };
                 break :cell_blk Cell{
