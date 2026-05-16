@@ -110,21 +110,18 @@ fn lerpColor(a: u32, b: u32, t: f32) u32 {
 }
 
 fn snapToCube(v: f32) u32 {
-    // Linux kernel framebuffer console snaps 24-bit values to the legacy
-    // VGA 16-color palette via nearest-distance matching. Verified
-    // empirically on this hardware (kernel 6.18 + amdgpudrmfb): only
-    // ~3 distinguishable green stops are visible — bright, medium, and
-    // black — even though the framebuffer is 32 bpp.
+    // Collapse trail-body colors to just 2 stops: medium green (100) and
+    // black (0). The "bright green" stop (255) was visually
+    // indistinguishable from head_col=white on the linux framebuffer
+    // console, so every cell at distance=0 through a non-leading head
+    // produced a stray "white pop" near the top of older trails.
     //
-    // So instead of pretending we have a 6-step cube and watching the
-    // kernel collapse it back to 2 visible shades, snap to the 3 stops
-    // that actually render distinctly. Trail looks like:
-    //     [bright][bright]...[medium]...[black][black]
-    // which matches what the user perceives as a "fade".
+    // Now: the only thing that renders as white is the actual leading
+    // head (handled before snap is called, via head_col). Everything
+    // else fades through medium → black.
     const clamped: f32 = if (v < 0) 0 else if (v > 255) 255 else v;
-    if (clamped < 35) return 0;
-    if (clamped < 170) return 100;
-    return 255;
+    if (clamped < 70) return 0;
+    return 100;
 }
 
 pub fn widget(self: *Matrix) *Widget {
