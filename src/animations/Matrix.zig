@@ -29,7 +29,7 @@ const SPEED_MAX: f32 = 0.15;
 // independent of head descent speed. ~0.10 at 50fps → ~5 changes/sec
 // per visible cell, matching the rapid char-cycling look in canvas
 // "matrix rain" implementations on the web.
-const TAIL_CHURN_PROB: f32 = 0.10;
+const TAIL_CHURN_PROB: f32 = 0.04;
 
 // Curated glyph pool for a Matrix-movie aesthetic. The cmatrix_*_codepoint
 // config entries are intentionally ignored — a contiguous Unicode range
