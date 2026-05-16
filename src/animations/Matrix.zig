@@ -258,20 +258,26 @@ fn draw(self: *Matrix) void {
                     // A column can have multiple is_head cells active at
                     // once (old trail still alive when a new one starts
                     // at the top). Only the BOTTOMMOST head — the leading
-                    // edge of the most recent drop — should render as
-                    // the white head. Other is_head cells are stale
-                    // markers; treat them as normal trail cells so we
-                    // don't get a stray white pop near the top of the
-                    // column.
+                    // edge of the most recent drop — renders as the
+                    // white head. Other is_head cells are NOT regular
+                    // trail cells either: in the fade math they have
+                    // distance=0 to themselves so they'd come out as
+                    // full fg (bright green), which looks identical to
+                    // the white head on this display and produces stray
+                    // "white" pops near the top of the column. Render
+                    // them at a fixed mid-fade green to defuse that.
+                    const is_any_head = dot.is_head;
                     const is_leading_head =
+                        is_any_head and
                         heads.len > 0 and
-                        heads[heads.len - 1] == y and
-                        dot.is_head;
+                        heads[heads.len - 1] == y;
                     if (is_leading_head) break :blk self.head_col;
+                    if (is_any_head and self.tail_fade) {
+                        // Non-leading head — mid-fade green, not full fg.
+                        break :blk lerpColor(self.fg, self.terminal_buffer.bg, 0.55);
+                    }
                     if (!self.tail_fade) break :blk self.fg;
                     // Orphan cell (its trail's head has scrolled off-screen).
-                    // Render as fully faded — these are the oldest cells of
-                    // a dying trail, so they should already be invisible.
                     if (head_idx >= heads.len) break :blk self.terminal_buffer.bg;
                     const hy = heads[head_idx];
                     const distance = hy - y;
