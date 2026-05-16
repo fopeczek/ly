@@ -11,7 +11,7 @@ const ly_core = ly_ui.ly_core;
 const interop = ly_core.interop;
 const TimeOfDay = interop.TimeOfDay;
 
-pub const FRAME_DELAY: usize = 8;
+pub const FRAME_DELAY: usize = 2;
 
 // Characters change mid-scroll
 pub const MID_SCROLL_CHANGE = true;
@@ -273,6 +273,15 @@ fn draw(self: *Matrix) void {
 
             const dot = self.dots[buf_width * y + x];
             const cell = if (dot.value == null or dot.value == ' ') self.default_cell else cell_blk: {
+                // Orphan cell (head has scrolled off-screen so there is
+                // no head left in this column): render as the space
+                // default_cell instead of "char with fg=bg". Pango under
+                // kmscon was drawing those fg=bg cells as default white,
+                // which manifested as "raindrop turns full white when
+                // head leaves screen".
+                if (self.tail_fade and (heads.len == 0 or head_idx >= heads.len)) {
+                    break :cell_blk self.default_cell;
+                }
                 const fg_color: u32 = blk: {
                     // Single-trail-per-column is enforced above; at most
                     // ONE is_head=true cell per column. That renders as
@@ -281,7 +290,6 @@ fn draw(self: *Matrix) void {
                         break :blk self.head_col;
                     }
                     if (!self.tail_fade) break :blk self.fg;
-                    if (head_idx >= heads.len) break :blk self.terminal_buffer.bg;
                     const hy = heads[head_idx];
                     const distance = hy - y;
                     const tail_len = self.lines[x].length;
