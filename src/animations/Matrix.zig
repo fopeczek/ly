@@ -17,10 +17,11 @@ pub const MID_SCROLL_CHANGE = true;
 // Per-column speed range in cells/draw-frame. Each column rolls its own
 // speed from a uniform continuous distribution at spawn time — no fixed
 // "slow / medium / fast" buckets. With frame_delay=20ms (50fps) this
-// produces column descent rates from 10 cells/sec (SPEED_MIN) to ~47
-// cells/sec (SPEED_MAX), with every value in between actually used.
-const SPEED_MIN: f32 = 0.20;
-const SPEED_MAX: f32 = 0.95;
+// produces column descent rates from 4 cells/sec (SPEED_MIN, ~12s to
+// cross a 50-row screen) to ~17 cells/sec (SPEED_MAX, ~3s to cross),
+// with every value in between actually used.
+const SPEED_MIN: f32 = 0.08;
+const SPEED_MAX: f32 = 0.35;
 
 // Per-cell per-draw-call probability that a non-head trail glyph cycles
 // to a new random pool entry. Runs every draw call regardless of whether
