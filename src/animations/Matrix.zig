@@ -317,7 +317,12 @@ fn draw(self: *Matrix) void {
                     // had no green tail. Wait one tick for the body
                     // to scroll into visible y>=1 territory.
                     if (dot.is_head and heads.len > 0 and heads[heads.len - 1] == y and y > 1) {
-                        break :inner self.head_col;
+                        // DIAGNOSTIC: render head as BRIGHT RED instead of
+                        // head_col (white). If the cells the user calls
+                        // "white ends" come out red with this binary, the
+                        // is_head→head_col path is the source. If they
+                        // come out white, the bug is elsewhere.
+                        break :inner 0x01FF0000;  // bold + (255, 0, 0) = bright red
                     }
                     if (!self.tail_fade) break :inner self.fg;
                     const distance = head_y_for_fade - y;
