@@ -110,13 +110,20 @@ fn lerpColor(a: u32, b: u32, t: f32) u32 {
 }
 
 fn snapToCube(v: f32) u32 {
+    // Linux kernel framebuffer console snaps 24-bit values to the legacy
+    // VGA 16-color palette via nearest-distance matching. Verified
+    // empirically on this hardware (kernel 6.18 + amdgpudrmfb): only
+    // ~3 distinguishable green stops are visible — bright, medium, and
+    // black — even though the framebuffer is 32 bpp.
+    //
+    // So instead of pretending we have a 6-step cube and watching the
+    // kernel collapse it back to 2 visible shades, snap to the 3 stops
+    // that actually render distinctly. Trail looks like:
+    //     [bright][bright]...[medium]...[black][black]
+    // which matches what the user perceives as a "fade".
     const clamped: f32 = if (v < 0) 0 else if (v > 255) 255 else v;
-    // Boundaries chosen as midpoints between cube stops.
-    if (clamped < 47.5) return 0;
-    if (clamped < 115) return 95;
-    if (clamped < 155) return 135;
-    if (clamped < 195) return 175;
-    if (clamped < 235) return 215;
+    if (clamped < 35) return 0;
+    if (clamped < 170) return 100;
     return 255;
 }
 
