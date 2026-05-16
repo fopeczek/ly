@@ -118,10 +118,13 @@ fn perceptualT(t_linear: f32) f32 {
     return 1.0 - std.math.pow(f32, 1.0 - tc, GAMMA);
 }
 
-// Compress fg's RGB channels to ~60% so the trail body's brightest cell
-// is clearly dimmer than the head_col (typically pure white).
+// Compress fg's RGB channels to ~40% so the trail body's brightest cell
+// is clearly dimmer than the head_col (typically pure white). Tuned
+// down from 0.60 after user feedback that g=153 still read as "white"
+// on their display — at 0.40 the body sits at g=102 which is
+// unambiguously a dim green to anyone.
 fn shiftedBodyColor(fg: u32) u32 {
-    const SHIFT: f32 = 0.60;
+    const SHIFT: f32 = 0.40;
     const r: u32 = @intFromFloat(@as(f32, @floatFromInt((fg >> 16) & 0xFF)) * SHIFT);
     const g: u32 = @intFromFloat(@as(f32, @floatFromInt((fg >> 8) & 0xFF)) * SHIFT);
     const b: u32 = @intFromFloat(@as(f32, @floatFromInt(fg & 0xFF)) * SHIFT);
