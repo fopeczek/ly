@@ -307,9 +307,14 @@ fn draw(self: *Matrix) void {
                 };
 
                 const fg_color: u32 = inner: {
-                    if (dot.is_head and heads.len > 0 and heads[heads.len - 1] == y) {
-                        break :inner self.head_col;
-                    }
+                    // DIAGNOSTIC: head_col disabled. Every cell renders
+                    // strictly via the fade math. If "white ends" still
+                    // appear with this binary, the cause is not the
+                    // legitimate head_col but a real rendering bug.
+                    // Re-enable by restoring the head check below.
+                    // if (dot.is_head and heads.len > 0 and heads[heads.len - 1] == y) {
+                    //     break :inner self.head_col;
+                    // }
                     if (!self.tail_fade) break :inner self.fg;
                     const distance = head_y_for_fade - y;
                     const tail_len = self.lines[x].length;
