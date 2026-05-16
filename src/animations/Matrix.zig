@@ -307,14 +307,18 @@ fn draw(self: *Matrix) void {
                 };
 
                 const fg_color: u32 = inner: {
-                    // DIAGNOSTIC: head_col disabled. Every cell renders
-                    // strictly via the fade math. If "white ends" still
-                    // appear with this binary, the cause is not the
-                    // legitimate head_col but a real rendering bug.
-                    // Re-enable by restoring the head check below.
-                    // if (dot.is_head and heads.len > 0 and heads[heads.len - 1] == y) {
-                    //     break :inner self.head_col;
-                    // }
+                    // Head renders as the bright head_col cell EXCEPT
+                    // during the first frame after spawn, when the
+                    // body cell at y=0 is not rendered (render loop
+                    // starts at y=1). Without the y>1 guard, a newly-
+                    // spawned head appears as a lone bright-white cell
+                    // at the top of the column with no trail behind it
+                    // — the "white ends" the user was reporting that
+                    // had no green tail. Wait one tick for the body
+                    // to scroll into visible y>=1 territory.
+                    if (dot.is_head and heads.len > 0 and heads[heads.len - 1] == y and y > 1) {
+                        break :inner self.head_col;
+                    }
                     if (!self.tail_fade) break :inner self.fg;
                     const distance = head_y_for_fade - y;
                     const tail_len = self.lines[x].length;
