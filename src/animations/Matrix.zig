@@ -11,7 +11,7 @@ const ly_core = ly_ui.ly_core;
 const interop = ly_core.interop;
 const TimeOfDay = interop.TimeOfDay;
 
-pub const FRAME_DELAY: usize = 2;
+pub const FRAME_DELAY: usize = 4;
 
 // Characters change mid-scroll
 pub const MID_SCROLL_CHANGE = true;
@@ -27,6 +27,13 @@ pub const Line = struct {
     space: usize,
     length: usize,
     update: usize,
+    // Once the actual head scrolls past the bottom of the screen, this
+    // tracks the conceptual head position advancing further down. Cells
+    // in the trail body fade based on distance to this virtual head,
+    // so the trail continues "falling" off the bottom instead of
+    // vanishing instantly. 0 means no off-screen head (trail is either
+    // alive on-screen or column is idle).
+    virtual_head_y: usize = 0,
 };
 
 instance: ?Widget = null,
@@ -167,23 +174,26 @@ fn draw(self: *Matrix) void {
             var line = &self.lines[x];
             if (self.frame <= line.update) continue;
 
-            if (self.dots[x].value == null and self.dots[buf_width + x].value == ' ') {
-                // Deep fix: only spawn a new trail if the column is truly empty.
-                // The original cmatrix algorithm would happily start a new
-                // raindrop while an old one was still mid-fall, producing
-                // two heads per column simultaneously and a visually-busy
-                // multi-trail column the user reads as "stray whites".
-                var column_has_content = false;
-                {
-                    var scan_y: usize = 1;
-                    while (scan_y <= buf_height) : (scan_y += 1) {
-                        const v = self.dots[buf_width * scan_y + x].value;
-                        if (v != null and v != ' ') {
-                            column_has_content = true;
-                            break;
-                        }
+            // Single-pass scan of this column: gather whether it has any
+            // value cells (so we can both decide on spawn AND clear
+            // virtual_head_y once the trail is fully gone).
+            var column_has_content = false;
+            {
+                var scan_y: usize = 1;
+                while (scan_y <= buf_height) : (scan_y += 1) {
+                    const v = self.dots[buf_width * scan_y + x].value;
+                    if (v != null and v != ' ') {
+                        column_has_content = true;
+                        break;
                     }
                 }
+            }
+            if (!column_has_content) line.virtual_head_y = 0;
+
+            if (self.dots[x].value == null and self.dots[buf_width + x].value == ' ') {
+                // Only spawn a new raindrop in a truly empty column.
+                // Prevents the cmatrix-classic "two heads per column"
+                // problem that the user read as stray whites.
                 if (!column_has_content) {
                     if (line.space > 0) {
                         line.space -= 1;
@@ -226,6 +236,15 @@ fn draw(self: *Matrix) void {
                     // Head's down offscreen
                     if (y > buf_height) {
                         self.dots[buf_width * tail + x].value = ' ';
+                        // Continue the "head" conceptually past the
+                        // bottom of the screen so the trail body fades
+                        // out naturally as it falls off, instead of
+                        // disappearing the instant the head leaves.
+                        if (line.virtual_head_y <= buf_height) {
+                            line.virtual_head_y = buf_height + 1;
+                        } else {
+                            line.virtual_head_y += 1;
+                        }
                         break :height_it;
                     }
                     dot = &self.dots[buf_width * y + x];
@@ -234,6 +253,7 @@ fn draw(self: *Matrix) void {
                 const randint = self.terminal_buffer.random.int(u16);
                 dot.value = @mod(randint, self.max_codepoint) + self.min_codepoint;
                 dot.is_head = true;
+                line.virtual_head_y = y;
 
                 if (seg_len > line.length or !first_col) {
                     self.dots[buf_width * tail + x].value = ' ';
@@ -273,30 +293,31 @@ fn draw(self: *Matrix) void {
 
             const dot = self.dots[buf_width * y + x];
             const cell = if (dot.value == null or dot.value == ' ') self.default_cell else cell_blk: {
-                // Orphan cell (head has scrolled off-screen so there is
-                // no head left in this column): render as the space
-                // default_cell instead of "char with fg=bg". Pango under
-                // kmscon was drawing those fg=bg cells as default white,
-                // which manifested as "raindrop turns full white when
-                // head leaves screen".
-                if (self.tail_fade and (heads.len == 0 or head_idx >= heads.len)) {
-                    break :cell_blk self.default_cell;
-                }
-                const fg_color: u32 = blk: {
-                    // Single-trail-per-column is enforced above; at most
-                    // ONE is_head=true cell per column. That renders as
-                    // head_col. Other cells fade from fg to bg.
+                // Pick a head_y to fade against:
+                //   - If there's an on-screen is_head for this cell, use that.
+                //   - If not, use line.virtual_head_y (head has scrolled past
+                //     the bottom; trail keeps falling as virtual_head_y
+                //     advances each tick).
+                //   - If neither, trail is fully off — render as default_cell.
+                const head_y_for_fade: usize = blk: {
+                    if (head_idx < heads.len) break :blk heads[head_idx];
+                    const vhy = self.lines[x].virtual_head_y;
+                    if (vhy == 0 or vhy <= y) break :cell_blk self.default_cell;
+                    break :blk vhy;
+                };
+
+                const fg_color: u32 = inner: {
                     if (dot.is_head and heads.len > 0 and heads[heads.len - 1] == y) {
-                        break :blk self.head_col;
+                        break :inner self.head_col;
                     }
-                    if (!self.tail_fade) break :blk self.fg;
-                    const hy = heads[head_idx];
-                    const distance = hy - y;
+                    if (!self.tail_fade) break :inner self.fg;
+                    const distance = head_y_for_fade - y;
                     const tail_len = self.lines[x].length;
                     const denom: f32 = if (tail_len == 0) 1 else @floatFromInt(tail_len);
                     const t_linear = @as(f32, @floatFromInt(distance)) / denom;
+                    if (t_linear >= 1.0) break :cell_blk self.default_cell;
                     const t = perceptualT(t_linear);
-                    break :blk lerpColor(self.fg, self.terminal_buffer.bg, t);
+                    break :inner lerpColor(self.fg, self.terminal_buffer.bg, t);
                 };
                 break :cell_blk Cell{
                     .ch = @intCast(dot.value.?),
