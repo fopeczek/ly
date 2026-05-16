@@ -20,7 +20,7 @@ pub const MID_SCROLL_CHANGE = true;
 // produces column descent rates from 4 cells/sec (SPEED_MIN, ~12s to
 // cross a 50-row screen) to ~17 cells/sec (SPEED_MAX, ~3s to cross),
 // with every value in between actually used.
-const SPEED_MIN: f32 = 0.03;
+const SPEED_MIN: f32 = 0.06;
 const SPEED_MAX: f32 = 0.15;
 
 // Per-cell per-draw-call probability that a non-head trail glyph cycles
