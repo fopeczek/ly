@@ -118,18 +118,6 @@ fn perceptualT(t_linear: f32) f32 {
     return 1.0 - std.math.pow(f32, 1.0 - tc, GAMMA);
 }
 
-// Compress fg's RGB channels to ~40% so the trail body's brightest cell
-// is clearly dimmer than the head_col (typically pure white). Tuned
-// down from 0.60 after user feedback that g=153 still read as "white"
-// on their display — at 0.40 the body sits at g=102 which is
-// unambiguously a dim green to anyone.
-fn shiftedBodyColor(fg: u32) u32 {
-    const SHIFT: f32 = 0.40;
-    const r: u32 = @intFromFloat(@as(f32, @floatFromInt((fg >> 16) & 0xFF)) * SHIFT);
-    const g: u32 = @intFromFloat(@as(f32, @floatFromInt((fg >> 8) & 0xFF)) * SHIFT);
-    const b: u32 = @intFromFloat(@as(f32, @floatFromInt(fg & 0xFF)) * SHIFT);
-    return (r << 16) | (g << 8) | b;
-}
 
 pub fn widget(self: *Matrix) *Widget {
     if (self.instance) |*instance| return instance;
@@ -286,32 +274,21 @@ fn draw(self: *Matrix) void {
             const dot = self.dots[buf_width * y + x];
             const cell = if (dot.value == null or dot.value == ' ') self.default_cell else cell_blk: {
                 const fg_color: u32 = blk: {
-                    // With single-trail-per-column enforced above, there
-                    // is at most ONE is_head=true cell in a column at
-                    // any time. That cell renders as the bright white
-                    // head. Every other body cell renders from a
-                    // DIMMER green palette than the head_col, so it can
-                    // never be confused with "white" on the user's
-                    // display — only the leading head is bright.
+                    // Single-trail-per-column is enforced above; at most
+                    // ONE is_head=true cell per column. That renders as
+                    // head_col. Other cells fade from fg to bg.
                     if (dot.is_head and heads.len > 0 and heads[heads.len - 1] == y) {
                         break :blk self.head_col;
                     }
                     if (!self.tail_fade) break :blk self.fg;
-                    // Orphan cell (its trail's head has scrolled off-screen).
                     if (head_idx >= heads.len) break :blk self.terminal_buffer.bg;
                     const hy = heads[head_idx];
                     const distance = hy - y;
                     const tail_len = self.lines[x].length;
                     const denom: f32 = if (tail_len == 0) 1 else @floatFromInt(tail_len);
                     const t_linear = @as(f32, @floatFromInt(distance)) / denom;
-                    // Perceptual gamma curve — bright end drops faster.
                     const t = perceptualT(t_linear);
-                    // Body palette: max ~60% of fg's green. Even at
-                    // distance=0 (which can only occur for non-leading
-                    // is_head edge cases) the body cell sits at g=153,
-                    // visibly different from the white head_col=(255,255,255).
-                    const body_fg: u32 = (self.fg & 0xFF000000) | shiftedBodyColor(self.fg);
-                    break :blk lerpColor(body_fg, self.terminal_buffer.bg, t);
+                    break :blk lerpColor(self.fg, self.terminal_buffer.bg, t);
                 };
                 break :cell_blk Cell{
                     .ch = @intCast(dot.value.?),

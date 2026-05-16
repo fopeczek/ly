@@ -238,14 +238,13 @@ pub fn runEventLoop(
                 }
             }
 
-            // Hide the cursor before flushing the frame. termbox2 leaves
-            // the cursor at the position the active widget put it; when
-            // Ly runs under kmscon (truecolor pty), kmscon renders a
-            // visible cursor block there and it's read as a stray
-            // bright cell over the matrix rain. Greeter doesn't actually
-            // need a visible cursor — password input shows its own '_'
-            // glyph via the password widget's draw.
-            _ = termbox.tb_set_cursor(-1, -1);
+            // Hide the cursor before flushing the frame. termbox2's
+            // tb_set_cursor clamps negative coords to (0,0) rather than
+            // hiding — must use tb_hide_cursor() proper. Without this
+            // kmscon renders the pty cursor at the active widget's
+            // last cursor position as a visible bright block over the
+            // matrix rain.
+            _ = termbox.tb_hide_cursor();
             TerminalBuffer.presentBuffer();
         }
 
