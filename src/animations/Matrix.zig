@@ -11,10 +11,24 @@ const ly_core = ly_ui.ly_core;
 const interop = ly_core.interop;
 const TimeOfDay = interop.TimeOfDay;
 
-pub const FRAME_DELAY: usize = 4;
-
 // Characters change mid-scroll
 pub const MID_SCROLL_CHANGE = true;
+
+// Per-column speed range in cells/draw-frame. Each column rolls its own
+// speed from a uniform continuous distribution at spawn time — no fixed
+// "slow / medium / fast" buckets. With frame_delay=20ms (50fps) this
+// produces column descent rates from 10 cells/sec (SPEED_MIN) to ~47
+// cells/sec (SPEED_MAX), with every value in between actually used.
+const SPEED_MIN: f32 = 0.20;
+const SPEED_MAX: f32 = 0.95;
+
+// Per-cell per-draw-call probability that a non-head trail glyph cycles
+// to a new random pool entry. Runs every draw call regardless of whether
+// the column's accumulator triggered an advance, so tail churn is fully
+// independent of head descent speed. ~0.10 at 50fps → ~5 changes/sec
+// per visible cell, matching the rapid char-cycling look in canvas
+// "matrix rain" implementations on the web.
+const TAIL_CHURN_PROB: f32 = 0.10;
 
 // Curated glyph pool for a Matrix-movie aesthetic. The cmatrix_*_codepoint
 // config entries are intentionally ignored — a contiguous Unicode range
@@ -63,7 +77,16 @@ pub const Dot = struct {
 pub const Line = struct {
     space: usize,
     length: usize,
-    update: usize,
+    // Cells per draw frame. Continuous f32 in [SPEED_MIN, SPEED_MAX],
+    // rolled fresh on each spawn so consecutive raindrops in the same
+    // column don't share a speed either.
+    speed: f32,
+    // Accumulator phase in [0..1). Each draw call: accum += speed; once
+    // it crosses 1.0 the column advances one cell and 1.0 is subtracted
+    // back off. Initialized to a random offset so columns desync from
+    // frame 1, eliminating the global "tick visible at once" lockstep
+    // the old discrete-update scheme produced.
+    advance_accum: f32,
     // Once the actual head scrolls past the bottom of the screen, this
     // tracks the conceptual head position advancing further down. Cells
     // in the trail body fade based on distance to this virtual head,
@@ -79,8 +102,6 @@ allocator: Allocator,
 terminal_buffer: *TerminalBuffer,
 dots: []Dot,
 lines: []Line,
-frame: usize,
-count: usize,
 fg: u32,
 head_col: u32,
 min_codepoint: u16,
@@ -115,8 +136,6 @@ pub fn init(
         .terminal_buffer = terminal_buffer,
         .dots = dots,
         .lines = lines,
-        .frame = 3,
-        .count = 0,
         .fg = fg,
         .head_col = head_col,
         .min_codepoint = min_codepoint,
@@ -194,112 +213,145 @@ fn realloc(self: *Matrix) !void {
     self.lines = lines;
 }
 
+// Tail churn + per-column advance gate. Extracted out of draw() so its
+// loop variables live in their own function scope and don't shadow the
+// render-pass loop variables (Zig disallows same-name variables in
+// nested scopes within a single function).
+fn stepColumns(self: *Matrix) void {
+    const buf_height = self.terminal_buffer.height;
+    const buf_width = self.terminal_buffer.width;
+
+    var x: usize = 0;
+    while (x < buf_width) : (x += 2) {
+        var line = &self.lines[x];
+
+        // ──── Tail churn pass — runs every draw call ────────────────
+        // Non-head trail cells cycle their glyph with TAIL_CHURN_PROB
+        // independently of whether this column's accumulator advances
+        // the head this frame. Decoupling churn from advance gives the
+        // "constantly flickering code" look: tails bubble even while
+        // their owning column is moving slowly.
+        if (MID_SCROLL_CHANGE) {
+            var ch_y: usize = 1;
+            while (ch_y <= buf_height) : (ch_y += 1) {
+                const cell = &self.dots[buf_width * ch_y + x];
+                if (cell.is_head) continue;
+                const v = cell.value orelse continue;
+                if (v == ' ') continue;
+                if (self.terminal_buffer.random.float(f32) < TAIL_CHURN_PROB) {
+                    const r = self.terminal_buffer.random.int(u32);
+                    cell.value = GLYPH_POOL[@mod(r, GLYPH_POOL.len)];
+                }
+            }
+        }
+
+        // ──── Per-column advance gate (continuous speed) ────────────
+        // Each column carries its own accumulator phase. Adding the
+        // column's speed (cells/frame) each draw call eventually
+        // crosses 1.0, at which point we advance the head exactly
+        // once and subtract 1.0. There is no global "tick" anymore —
+        // columns trigger their advances on whatever frame their phase
+        // happens to land on, so the old "lockstep" visual is gone.
+        line.advance_accum += line.speed;
+        if (line.advance_accum < 1.0) continue;
+        line.advance_accum -= 1.0;
+
+        var tail: usize = 0;
+
+        // Single-pass scan of this column: gather whether it has any
+        // value cells (so we can both decide on spawn AND clear
+        // virtual_head_y once the trail is fully gone).
+        var column_has_content = false;
+        {
+            var scan_y: usize = 1;
+            while (scan_y <= buf_height) : (scan_y += 1) {
+                const v = self.dots[buf_width * scan_y + x].value;
+                if (v != null and v != ' ') {
+                    column_has_content = true;
+                    break;
+                }
+            }
+        }
+        if (!column_has_content) line.virtual_head_y = 0;
+
+        if (self.dots[x].value == null and self.dots[buf_width + x].value == ' ') {
+            // Only spawn a new raindrop in a truly empty column.
+            // Prevents the cmatrix-classic "two heads per column"
+            // problem that the user read as stray whites.
+            if (!column_has_content) {
+                if (line.space > 0) {
+                    line.space -= 1;
+                } else {
+                    const randint = self.terminal_buffer.random.int(u16);
+                    const h = buf_height;
+                    line.length = @mod(randint, h - 3) + 3;
+                    self.dots[x].value = GLYPH_POOL[@mod(randint, GLYPH_POOL.len)];
+                    line.space = @mod(randint, h + 1);
+                    // Reroll speed on every spawn so consecutive
+                    // raindrops in the same column don't share a pace.
+                    line.speed = SPEED_MIN +
+                        self.terminal_buffer.random.float(f32) * (SPEED_MAX - SPEED_MIN);
+                }
+            }
+        }
+
+        var y: usize = 0;
+        var first_col = true;
+        var seg_len: u64 = 0;
+        height_it: while (y <= buf_height) : (y += 1) {
+            var dot = &self.dots[buf_width * y + x];
+            // Skip over spaces
+            while (y <= buf_height and (dot.value == ' ' or dot.value == null)) {
+                y += 1;
+                if (y > buf_height) break :height_it;
+                dot = &self.dots[buf_width * y + x];
+            }
+
+            // Find the head of this column
+            tail = y;
+            seg_len = 0;
+            while (y <= buf_height and dot.value != ' ' and dot.value != null) {
+                dot.is_head = false;
+                y += 1;
+                seg_len += 1;
+                // Head's down offscreen
+                if (y > buf_height) {
+                    self.dots[buf_width * tail + x].value = ' ';
+                    // Continue the "head" conceptually past the
+                    // bottom of the screen so the trail body fades
+                    // out naturally as it falls off, instead of
+                    // disappearing the instant the head leaves.
+                    if (line.virtual_head_y <= buf_height) {
+                        line.virtual_head_y = buf_height + 1;
+                    } else {
+                        line.virtual_head_y += 1;
+                    }
+                    break :height_it;
+                }
+                dot = &self.dots[buf_width * y + x];
+            }
+
+            const randint = self.terminal_buffer.random.int(u16);
+            dot.value = GLYPH_POOL[@mod(randint, GLYPH_POOL.len)];
+            dot.is_head = true;
+            line.virtual_head_y = y;
+
+            if (seg_len > line.length or !first_col) {
+                self.dots[buf_width * tail + x].value = ' ';
+                self.dots[x].value = null;
+            }
+            first_col = false;
+        }
+    }
+}
+
 fn draw(self: *Matrix) void {
     if (!self.animate.*) return;
 
     const buf_height = self.terminal_buffer.height;
     const buf_width = self.terminal_buffer.width;
-    self.count += 1;
-    if (self.count > FRAME_DELAY) {
-        self.frame += 1;
-        if (self.frame > 4) self.frame = 1;
-        self.count = 0;
 
-        var x: usize = 0;
-        while (x < buf_width) : (x += 2) {
-            var tail: usize = 0;
-            var line = &self.lines[x];
-            if (self.frame <= line.update) continue;
-
-            // Single-pass scan of this column: gather whether it has any
-            // value cells (so we can both decide on spawn AND clear
-            // virtual_head_y once the trail is fully gone).
-            var column_has_content = false;
-            {
-                var scan_y: usize = 1;
-                while (scan_y <= buf_height) : (scan_y += 1) {
-                    const v = self.dots[buf_width * scan_y + x].value;
-                    if (v != null and v != ' ') {
-                        column_has_content = true;
-                        break;
-                    }
-                }
-            }
-            if (!column_has_content) line.virtual_head_y = 0;
-
-            if (self.dots[x].value == null and self.dots[buf_width + x].value == ' ') {
-                // Only spawn a new raindrop in a truly empty column.
-                // Prevents the cmatrix-classic "two heads per column"
-                // problem that the user read as stray whites.
-                if (!column_has_content) {
-                    if (line.space > 0) {
-                        line.space -= 1;
-                    } else {
-                        const randint = self.terminal_buffer.random.int(u16);
-                        const h = buf_height;
-                        line.length = @mod(randint, h - 3) + 3;
-                        self.dots[x].value = GLYPH_POOL[@mod(randint, GLYPH_POOL.len)];
-                        line.space = @mod(randint, h + 1);
-                    }
-                }
-            }
-
-            var y: usize = 0;
-            var first_col = true;
-            var seg_len: u64 = 0;
-            height_it: while (y <= buf_height) : (y += 1) {
-                var dot = &self.dots[buf_width * y + x];
-                // Skip over spaces
-                while (y <= buf_height and (dot.value == ' ' or dot.value == null)) {
-                    y += 1;
-                    if (y > buf_height) break :height_it;
-                    dot = &self.dots[buf_width * y + x];
-                }
-
-                // Find the head of this column
-                tail = y;
-                seg_len = 0;
-                while (y <= buf_height and dot.value != ' ' and dot.value != null) {
-                    dot.is_head = false;
-                    if (MID_SCROLL_CHANGE) {
-                        const randint = self.terminal_buffer.random.int(u16);
-                        if (@mod(randint, 8) == 0) {
-                            dot.value = GLYPH_POOL[@mod(randint, GLYPH_POOL.len)];
-                        }
-                    }
-
-                    y += 1;
-                    seg_len += 1;
-                    // Head's down offscreen
-                    if (y > buf_height) {
-                        self.dots[buf_width * tail + x].value = ' ';
-                        // Continue the "head" conceptually past the
-                        // bottom of the screen so the trail body fades
-                        // out naturally as it falls off, instead of
-                        // disappearing the instant the head leaves.
-                        if (line.virtual_head_y <= buf_height) {
-                            line.virtual_head_y = buf_height + 1;
-                        } else {
-                            line.virtual_head_y += 1;
-                        }
-                        break :height_it;
-                    }
-                    dot = &self.dots[buf_width * y + x];
-                }
-
-                const randint = self.terminal_buffer.random.int(u16);
-                dot.value = GLYPH_POOL[@mod(randint, GLYPH_POOL.len)];
-                dot.is_head = true;
-                line.virtual_head_y = y;
-
-                if (seg_len > line.length or !first_col) {
-                    self.dots[buf_width * tail + x].value = ' ';
-                    self.dots[x].value = null;
-                }
-                first_col = false;
-            }
-        }
-    }
+    self.stepColumns();
 
     // Stack-allocated buffer for per-column head positions. A column can
     // host multiple concurrent trails; without per-cell head lookup the
@@ -417,7 +469,11 @@ fn initBuffers(dots: []Dot, lines: []Line, width: usize, height: usize, random: 
         var line = lines[x];
         line.space = @mod(random.int(u16), height) + 1;
         line.length = @mod(random.int(u16), height - 3) + 3;
-        line.update = @mod(random.int(u16), 3) + 1;
+        line.speed = SPEED_MIN + random.float(f32) * (SPEED_MAX - SPEED_MIN);
+        // Random phase so all columns don't trigger their first advance
+        // on the same frame.
+        line.advance_accum = random.float(f32);
+        line.virtual_head_y = 0;
         lines[x] = line;
 
         dots[width + x].value = ' ';
