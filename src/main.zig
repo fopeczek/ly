@@ -1894,21 +1894,16 @@ fn increaseBrightnessCmd(ptr: *anyopaque) !bool {
 }
 
 fn updateNumlock(self: *Label, ptr: *anyopaque) !void {
-    var state: *UiState = @ptrCast(@alignCast(ptr));
+    const state: *UiState = @ptrCast(@alignCast(ptr));
 
-    const lock_state = interop.getLockState() catch |err| {
+    // KDGKBLED ioctl is VT-only — it returns EINVAL on a pty slave.
+    // When we run Ly inside kmscon (for truecolor rendering) the ioctl
+    // fails on the pty. Silently disable updates and clear text; no
+    // need to splash a red error across the greeter for something
+    // that's structural, not an actual fault.
+    const lock_state = interop.getLockState() catch {
         self.update_fn = null;
-        try state.info_line.addMessage(
-            state.lang.err_lock_state,
-            state.config.error_bg,
-            state.config.error_fg,
-        );
-        try state.log_file.err(
-            state.io,
-            "sys",
-            "failed to get lock state: {s}",
-            .{@errorName(err)},
-        );
+        self.setText("");
         return;
     };
 
@@ -1916,12 +1911,11 @@ fn updateNumlock(self: *Label, ptr: *anyopaque) !void {
 }
 
 fn updateCapslock(self: *Label, ptr: *anyopaque) !void {
-    var state: *UiState = @ptrCast(@alignCast(ptr));
+    const state: *UiState = @ptrCast(@alignCast(ptr));
 
-    const lock_state = interop.getLockState() catch |err| {
+    const lock_state = interop.getLockState() catch {
         self.update_fn = null;
-        try state.info_line.addMessage(state.lang.err_lock_state, state.config.error_bg, state.config.error_fg);
-        try state.log_file.err(state.io, "sys", "failed to get lock state: {s}", .{@errorName(err)});
+        self.setText("");
         return;
     };
 
