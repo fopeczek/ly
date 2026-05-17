@@ -1408,6 +1408,14 @@ pub fn main(init: std.process.Init) !void {
     try state.buffer.registerGlobalKeybind(state.io, "J", &debugItemNext, &state);
     try state.buffer.registerGlobalKeybind(state.io, "H", &debugAdjustDown, &state);
     try state.buffer.registerGlobalKeybind(state.io, "L", &debugAdjustUp, &state);
+    // Arrow keys too — most users reach for arrows first.
+    // Up/Down replace TerminalBuffer's widget-cursor handlers; the
+    // pass-through `return true` in non-debug mode lets the underlying
+    // widget receive the key as before.
+    try state.buffer.registerGlobalKeybind(state.io, "Up", &debugArrowUp, &state);
+    try state.buffer.registerGlobalKeybind(state.io, "Down", &debugArrowDown, &state);
+    try state.buffer.registerGlobalKeybind(state.io, "Left", &debugArrowLeft, &state);
+    try state.buffer.registerGlobalKeybind(state.io, "Right", &debugArrowRight, &state);
 
     try state.buffer.registerGlobalKeybind(state.io, "Enter", &authenticate, &state);
 
@@ -1582,6 +1590,15 @@ fn uiErrorHandler(err: anyerror, ctx: *anyopaque) anyerror!void {
 fn disableInsertMode(ptr: *anyopaque) !bool {
     var state: *UiState = @ptrCast(@alignCast(ptr));
 
+    // Esc closes the debug menu if it's open (in addition to
+    // Shift+F12). Without this Esc still falls through to vi-mode
+    // logic, which feels wrong from inside the menu.
+    if (state.debug_menu.visible) {
+        state.debug_menu.visible = false;
+        state.buffer.drawNextFrame(true);
+        return false;
+    }
+
     if (state.config.vi_mode and state.insert_mode) {
         state.insert_mode = false;
         state.password.should_insert = false;
@@ -1695,6 +1712,64 @@ fn debugItemPrev(ptr: *anyopaque) !bool {
     }
     if (state.insert_mode) return true;
     return try state.buffer.simulateKeybind(state.io, "Up");
+}
+
+// Arrow-key versions for debug nav. When debug menu is visible they
+// drive the menu; otherwise they delegate to TerminalBuffer's own
+// moveCursorUp/Down which is what the default Up/Down keybind ran.
+// The TerminalBuffer binds Up/Down/Left/Right to its own functions
+// during runEventLoop(); these handlers replace those bindings.
+fn debugArrowUp(ptr: *anyopaque) !bool {
+    var state: *UiState = @ptrCast(@alignCast(ptr));
+    if (state.debug_menu.visible) {
+        state.debug_menu.prevItem();
+        state.buffer.drawNextFrame(true);
+        return false;
+    }
+    // Outside the debug menu, replicate TerminalBuffer.moveCursorUp's
+    // own logic — we shadowed its Up registration, so we have to do
+    // the widget-cursor walk ourselves.
+    if (state.buffer.active_widget_index > 0) {
+        state.buffer.active_widget_index -= 1;
+        state.buffer.drawNextFrame(true);
+    }
+    return false;
+}
+
+fn debugArrowDown(ptr: *anyopaque) !bool {
+    var state: *UiState = @ptrCast(@alignCast(ptr));
+    if (state.debug_menu.visible) {
+        state.debug_menu.nextItem();
+        state.buffer.drawNextFrame(true);
+        return false;
+    }
+    if (state.buffer.active_widget_index + 1 < state.buffer.handlable_widgets.items.len) {
+        state.buffer.active_widget_index += 1;
+        state.buffer.drawNextFrame(true);
+    }
+    return false;
+}
+
+fn debugArrowLeft(ptr: *anyopaque) !bool {
+    var state: *UiState = @ptrCast(@alignCast(ptr));
+    if (!state.debug_menu.visible) return true;
+    if (state.matrix_ref) |m| {
+        const r = state.debug_menu.adjust(m, -1);
+        applyActionResult(state, m, r);
+    }
+    state.buffer.drawNextFrame(true);
+    return false;
+}
+
+fn debugArrowRight(ptr: *anyopaque) !bool {
+    var state: *UiState = @ptrCast(@alignCast(ptr));
+    if (!state.debug_menu.visible) return true;
+    if (state.matrix_ref) |m| {
+        const r = state.debug_menu.adjust(m, 1);
+        applyActionResult(state, m, r);
+    }
+    state.buffer.drawNextFrame(true);
+    return false;
 }
 
 // h/l adjust the selected item when debug visible; no-op otherwise.
@@ -2334,7 +2409,9 @@ fn positionWidgets(ptr: *anyopaque) !void {
         if (state.config.brightness_up_key != null) {
             last_label = state.brightness_up_label;
         }
-        state.debug_label.positionXY(last_label
+        // positionX (not positionXY) — keeps the same row instead of
+        // copying brightness_up's y which was advanced one line.
+        state.debug_label.positionX(last_label
             .childrenPosition()
             .addX(1));
         last_label = state.debug_label;
