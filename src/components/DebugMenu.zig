@@ -122,9 +122,16 @@ pub const Tab = enum {
 
 const TABS = [_]Tab{ .rain, .errors, .lockout };
 
+// Two-mode navigation. In .nav, arrow keys cycle items / tabs and
+// Enter "opens" the selected item for editing. In .edit, up/down
+// adjust the selected numeric value; Enter or Esc returns to .nav.
+// Action items fire directly on Enter without entering edit mode.
+pub const Mode = enum { nav, edit };
+
 visible: bool = false,
 tab_idx: u8 = 0,
 item_idx: u8 = 0,
+mode: Mode = .nav,
 // Wired up by main after Matrix is constructed and the UiState
 // pointers are stable. drawWidget reads through these to get current
 // values to display.
@@ -169,7 +176,45 @@ pub fn toggle(self: *DebugMenu) void {
     if (self.visible) {
         self.tab_idx = 0;
         self.item_idx = 0;
+        self.mode = .nav;
     }
+}
+
+// Enter pressed on the current item.
+//   - Action item: fire it (return the corresponding ActionResult).
+//   - Numeric item: toggle into edit mode (no value change).
+//   - Readout: no-op.
+//   - While already in edit: commit and return to nav mode.
+pub fn activate(self: *DebugMenu, _: *Matrix) ActionResult {
+    var r: ActionResult = .{};
+    if (self.mode == .edit) {
+        self.mode = .nav;
+        return r;
+    }
+    const item = self.currentItem();
+    if (item.isAction()) {
+        switch (item) {
+            .action_error_burst => r.fire_error_burst = true,
+            .action_toggle_locked => r.toggle_locked = true,
+            .action_reset_fails => r.reset_fails = true,
+            else => {},
+        }
+        return r;
+    }
+    if (item.isReadout()) return r;
+    // Numeric — flip into edit mode.
+    self.mode = .edit;
+    return r;
+}
+
+// Exit edit mode without committing further changes. Wired to Esc
+// when the menu is visible.
+pub fn exitEdit(self: *DebugMenu) bool {
+    if (self.mode == .edit) {
+        self.mode = .nav;
+        return true;
+    }
+    return false;
 }
 
 pub fn currentTab(self: *const DebugMenu) Tab {
@@ -365,9 +410,12 @@ fn drawWidget(self: *DebugMenu) void {
         const row_bg: u32 = if (selected) COL_SELECTED_BG else COL_BG;
         // Fill the row background so selection highlight is visible.
         fillRow(px + 1, row_y, panel_w - 2, COL_LABEL, row_bg);
-        // Selection marker
+        // Selection marker — different glyph when editing so the
+        // mode change is visually obvious.
         if (selected) {
-            Cell.init('>', COL_TAB_ACTIVE, row_bg).put(px + 2, row_y);
+            const marker: u32 = if (self.mode == .edit) '*' else '>';
+            const marker_fg: u32 = if (self.mode == .edit) 0x01FFFF00 else COL_TAB_ACTIVE;
+            Cell.init(marker, marker_fg, row_bg).put(px + 2, row_y);
         }
         // Label
         const label_fg: u32 = if (item.isAction()) COL_ACTION else COL_LABEL;
@@ -378,7 +426,10 @@ fn drawWidget(self: *DebugMenu) void {
     }
 
     // Help line at bottom
-    const help = "Tab tabs  j/k item  h/l adjust  Sh+F12 close";
+    const help = if (self.mode == .edit)
+        "EDITING: \xe2\x86\x91/\xe2\x86\x93 adjust  Enter/Esc done"
+    else
+        "\xe2\x86\x91/\xe2\x86\x93 item  Tab tab  Enter edit  Esc close";
     if (help.len < panel_w - 2) {
         putStr(px + 1, py + panel_h - 2, help, COL_HELP, COL_BG);
     } else {

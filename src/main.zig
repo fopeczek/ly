@@ -492,6 +492,17 @@ pub fn main(init: std.process.Init) !void {
     std.posix.sigaction(std.posix.SIG.QUIT, &sigint_ignore, null);
     std.posix.sigaction(std.posix.SIG.TSTP, &sigint_ignore, null);
 
+    // Kernel-enforced parent-death signal. When ly runs under kmscon
+    // and kmscon is killed (the wrapper SIGTERMs it on successful
+    // auth to release DRM master), ly would otherwise survive as an
+    // orphan whose pty fd has been deleted — and busy-loop on
+    // tb_poll_event hitting EBADF/POLLNVAL at 100% CPU. PR_SET_PDEATHSIG
+    // makes the kernel send SIGTERM the instant the parent exits, so
+    // we self-terminate cleanly. PR_SET_PDEATHSIG constant from
+    // <linux/prctl.h> = 1.
+    const PR_SET_PDEATHSIG: i32 = 1;
+    _ = std.os.linux.prctl(PR_SET_PDEATHSIG, @as(usize, @intCast(@intFromEnum(std.posix.SIG.TERM))), 0, 0, 0);
+
     // Initialize components
     state.shutdown_label = Label.init(
         "",
@@ -1433,7 +1444,7 @@ pub fn main(init: std.process.Init) !void {
     try state.buffer.registerGlobalKeybind(state.io, "Left", &debugArrowLeft, &state);
     try state.buffer.registerGlobalKeybind(state.io, "Right", &debugArrowRight, &state);
 
-    try state.buffer.registerGlobalKeybind(state.io, "Enter", &authenticate, &state);
+    try state.buffer.registerGlobalKeybind(state.io, "Enter", &debugEnter, &state);
 
     try state.buffer.registerGlobalKeybind(state.io, state.config.shutdown_key, &shutdownCmd, &state);
     try state.buffer.registerGlobalKeybind(state.io, state.config.restart_key, &restartCmd, &state);
@@ -1606,10 +1617,14 @@ fn uiErrorHandler(err: anyerror, ctx: *anyopaque) anyerror!void {
 fn disableInsertMode(ptr: *anyopaque) !bool {
     var state: *UiState = @ptrCast(@alignCast(ptr));
 
-    // Esc closes the debug menu if it's open (in addition to
-    // Shift+F12). Without this Esc still falls through to vi-mode
-    // logic, which feels wrong from inside the menu.
+    // Esc inside the debug menu first exits edit-mode (back to
+    // navigation); a second Esc closes the menu. This matches the
+    // common modal-editor convention.
     if (state.debug_menu.visible) {
+        if (state.debug_menu.exitEdit()) {
+            state.buffer.drawNextFrame(true);
+            return false;
+        }
         state.debug_menu.visible = false;
         state.buffer.drawNextFrame(true);
         return false;
@@ -1738,7 +1753,14 @@ fn debugItemPrev(ptr: *anyopaque) !bool {
 fn debugArrowUp(ptr: *anyopaque) !bool {
     var state: *UiState = @ptrCast(@alignCast(ptr));
     if (state.debug_menu.visible) {
-        state.debug_menu.prevItem();
+        if (state.debug_menu.mode == .edit) {
+            if (state.matrix_ref) |m| {
+                const r = state.debug_menu.adjust(m, 1);
+                applyActionResult(state, m, r);
+            }
+        } else {
+            state.debug_menu.prevItem();
+        }
         state.buffer.drawNextFrame(true);
         return false;
     }
@@ -1755,7 +1777,14 @@ fn debugArrowUp(ptr: *anyopaque) !bool {
 fn debugArrowDown(ptr: *anyopaque) !bool {
     var state: *UiState = @ptrCast(@alignCast(ptr));
     if (state.debug_menu.visible) {
-        state.debug_menu.nextItem();
+        if (state.debug_menu.mode == .edit) {
+            if (state.matrix_ref) |m| {
+                const r = state.debug_menu.adjust(m, -1);
+                applyActionResult(state, m, r);
+            }
+        } else {
+            state.debug_menu.nextItem();
+        }
         state.buffer.drawNextFrame(true);
         return false;
     }
@@ -1809,6 +1838,25 @@ fn debugAdjustUp(ptr: *anyopaque) !bool {
     }
     state.buffer.drawNextFrame(true);
     return false;
+}
+
+// Enter handler. When the debug menu is open and on a numeric item
+// it flips into edit-mode (up/down then adjust the value). On action
+// items it fires the action directly. On readouts it's a no-op.
+// When the menu is hidden, falls through to ly's normal Enter
+// behaviour (authenticate).
+fn debugEnter(ptr: *anyopaque) !bool {
+    var state: *UiState = @ptrCast(@alignCast(ptr));
+    if (state.debug_menu.visible) {
+        if (state.matrix_ref) |m| {
+            const r = state.debug_menu.activate(m);
+            applyActionResult(state, m, r);
+        }
+        state.buffer.drawNextFrame(true);
+        return false;
+    }
+    // Pass through to the regular authenticate handler.
+    return try authenticate(ptr);
 }
 
 fn applyActionResult(state: *UiState, m: *Matrix, r: DebugMenu.ActionResult) void {
