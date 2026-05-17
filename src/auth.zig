@@ -24,6 +24,15 @@ pub const AuthOptions = struct {
     x_vt: ?u8,
     session_pid: std.posix.pid_t,
     use_kmscon_vt: bool,
+    // When set, ly runs in "auth-only" mode: do PAM auth + open
+    // session, then serialize username + the resolved session shell
+    // command to this file path and exit 0 *without* forking the
+    // session. A parent wrapper then reads the file, drops privs to
+    // the user, and exec's the session on a clean tty (no DRM-master
+    // holdover from the kmscon greeter). See
+    // [[project_kmscon_libseat_drm_busy_2026_05_17]] for the
+    // architectural rationale.
+    auth_only_state: ?[]const u8 = null,
 };
 
 var xorg_pid: std.posix.pid_t = 0;
@@ -142,6 +151,16 @@ pub fn authenticate(
     // Set user shell if it hasn't already been set
     try log_file.info(io, "auth/passwd", "setting user shell", .{});
     if (user_entry.shell == null) interop.setUserShell(&user_entry);
+
+    // Auth-only mode: serialise username + the session shell command
+    // to the state file and exit. The parent wrapper takes over from
+    // there. Skips fork, exec, and pam_close_session — runuser in
+    // the wrapper will open a fresh PAM session for the user.
+    if (options.auth_only_state) |state_path| {
+        try log_file.info(io, "auth/sys", "auth-only: writing state to {s}", .{state_path});
+        try writeAuthOnlyState(allocator, io, state_path, user_entry, options, current_environment);
+        return;
+    }
 
     var shared_err = try SharedError.init(null, null);
     defer shared_err.deinit();
@@ -701,4 +720,52 @@ fn pamDiagnose(status: c_int) anyerror {
         interop.pam.PAM_USER_UNKNOWN => return error.PamUserUnknown,
         else => return error.PamAbort,
     };
+}
+
+// Serialize the post-auth state to a shell-sourceable file. Format
+// is `KEY='value'` per line — single-quote escaping is the only thing
+// we have to worry about since usernames and session names don't
+// contain `'`. Wrapper does `. $STATE_FILE` to import.
+//
+// Keys written:
+//   LY_USER          — username, for `runuser -u`
+//   LY_SHELL         — user's login shell, for `$shell -c "$cmd"`
+//   LY_SESSION_CMD   — the exact "$setup_cmd $login_cmd $exec_cmd"
+//                      that startSession()/executeCmd() would have
+//                      passed to the user's shell. Pre-composed here
+//                      to match upstream's command shape exactly.
+//   LY_SESSION_TYPE  — wayland / x11 / tty (drives XDG_SESSION_TYPE)
+//   LY_SESSION_DESK  — desktop name (drives XDG_SESSION_DESKTOP)
+fn writeAuthOnlyState(
+    _: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    user_entry: interop.UsernameEntry,
+    options: AuthOptions,
+    env: Environment,
+) !void {
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .permissions = .fromMode(0o600) });
+    defer file.close(io);
+
+    var write_buf: [4096]u8 = undefined;
+    var w = file.writer(io, &write_buf);
+    const username = user_entry.username orelse return error.NoUsername;
+    const shell = user_entry.shell orelse return error.NoUserShell;
+    const session_type: []const u8 = switch (env.display_server) {
+        .wayland => "wayland",
+        .shell => "tty",
+        .xinitrc, .x11 => "x11",
+        .custom => if (env.is_terminal) "tty" else "unspecified",
+    };
+
+    try w.interface.print("LY_USER='{s}'\n", .{username});
+    try w.interface.print("LY_SHELL='{s}'\n", .{shell});
+    try w.interface.print("LY_SESSION_CMD='{s} {s} {s}'\n", .{
+        options.setup_cmd,
+        options.login_cmd orelse "",
+        env.cmd orelse shell,
+    });
+    try w.interface.print("LY_SESSION_TYPE='{s}'\n", .{session_type});
+    try w.interface.print("LY_SESSION_DESK='{s}'\n", .{env.xdg_session_desktop orelse ""});
+    try w.interface.flush();
 }

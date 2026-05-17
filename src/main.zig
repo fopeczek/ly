@@ -110,6 +110,13 @@ const UiState = struct {
     matrix_ref: ?*Matrix,
     // Live-tunable debug overlay (toggled with Ctrl+Shift+Alt+Esc).
     debug_menu: DebugMenu,
+    // Auth-only knobs (--auth-only / --state CLI flags). When
+    // auth_only_mode is true and PAM succeeds, ly writes session info
+    // to auth_only_state_path and exits 0 instead of forking the
+    // session. The wrapper /usr/local/bin/ly-via-kmscon picks up
+    // from there.
+    auth_only_mode: bool,
+    auth_only_state_path: ?[]const u8,
     session_specifier_label: Label,
     login_label: Label,
     password_label: Label,
@@ -189,6 +196,8 @@ pub fn main(init: std.process.Init) !void {
         \\-c, --config <str>        Overrides the default configuration path. Example: --config /usr/share/ly
         \\--use-kmscon-vt           Uses KMSCON instead of the kernel VT.
         \\--take-tty <u8>           When running under a terminal emulator (kmscon), reassign controlling TTY to /dev/ttyN so PAM/logind accept the session. Termbox keeps rendering through the inherited fd.
+        \\--auth-only               Do PAM auth + session-info write, then exit without forking the session. A parent wrapper takes over (used to escape kmscon's DRM-master hold before sway starts).
+        \\--state <str>             Path of the state file --auth-only writes (default /run/ly/state-tty1).
         \\--validate-config <str>   Validates the given configuration file.
     );
 
@@ -211,6 +220,11 @@ pub fn main(init: std.process.Init) !void {
     // initializing termbox. Set via --take-tty=N; null means "leave
     // ctty alone" (vanilla path, no kmscon parent).
     var take_tty_target: ?u8 = null;
+    // Auth-only mode bookkeeping. Mirrored onto state.auth_only_*
+    // a few lines below so the authenticate() callback can see them
+    // — callbacks only get access to UiState via a pointer.
+    state.auth_only_mode = false;
+    state.auth_only_state_path = null;
 
     var start_cmd_exit_code: u8 = 0;
 
@@ -232,6 +246,8 @@ pub fn main(init: std.process.Init) !void {
         if (res.args.config) |path| config_parent_path = path;
         if (res.args.@"use-kmscon-vt" != 0) state.use_kmscon_vt = true;
         if (res.args.@"take-tty") |n| take_tty_target = n;
+        if (res.args.@"auth-only" != 0) state.auth_only_mode = true;
+        if (res.args.state) |path| state.auth_only_state_path = path;
         if (res.args.@"validate-config") |path| {
             var parser = try IniParser(Config).init(
                 state.allocator,
@@ -1942,6 +1958,7 @@ fn authenticate(ptr: *anyopaque) !bool {
                 .x_vt = state.config.x_vt,
                 .session_pid = session_pid,
                 .use_kmscon_vt = state.use_kmscon_vt,
+                .auth_only_state = if (state.auth_only_mode) (state.auth_only_state_path orelse "/run/ly/state") else null,
             };
 
             // Signal action to give up control on the TTY
