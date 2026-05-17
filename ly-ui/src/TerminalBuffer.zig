@@ -27,6 +27,12 @@ pub const InitOptions = struct {
     border_fg: u32,
     full_color: bool,
     is_tty: bool,
+    // When set, termbox2 initializes on this fd instead of opening
+    // /dev/tty itself. Used when ly has swapped controlling TTY (e.g.
+    // running inside kmscon with --take-tty=N) — termbox must keep
+    // rendering through the original pty fd while ctty points
+    // elsewhere for PAM/logind. See interop.swapControllingTty.
+    tty_fd: ?c_int = null,
 };
 
 pub const Styling = struct {
@@ -102,8 +108,14 @@ pub fn init(
     log_file: *LogFile,
     random: Random,
 ) !TerminalBuffer {
-    // Initialize termbox
-    _ = termbox.tb_init();
+    // Initialize termbox. If the caller provided a tty_fd (the kmscon
+    // pty fd saved before ctty swap), use it directly so rendering
+    // stays routed through kmscon; otherwise let termbox open /dev/tty.
+    if (options.tty_fd) |fd| {
+        _ = termbox.tb_init_fd(fd);
+    } else {
+        _ = termbox.tb_init();
+    }
 
     if (options.full_color) {
         _ = termbox.tb_set_output_mode(termbox.TB_OUTPUT_TRUECOLOR);

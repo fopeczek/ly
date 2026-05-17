@@ -174,6 +174,7 @@ pub fn main(init: std.process.Init) !void {
         \\-v, --version             Shows the version of Ly.
         \\-c, --config <str>        Overrides the default configuration path. Example: --config /usr/share/ly
         \\--use-kmscon-vt           Uses KMSCON instead of the kernel VT.
+        \\--take-tty <u8>           When running under a terminal emulator (kmscon), reassign controlling TTY to /dev/ttyN so PAM/logind accept the session. Termbox keeps rendering through the inherited fd.
         \\--validate-config <str>   Validates the given configuration file.
     );
 
@@ -191,6 +192,11 @@ pub fn main(init: std.process.Init) !void {
     defer if (old_save_parser) |*str| str.deinit();
 
     state.use_kmscon_vt = false;
+
+    // /dev/ttyN number to reassign as our controlling tty before
+    // initializing termbox. Set via --take-tty=N; null means "leave
+    // ctty alone" (vanilla path, no kmscon parent).
+    var take_tty_target: ?u8 = null;
 
     var start_cmd_exit_code: u8 = 0;
 
@@ -211,6 +217,7 @@ pub fn main(init: std.process.Init) !void {
         }
         if (res.args.config) |path| config_parent_path = path;
         if (res.args.@"use-kmscon-vt" != 0) state.use_kmscon_vt = true;
+        if (res.args.@"take-tty") |n| take_tty_target = n;
         if (res.args.@"validate-config") |path| {
             var parser = try IniParser(Config).init(
                 state.allocator,
@@ -381,6 +388,22 @@ pub fn main(init: std.process.Init) !void {
         start_cmd_exit_code = process_result.exited;
     }
 
+    // Reassign controlling TTY before termbox grabs it. When ly runs
+    // inside kmscon, the inherited ctty is kmscon's pty — that mismatch
+    // makes pam_systemd's logind/Varlink CreateSession reject the
+    // session with InvalidParameter. swapControllingTty hands us back
+    // an fd to the original (kmscon) pty so termbox keeps rendering
+    // through kmscon while ctty becomes /dev/ttyN for PAM's benefit.
+    var preserved_tty_fd: ?c_int = null;
+    if (take_tty_target) |n| {
+        if (interop.swapControllingTty(n)) |fd| {
+            preserved_tty_fd = fd;
+            try state.log_file.info(state.io, "tui", "ctty reassigned to /dev/tty{d}; termbox uses inherited pty fd", .{n});
+        } else |err| {
+            try state.log_file.err(state.io, "tui", "swapControllingTty failed: {s} — continuing without ctty swap", .{@errorName(err)});
+        }
+    }
+
     // Initialize terminal buffer
     try state.log_file.info(state.io, "tui", "initializing terminal buffer", .{});
     var labels = [_][]const u8{
@@ -406,6 +429,7 @@ pub fn main(init: std.process.Init) !void {
         .border_fg = state.config.border_fg,
         .full_color = state.config.full_color,
         .is_tty = true,
+        .tty_fd = preserved_tty_fd,
     };
     state.buffer = try TerminalBuffer.init(
         state.allocator,

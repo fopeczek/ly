@@ -287,6 +287,60 @@ pub fn switchTty(tty: u8) !void {
     if (status != 0) return error.FailedToWaitForActiveTty;
 }
 
+// Detach the calling session from its current controlling TTY (typically
+// kmscon's pty when ly is launched inside kmscon) and adopt /dev/ttyN
+// as the new controlling TTY. Returns an open fd to the *previous*
+// controlling TTY so the caller can keep using it for terminal I/O
+// (specifically: termbox2 rendering, which has to stay routed through
+// kmscon's pty so kmscon can render it onto the framebuffer).
+//
+// Why: pam_systemd's Varlink CreateSession call cross-checks the
+// caller's actual controlling TTY against PAM_TTY. If the process is
+// inside kmscon's pty but Ly declares PAM_TTY="tty1", logind returns
+// org.varlink.service.InvalidParameter and session creation fails →
+// login is impossible. Re-attaching ctty to /dev/tty1 makes the two
+// consistent and logind happy, while the returned fd lets termbox keep
+// drawing through kmscon for the truecolor/Pango rendering.
+//
+// Requires the process to already be a session leader (forkpty() done
+// by kmscon ensures this). Linux-only; FreeBSD path returns an error.
+pub fn swapControllingTty(target_tty_num: u8) !std.posix.fd_t {
+    if (builtin.os.tag != .linux) return error.FeatureUnimplemented;
+
+    const TIOCNOTTY: u32 = 0x5422;
+    const TIOCSCTTY: u32 = 0x540E;
+
+    // Hold an open fd to the *current* controlling tty (whatever it
+    // is — typically kmscon's pty). This fd survives the ctty swap and
+    // is what we hand back to termbox2 so rendering still goes through
+    // kmscon.
+    const old_ctty_fd = std.c.open("/dev/tty", .{ .ACCMODE = .RDWR });
+    if (old_ctty_fd < 0) return error.OpenCurrentCttyFailed;
+    errdefer _ = std.c.close(old_ctty_fd);
+
+    // Detach the session from the current ctty. After this, the
+    // session has no controlling terminal — required precondition for
+    // TIOCSCTTY below. If we weren't a session leader the ioctl is a
+    // no-op; the subsequent TIOCSCTTY would then fail with EPERM,
+    // which we surface as SetCtTyFailed.
+    _ = std.c.ioctl(old_ctty_fd, TIOCNOTTY);
+
+    // Open the target tty WITHOUT claiming it as ctty implicitly
+    // (O_NOCTTY). We claim it explicitly below.
+    var tty_path_buf: [16]u8 = undefined;
+    const tty_path = try std.fmt.bufPrintZ(&tty_path_buf, "/dev/tty{d}", .{target_tty_num});
+    const new_tty_fd = std.c.open(tty_path.ptr, .{ .ACCMODE = .RDWR, .NOCTTY = true });
+    if (new_tty_fd < 0) return error.OpenNewTtyFailed;
+    defer _ = std.c.close(new_tty_fd);
+
+    // Claim /dev/ttyN as the new controlling terminal. Second arg of 0
+    // = don't steal from another session.
+    const set_status = std.c.ioctl(new_tty_fd, TIOCSCTTY, @as(c_int, 0));
+    if (set_status != 0) return error.SetCtTyFailed;
+
+    return old_ctty_fd;
+}
+
 pub fn getLockState() !struct {
     numlock: bool,
     capslock: bool,
