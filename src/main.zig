@@ -2595,13 +2595,17 @@ fn positionWidgets(ptr: *anyopaque) !void {
     // Attempts-left badge pinned to the bottom-right corner. Empty
     // text until the first failed auth, so it's invisible during
     // normal use. Right-anchored via invertX with the label width
-    // subtracted; bottom-anchored via invertY against buffer height.
+    // subtracted; bottom-anchored via invertY against buffer height-1
+    // so it lands on the very last visible row (row buffer.height - 1
+    // when edge_margin.y is 0). Previously used invertY(buffer.height)
+    // which pushed the label off-screen by one row whenever
+    // edge_margin was zero — making the badge invisible.
     const a_width: usize = TerminalBuffer.strWidth(state.attempts_label.text);
     state.attempts_label.positionXY(state.edge_margin
         .add(TerminalBuffer.START_POSITION)
         .invertX(state.buffer.width)
         .removeXIf(a_width, state.buffer.width > a_width + state.edge_margin.x)
-        .invertY(state.buffer.height));
+        .invertY(state.buffer.height - 1));
 
     state.numlock_label.positionX(state.edge_margin
         .add(TerminalBuffer.START_POSITION)

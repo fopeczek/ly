@@ -222,6 +222,12 @@ glitch_seed_permille: u16,
 overlay_initial_ttl: u8,
 overlay_lines_per_burst: u8,
 rain_density: u8,
+// Last-seen rain_density. Tracked so a change (user slid the
+// debug-menu slider) can re-roll every column's line.space to
+// match the new bound — without this, density only takes effect
+// on each column's NEXT spawn (which can take 10+ seconds at
+// rd=0 because line.space ticks at advance-rate, not frame-rate).
+rain_density_prev: u8,
 min_drop_len: u8,
 // Inclusive upper bound on a freshly-spawned raindrop's trail
 // length (in cells). Spawn rolls a length in
@@ -296,6 +302,7 @@ pub fn init(
         .overlay_initial_ttl = DEFAULT_OVERLAY_INITIAL_TTL,
         .overlay_lines_per_burst = DEFAULT_OVERLAY_LINES_PER_BURST,
         .rain_density = DEFAULT_RAIN_DENSITY,
+        .rain_density_prev = DEFAULT_RAIN_DENSITY,
         .min_drop_len = DEFAULT_MIN_DROP_LEN,
         .max_drop_len = DEFAULT_MAX_DROP_LEN,
         .glitch_ttl_min = DEFAULT_GLITCH_TTL_MIN,
@@ -436,19 +443,6 @@ fn stepColumns(self: *Matrix) void {
         if (!column_has_content) {
             line.virtual_head_y = 0;
             line.dark_run = 0;
-        }
-
-        // Recompute the current density's max idle gap up-front so we
-        // can clamp `line.space` to it. Without this clamp a freshly
-        // increased rain_density (user slid the slider up) wouldn't
-        // visibly take effect until every column's CURRENT idle wait
-        // finished — at rd=0 that's up to 105 frames (~2s+). Clamping
-        // makes density changes feel immediate.
-        const rd_now: u16 = @as(u16, self.rain_density);
-        const space_unlocked_now: usize = if (rd_now >= 20) 1 else (@as(usize, 21 - rd_now) * 5);
-        const space_max_now: usize = if (self.locked) space_unlocked_now * LOCKED_SPACE_MULT else space_unlocked_now;
-        if (line.space >= space_max_now) {
-            line.space = if (space_max_now == 0) 0 else space_max_now - 1;
         }
 
         if (self.dots[x].value == null and self.dots[buf_width + x].value == ' ') {
@@ -909,6 +903,28 @@ fn draw(self: *Matrix) void {
 
     const buf_height = self.terminal_buffer.height;
     const buf_width = self.terminal_buffer.width;
+
+    // Density change → re-roll every column's line.space to land in
+    // the new bound's range. line.space is the per-column "wait
+    // before respawning the next trail". Without a fresh roll, an
+    // existing wait (e.g. 80 advances at rd=5) would persist after
+    // the user slides to rd=20 (flood) — each advance is ~10
+    // frames, so the old wait could last 10+ seconds before the
+    // new density takes effect, making the slider feel dead. We
+    // detect changes with rain_density_prev and re-roll all columns
+    // exactly once per change.
+    if (self.rain_density != self.rain_density_prev) {
+        const rd: u16 = @as(u16, self.rain_density);
+        const space_unlocked: usize = if (rd >= 20) 1 else (@as(usize, 21 - rd) * 5);
+        const space_max: usize = if (self.locked) space_unlocked * LOCKED_SPACE_MULT else space_unlocked;
+        const cap_u16: u16 = @intCast(@max(1, @min(space_max, std.math.maxInt(u16))));
+        var x_idx: usize = 0;
+        while (x_idx < buf_width) : (x_idx += 2) {
+            const r = self.terminal_buffer.random.int(u16);
+            self.lines[x_idx].space = @as(usize, @mod(r, cap_u16));
+        }
+        self.rain_density_prev = self.rain_density;
+    }
 
     self.stepColumns();
     self.tickGlitches();
