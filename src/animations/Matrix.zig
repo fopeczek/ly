@@ -31,6 +31,19 @@ const SPEED_MAX: f32 = 0.15;
 // "matrix rain" implementations on the web.
 const TAIL_CHURN_PROB: f32 = 0.04;
 
+// Per-head-spawn probability (in %) of starting a new grouped dark-gap
+// run in this column. 4% means roughly every 25th cell in a trail
+// becomes the start of a dark group — sparse enough not to dominate,
+// frequent enough to add visual interest.
+const DARK_RUN_START_PCT: u16 = 4;
+
+// Inclusive length range of a dark-gap run, in cells. Grouping (vs.
+// single random "bullet holes") was the explicit user preference;
+// 2–5 cells produces visibly contiguous gaps without ever blanking
+// more than ~10% of a trail at once.
+const DARK_RUN_MIN: u8 = 2;
+const DARK_RUN_MAX: u8 = 5;
+
 // Curated glyph pool for a Matrix-movie aesthetic. The cmatrix_*_codepoint
 // config entries are intentionally ignored — a contiguous Unicode range
 // produces ASCII-printable or pure-Katakana monocultures that don't feel
@@ -73,6 +86,13 @@ const Matrix = @This();
 pub const Dot = struct {
     value: ?usize,
     is_head: bool,
+    // Render this cell as a blank gap even though it has a value. Used
+    // to punch grouped dark spots into otherwise-monotonous trails
+    // (matrix-rain demos on the web do this — characters "blink out"
+    // for a stretch). The value/is_head bookkeeping continues normally
+    // so the algorithm doesn't get confused into thinking the column
+    // has a gap; only the render layer treats it as empty.
+    is_dark: bool = false,
 };
 
 pub const Line = struct {
@@ -95,6 +115,11 @@ pub const Line = struct {
     // vanishing instantly. 0 means no off-screen head (trail is either
     // alive on-screen or column is idle).
     virtual_head_y: usize = 0,
+    // Cells remaining in the current grouped-dark-spot run. When > 0,
+    // the next N head spawns in this column are marked is_dark so
+    // they show as gaps in the falling trail. Reset to 0 when the
+    // column empties.
+    dark_run: u8 = 0,
 };
 
 instance: ?Widget = null,
@@ -273,7 +298,10 @@ fn stepColumns(self: *Matrix) void {
                 }
             }
         }
-        if (!column_has_content) line.virtual_head_y = 0;
+        if (!column_has_content) {
+            line.virtual_head_y = 0;
+            line.dark_run = 0;
+        }
 
         if (self.dots[x].value == null and self.dots[buf_width + x].value == ' ') {
             // Only spawn a new raindrop in a truly empty column.
@@ -287,7 +315,11 @@ fn stepColumns(self: *Matrix) void {
                     const h = buf_height;
                     line.length = @mod(randint, h - 10) + 10;
                     self.dots[x].value = GLYPH_POOL[@mod(randint, GLYPH_POOL.len)];
-                    line.space = @mod(randint, h + 1);
+                    // Inter-raindrop idle gap in cells. Smaller window
+                    // = higher density (column respawns sooner after a
+                    // trail completes). h/3 gives ~3x density vs the
+                    // original [0..h] range.
+                    line.space = @mod(randint, h / 3 + 1);
                     // Reroll speed on every spawn so consecutive
                     // raindrops in the same column don't share a pace.
                     line.speed = SPEED_MIN +
@@ -335,6 +367,24 @@ fn stepColumns(self: *Matrix) void {
             const randint = self.terminal_buffer.random.int(u16);
             dot.value = GLYPH_POOL[@mod(randint, GLYPH_POOL.len)];
             dot.is_head = true;
+            // Dark-gap-run state machine. If we're mid-run, this head
+            // is dark and we decrement. Otherwise, roll the start
+            // probability; if it fires, set up a new run of random
+            // length [MIN..MAX] and dark-mark this head too.
+            if (line.dark_run > 0) {
+                dot.is_dark = true;
+                line.dark_run -= 1;
+            } else {
+                dot.is_dark = false;
+                const start_roll = self.terminal_buffer.random.int(u16);
+                if (@mod(start_roll, 100) < DARK_RUN_START_PCT) {
+                    const span = (DARK_RUN_MAX - DARK_RUN_MIN) + 1;
+                    const len_roll = self.terminal_buffer.random.int(u16);
+                    line.dark_run = @as(u8, @intCast(@mod(len_roll, span))) + DARK_RUN_MIN;
+                    dot.is_dark = true;
+                    line.dark_run -= 1;
+                }
+            }
             line.virtual_head_y = y;
 
             if (seg_len > line.length or !first_col) {
@@ -382,7 +432,7 @@ fn draw(self: *Matrix) void {
             while (head_idx < heads.len and heads[head_idx] < y) head_idx += 1;
 
             const dot = self.dots[buf_width * y + x];
-            const cell = if (dot.value == null or dot.value == ' ') self.default_cell else cell_blk: {
+            const cell = if (dot.value == null or dot.value == ' ' or dot.is_dark) self.default_cell else cell_blk: {
                 // Pick a head_y to fade against:
                 //   - If there's an on-screen is_head for this cell, use that.
                 //   - If not, use line.virtual_head_y (head has scrolled past
@@ -468,7 +518,7 @@ fn initBuffers(dots: []Dot, lines: []Line, width: usize, height: usize, random: 
     var x: usize = 0;
     while (x < width) : (x += 2) {
         var line = lines[x];
-        line.space = @mod(random.int(u16), height) + 1;
+        line.space = @mod(random.int(u16), height / 3) + 1;
         line.length = @mod(random.int(u16), height - 10) + 10;
         line.speed = SPEED_MIN + random.float(f32) * (SPEED_MAX - SPEED_MIN);
         // Random phase so all columns don't trigger their first advance
