@@ -212,6 +212,12 @@ overlay_initial_ttl: u8,
 overlay_lines_per_burst: u8,
 density_div: u8,
 min_drop_len: u8,
+// Frames elapsed since the most recent error burst. Used to
+// compute the per-frame "fall-down" probability for overlay
+// cells — starts at 0 (no decay) and ramps to OVERLAY_DECAY_FRAMES
+// where all overlay cells are aggressively dropped. New error
+// bursts reset this back to 0.
+overlay_decay_frames: u32,
 
 pub fn init(
     allocator: Allocator,
@@ -260,6 +266,7 @@ pub fn init(
         .overlay_lines_per_burst = DEFAULT_OVERLAY_LINES_PER_BURST,
         .density_div = DEFAULT_DENSITY_DIV,
         .min_drop_len = DEFAULT_MIN_DROP_LEN,
+        .overlay_decay_frames = std.math.maxInt(u32),
     };
 }
 
@@ -411,8 +418,15 @@ fn stepColumns(self: *Matrix) void {
                     // trail completes). h/3 gives ~3x density vs the
                     // original [0..h] range. Locked mode multiplies
                     // the window so density visibly collapses.
-                    const div_safe: usize = @max(self.density_div, 1);
-                    const space_max: usize = if (self.locked) (h / div_safe + 1) * LOCKED_SPACE_MULT else h / div_safe + 1;
+                    // density_div semantics: smaller = denser. New
+                    // linear scale (max-wait between trails in
+                    // cells) maps 0 → 3 (test mode, every column
+                    // ~always ready), 1 → 8 (very dense), 3 → 18
+                    // (default, slightly denser than original), and
+                    // 30 → 153 (very sparse). 0 still leaves some
+                    // gap so the screen isn't all-white-heads.
+                    const space_unlocked: usize = @as(usize, self.density_div) * 5 + 3;
+                    const space_max: usize = if (self.locked) space_unlocked * LOCKED_SPACE_MULT else space_unlocked;
                     line.space = @mod(randint, @as(u16, @intCast(@min(space_max, std.math.maxInt(u16)))));
                     // Reroll speed on every spawn so consecutive
                     // raindrops in the same column don't share a pace.
@@ -535,7 +549,19 @@ const LOCKED_SPACE_MULT: usize = 3;
 // overlay layer. Each cell's TTL counts down only when a rain head
 // walks across it, so the text gets visually "scrubbed away" by
 // passing raindrops — slow when rain is light, fast when dense.
+// At ~50fps this is roughly 30s — the time after which an
+// untouched overlay should be fully gone via the per-frame
+// fall-down. Mimics faillock's lockout window without depending on
+// faillock state.
+const OVERLAY_DECAY_FRAMES: u32 = 1500;
+
 pub fn pushErrorBurst(self: *Matrix) void {
+    // Restart the decay timer so the freshly-added error text gets
+    // its full settle period before falling. Multiple bursts in
+    // quick succession therefore accumulate and persist longer —
+    // matching the user's intuition that more attempts = more red.
+    self.overlay_decay_frames = 0;
+
     const w = self.terminal_buffer.width;
     const h = self.terminal_buffer.height;
     if (w == 0 or h == 0) return;
@@ -562,6 +588,146 @@ pub fn pushErrorBurst(self: *Matrix) void {
             self.dots[idx].overlay_ch = @intCast(ch);
             self.dots[idx].overlay_ttl = self.overlay_initial_ttl;
         }
+    }
+}
+
+// Public: wipe every overlay cell immediately. Wired to the
+// [ clear errors ] debug action.
+pub fn clearOverlay(self: *Matrix) void {
+    for (self.dots) |*d| {
+        d.overlay_ttl = 0;
+        d.overlay_ch = ' ';
+    }
+    self.overlay_decay_frames = std.math.maxInt(u32);
+}
+
+// Per-frame overlay decay. As overlay_decay_frames climbs toward
+// OVERLAY_DECAY_FRAMES, each overlay cell has an increasing
+// probability of "falling" — moving its glyph one row down (or
+// disappearing if at the bottom). Iterate bottom-up so a moved
+// glyph isn't re-processed in the same frame.
+fn decayOverlay(self: *Matrix) void {
+    if (self.overlay_decay_frames >= OVERLAY_DECAY_FRAMES) {
+        // Saturating: clamp to the threshold; no further work.
+        self.overlay_decay_frames = OVERLAY_DECAY_FRAMES;
+        return;
+    }
+    self.overlay_decay_frames += 1;
+
+    // Ramp 0..1 across the decay window. Squared so the drop rate
+    // is gentle at the start and accelerates as we approach the
+    // end of the faillock window — matches the user's spec
+    // ("higher chance to drop char" near the end).
+    const phase: f32 = @as(f32, @floatFromInt(self.overlay_decay_frames)) /
+        @as(f32, @floatFromInt(OVERLAY_DECAY_FRAMES));
+    const drop_prob: f32 = phase * phase * 0.04;
+
+    const w = self.terminal_buffer.width;
+    const h = self.terminal_buffer.height;
+    if (w == 0 or h == 0) return;
+
+    var y_iter: usize = h;
+    while (y_iter >= 1) : (y_iter -= 1) {
+        var x: usize = 0;
+        while (x < w) : (x += 2) {
+            const idx = w * y_iter + x;
+            if (idx >= self.dots.len) continue;
+            const dot = &self.dots[idx];
+            if (dot.overlay_ttl == 0) continue;
+            if (self.terminal_buffer.random.float(f32) >= drop_prob) continue;
+            // Try to move the overlay glyph one row down.
+            if (y_iter < h) {
+                const tidx = w * (y_iter + 1) + x;
+                if (tidx < self.dots.len) {
+                    const target = &self.dots[tidx];
+                    // Only overwrite if target slot is empty (or
+                    // also an overlay cell — we displace it).
+                    target.overlay_ch = dot.overlay_ch;
+                    target.overlay_ttl = dot.overlay_ttl;
+                }
+            }
+            dot.overlay_ttl = 0;
+            dot.overlay_ch = ' ';
+        }
+    }
+}
+
+// ─── persistence ────────────────────────────────────────────────────
+// Tunables auto-save to PREFS_PATH after every debug-menu edit and
+// auto-load on init. Format is one `key=value` line per field —
+// trivially parseable + human-readable. Fields keep their default
+// values when absent (so adding a new field doesn't break old prefs).
+pub const PREFS_PATH: []const u8 = "/var/lib/ly/matrix-prefs";
+
+pub fn savePrefs(self: *Matrix, io: std.Io) void {
+    // Best-effort: failure to persist is silently ignored.
+    saveImpl(self, io) catch {};
+}
+
+fn saveImpl(self: *Matrix, io: std.Io) !void {
+    // Ensure the parent directory exists. systemd's StateDirectory=ly
+    // creates /var/lib/ly automatically when the unit starts; this
+    // is a defence in case the directory was wiped.
+    std.Io.Dir.cwd().createDirPath(io, "/var/lib/ly") catch {};
+
+    var file = try std.Io.Dir.cwd().createFile(
+        io,
+        PREFS_PATH,
+        .{ .permissions = .fromMode(0o600) },
+    );
+    defer file.close(io);
+
+    var buf: [1024]u8 = undefined;
+    var w = file.writer(io, &buf);
+    try w.interface.print("speed_min={d:.4}\n", .{self.speed_min});
+    try w.interface.print("speed_max={d:.4}\n", .{self.speed_max});
+    try w.interface.print("tail_churn_prob={d:.4}\n", .{self.tail_churn_prob});
+    try w.interface.print("dark_run_start_pct={d}\n", .{self.dark_run_start_pct});
+    try w.interface.print("dark_run_min={d}\n", .{self.dark_run_min});
+    try w.interface.print("dark_run_max={d}\n", .{self.dark_run_max});
+    try w.interface.print("glitch_seed_permille={d}\n", .{self.glitch_seed_permille});
+    try w.interface.print("overlay_initial_ttl={d}\n", .{self.overlay_initial_ttl});
+    try w.interface.print("overlay_lines_per_burst={d}\n", .{self.overlay_lines_per_burst});
+    try w.interface.print("density_div={d}\n", .{self.density_div});
+    try w.interface.print("min_drop_len={d}\n", .{self.min_drop_len});
+    try w.interface.flush();
+}
+
+pub fn loadPrefs(self: *Matrix, io: std.Io) void {
+    loadImpl(self, io) catch {
+        // Missing/corrupt prefs file is fine — defaults apply.
+    };
+}
+
+fn loadImpl(self: *Matrix, io: std.Io) !void {
+    var file = try std.Io.Dir.cwd().openFile(
+        io,
+        PREFS_PATH,
+        .{ .mode = .read_only },
+    );
+    defer file.close(io);
+
+    var read_buf: [4096]u8 = undefined;
+    var fr = file.reader(io, &read_buf);
+    var r = &fr.interface;
+    while (true) {
+        const line = r.takeDelimiterInclusive('\n') catch break;
+        const trimmed = std.mem.trimEnd(u8, line, "\n\r ");
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        const key = trimmed[0..eq];
+        const val = trimmed[eq + 1 ..];
+
+        if (std.mem.eql(u8, key, "speed_min")) self.speed_min = std.fmt.parseFloat(f32, val) catch self.speed_min
+        else if (std.mem.eql(u8, key, "speed_max")) self.speed_max = std.fmt.parseFloat(f32, val) catch self.speed_max
+        else if (std.mem.eql(u8, key, "tail_churn_prob")) self.tail_churn_prob = std.fmt.parseFloat(f32, val) catch self.tail_churn_prob
+        else if (std.mem.eql(u8, key, "dark_run_start_pct")) self.dark_run_start_pct = std.fmt.parseInt(u16, val, 10) catch self.dark_run_start_pct
+        else if (std.mem.eql(u8, key, "dark_run_min")) self.dark_run_min = std.fmt.parseInt(u8, val, 10) catch self.dark_run_min
+        else if (std.mem.eql(u8, key, "dark_run_max")) self.dark_run_max = std.fmt.parseInt(u8, val, 10) catch self.dark_run_max
+        else if (std.mem.eql(u8, key, "glitch_seed_permille")) self.glitch_seed_permille = std.fmt.parseInt(u16, val, 10) catch self.glitch_seed_permille
+        else if (std.mem.eql(u8, key, "overlay_initial_ttl")) self.overlay_initial_ttl = std.fmt.parseInt(u8, val, 10) catch self.overlay_initial_ttl
+        else if (std.mem.eql(u8, key, "overlay_lines_per_burst")) self.overlay_lines_per_burst = std.fmt.parseInt(u8, val, 10) catch self.overlay_lines_per_burst
+        else if (std.mem.eql(u8, key, "density_div")) self.density_div = std.fmt.parseInt(u8, val, 10) catch self.density_div
+        else if (std.mem.eql(u8, key, "min_drop_len")) self.min_drop_len = std.fmt.parseInt(u8, val, 10) catch self.min_drop_len;
     }
 }
 
@@ -625,6 +791,7 @@ fn draw(self: *Matrix) void {
 
     self.stepColumns();
     self.tickGlitches();
+    self.decayOverlay();
 
     // Stack-allocated buffer for per-column head positions. A column can
     // host multiple concurrent trails; without per-cell head lookup the

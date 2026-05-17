@@ -46,6 +46,7 @@ pub const Item = enum {
     overlay_initial_ttl,
     overlay_lines_per_burst,
     action_error_burst,
+    action_clear_errors,
     // Lockout tab
     action_toggle_locked,
     action_reset_fails,
@@ -66,6 +67,7 @@ pub const Item = enum {
             .overlay_initial_ttl => "overlay TTL     ",
             .overlay_lines_per_burst => "overlay lines/  ",
             .action_error_burst => "[ trigger error ]",
+            .action_clear_errors => "[ clear errors  ]",
             .action_toggle_locked => "[ toggle locked ]",
             .action_reset_fails => "[ reset fails   ]",
             .readout_locked => "locked          ",
@@ -75,7 +77,7 @@ pub const Item = enum {
 
     pub fn isAction(self: Item) bool {
         return switch (self) {
-            .action_error_burst, .action_toggle_locked, .action_reset_fails => true,
+            .action_error_burst, .action_clear_errors, .action_toggle_locked, .action_reset_fails => true,
             else => false,
         };
     }
@@ -110,7 +112,8 @@ pub const Tab = enum {
             },
             .errors => &[_]Item{
                 .glitch_seed_permille, .overlay_initial_ttl,
-                .overlay_lines_per_burst, .action_error_burst,
+                .overlay_lines_per_burst,
+                .action_error_burst, .action_clear_errors,
             },
             .lockout => &[_]Item{
                 .action_toggle_locked, .action_reset_fails,
@@ -195,6 +198,7 @@ pub fn activate(self: *DebugMenu, _: *Matrix) ActionResult {
     if (item.isAction()) {
         switch (item) {
             .action_error_burst => r.fire_error_burst = true,
+            .action_clear_errors => r.clear_errors = true,
             .action_toggle_locked => r.toggle_locked = true,
             .action_reset_fails => r.reset_fails = true,
             else => {},
@@ -253,6 +257,7 @@ pub const ActionResult = struct {
     fire_error_burst: bool = false,
     toggle_locked: bool = false,
     reset_fails: bool = false,
+    clear_errors: bool = false,
 };
 
 pub fn adjust(self: *DebugMenu, m: *Matrix, delta: i8) ActionResult {
@@ -261,7 +266,11 @@ pub fn adjust(self: *DebugMenu, m: *Matrix, delta: i8) ActionResult {
     switch (item) {
         .speed_min => m.speed_min = std.math.clamp(m.speed_min + @as(f32, @floatFromInt(delta)) * 0.01, 0.01, m.speed_max),
         .speed_max => m.speed_max = std.math.clamp(m.speed_max + @as(f32, @floatFromInt(delta)) * 0.01, m.speed_min, 2.0),
-        .density_div => m.density_div = u8_adjust(m.density_div, delta, 1, 30),
+        // density_div: 0 = constant-rain test mode (still leaves
+        // a few cell gap to avoid all-white-head saturation), 1 =
+        // very dense, default 3, higher = sparser. See Matrix's
+        // space_max formula for the exact mapping.
+        .density_div => m.density_div = u8_adjust(m.density_div, delta, 0, 60),
         .min_drop_len => m.min_drop_len = u8_adjust(m.min_drop_len, delta, 2, 40),
         .tail_churn_prob => m.tail_churn_prob = std.math.clamp(m.tail_churn_prob + @as(f32, @floatFromInt(delta)) * 0.01, 0.0, 1.0),
         .dark_run_start_pct => m.dark_run_start_pct = u16_adjust(m.dark_run_start_pct, delta, 0, 100),
@@ -272,6 +281,9 @@ pub fn adjust(self: *DebugMenu, m: *Matrix, delta: i8) ActionResult {
         .overlay_lines_per_burst => m.overlay_lines_per_burst = u8_adjust(m.overlay_lines_per_burst, delta, 1, 20),
         .action_error_burst => if (delta > 0) {
             r.fire_error_burst = true;
+        },
+        .action_clear_errors => if (delta > 0) {
+            r.clear_errors = true;
         },
         .action_toggle_locked => if (delta > 0) {
             r.toggle_locked = true;
@@ -316,7 +328,7 @@ pub fn formatValue(item: Item, m: *const Matrix, auth_fails: u64, buf: []u8) ![]
         .glitch_seed_permille => try std.fmt.bufPrint(buf, "{d}", .{m.glitch_seed_permille}),
         .overlay_initial_ttl => try std.fmt.bufPrint(buf, "{d}", .{m.overlay_initial_ttl}),
         .overlay_lines_per_burst => try std.fmt.bufPrint(buf, "{d}", .{m.overlay_lines_per_burst}),
-        .action_error_burst, .action_toggle_locked, .action_reset_fails => try std.fmt.bufPrint(buf, "<press l>", .{}),
+        .action_error_burst, .action_clear_errors, .action_toggle_locked, .action_reset_fails => try std.fmt.bufPrint(buf, "<press Enter>", .{}),
         .readout_locked => try std.fmt.bufPrint(buf, "{s}", .{if (m.locked) "YES" else "no"}),
         .readout_auth_fails => try std.fmt.bufPrint(buf, "{d}", .{auth_fails}),
     };

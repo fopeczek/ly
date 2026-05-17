@@ -1182,6 +1182,9 @@ pub fn main(init: std.process.Init) !void {
                 state.config.cmatrix_tail_fade,
             );
             state.matrix_ref = &matrix_storage.?;
+            // Load persisted tunables (if any). Best-effort — missing
+            // /var/lib/ly/matrix-prefs just means defaults apply.
+            matrix_storage.?.loadPrefs(state.io);
             state.debug_menu.attach(&matrix_storage.?, &state.auth_fails, &state.buffer);
             animation = matrix_storage.?.widget();
         },
@@ -1860,13 +1863,16 @@ fn debugEnter(ptr: *anyopaque) !bool {
 
 fn applyActionResult(state: *UiState, m: *Matrix, r: DebugMenu.ActionResult) void {
     if (r.fire_error_burst) m.pushErrorBurst();
+    if (r.clear_errors) m.clearOverlay();
     if (r.toggle_locked) m.setLocked(!m.locked);
     if (r.reset_fails) {
         state.auth_fails = 0;
         m.setLocked(false);
-        // Clear attempts label since the count is gone.
         state.attempts_label.setTextBuf(&state.attempts_buf, "", .{}) catch {};
     }
+    // Persist tunables after every adjust / action — debug menu
+    // changes survive ly restarts. Best-effort write.
+    m.savePrefs(state.io);
 }
 
 fn customCommand(ptr: *anyopaque) !bool {
@@ -2516,12 +2522,16 @@ fn positionWidgets(ptr: *anyopaque) !void {
         .add(TerminalBuffer.START_POSITION)
         .invertX(state.buffer.width)
         .removeXIf(TerminalBuffer.strWidth(state.clock_label.text) + tty_label_width + tty_label_gap, state.buffer.width > TerminalBuffer.strWidth(state.clock_label.text) + tty_label_width + tty_label_gap + state.edge_margin.x));
-    // Attempts-left badge pinned to the top-left corner. Stays
-    // anchored at edge_margin regardless of clock/tty status. Text
-    // is empty until the first failed auth, so it's invisible
-    // during normal use.
+    // Attempts-left badge pinned to the bottom-right corner. Empty
+    // text until the first failed auth, so it's invisible during
+    // normal use. Right-anchored via invertX with the label width
+    // subtracted; bottom-anchored via invertY against buffer height.
+    const a_width: usize = TerminalBuffer.strWidth(state.attempts_label.text);
     state.attempts_label.positionXY(state.edge_margin
-        .add(TerminalBuffer.START_POSITION));
+        .add(TerminalBuffer.START_POSITION)
+        .invertX(state.buffer.width)
+        .removeXIf(a_width, state.buffer.width > a_width + state.edge_margin.x)
+        .invertY(state.buffer.height));
 
     state.numlock_label.positionX(state.edge_margin
         .add(TerminalBuffer.START_POSITION)
