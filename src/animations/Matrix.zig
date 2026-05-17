@@ -39,6 +39,13 @@ const DEFAULT_MIN_DROP_LEN: u8 = 10;
 // can never exceed the visible area. Default 30 (~movie-feel medium
 // trails). User-tunable + persisted.
 const DEFAULT_MAX_DROP_LEN: u8 = 30;
+// drop_v_margin default: 8 cells of clearance at the top of the
+// column before a new trail spawns. Small enough that adjacent
+// trails in one column are visually distinct as separate raindrops;
+// large enough to prevent the "wave of synchronized heads" at high
+// rain_density.
+const DEFAULT_DROP_V_MARGIN: u16 = 8;
+const DEFAULT_DROP_H_MARGIN: u16 = 0;
 
 // Tail-churn / dark-run tunables previously lived here as `const`.
 // They're now instance fields on Matrix (initialised from the
@@ -236,6 +243,21 @@ min_drop_len: u8,
 // [min_drop_len, min(max_drop_len, screen_height - 1)] so the
 // value can never overflow the visible area.
 max_drop_len: u8,
+// Vertical drop margin: when a new trail is about to spawn at
+// the top of a column, the top N rows of that column must be
+// empty. Replaces the old "whole column must be empty" gate so
+// multiple trails can coexist in one column, staggered. Default
+// 8 (≈ 8 cells of clearance above the next spawn). Setting this
+// to the screen height effectively restores the old single-
+// trail-per-column behavior.
+drop_v_margin: u16,
+// Horizontal drop margin: when checking spawn eligibility, also
+// require the top drop_v_margin rows of any column within N
+// cells (left and right) to be empty. 0 = no horizontal gate;
+// adjacent columns may have heads at the same row. Higher
+// values produce a "shuffled" appearance with fewer
+// simultaneous heads along any horizontal line.
+drop_h_margin: u16,
 // Inclusive glitch-dot lifetime range. Higher values = dots
 // linger longer. Tunable via debug menu, persisted by savePrefs.
 glitch_ttl_min: u8,
@@ -305,6 +327,8 @@ pub fn init(
         .overlay_lines_per_burst = DEFAULT_OVERLAY_LINES_PER_BURST,
         .rain_density = DEFAULT_RAIN_DENSITY,
         .rain_density_prev = DEFAULT_RAIN_DENSITY,
+        .drop_v_margin = DEFAULT_DROP_V_MARGIN,
+        .drop_h_margin = DEFAULT_DROP_H_MARGIN,
         .min_drop_len = DEFAULT_MIN_DROP_LEN,
         .max_drop_len = DEFAULT_MAX_DROP_LEN,
         .glitch_ttl_min = DEFAULT_GLITCH_TTL_MIN,
@@ -447,6 +471,52 @@ fn stepColumns(self: *Matrix) void {
             line.dark_run = 0;
         }
 
+        // ──── Spawn gate based on drop_v_margin / drop_h_margin ──────
+        // Replaces the old "column must be entirely empty" gate.
+        // A new trail may spawn in this column when the top
+        // drop_v_margin rows of THIS column AND (optionally) of every
+        // adjacent column within drop_h_margin cells are empty. The
+        // old single-trail-per-column behavior is recovered by
+        // setting drop_v_margin equal to the screen height.
+        const v_gap_eff: usize = @min(@as(usize, self.drop_v_margin), buf_height);
+        const h_gap_eff: usize = @as(usize, self.drop_h_margin);
+        var spawn_gate_open: bool = true;
+        {
+            var sy: usize = 1;
+            while (sy <= v_gap_eff and sy <= buf_height) : (sy += 1) {
+                const v = self.dots[buf_width * sy + x].value;
+                if (v != null and v != ' ') {
+                    spawn_gate_open = false;
+                    break;
+                }
+            }
+            if (spawn_gate_open and h_gap_eff > 0) {
+                var dx: usize = 2;
+                neighbour_loop: while (dx <= h_gap_eff) : (dx += 2) {
+                    if (x >= dx) {
+                        var sy2: usize = 1;
+                        while (sy2 <= v_gap_eff and sy2 <= buf_height) : (sy2 += 1) {
+                            const v = self.dots[buf_width * sy2 + (x - dx)].value;
+                            if (v != null and v != ' ') {
+                                spawn_gate_open = false;
+                                break :neighbour_loop;
+                            }
+                        }
+                    }
+                    if (x + dx < buf_width) {
+                        var sy2: usize = 1;
+                        while (sy2 <= v_gap_eff and sy2 <= buf_height) : (sy2 += 1) {
+                            const v = self.dots[buf_width * sy2 + (x + dx)].value;
+                            if (v != null and v != ' ') {
+                                spawn_gate_open = false;
+                                break :neighbour_loop;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if (self.dots[x].value == null and self.dots[buf_width + x].value == ' ') {
             // rain_density == 0 disables spawning entirely — the user
             // explicitly asked for "0 = nothing spawns" semantics
@@ -456,10 +526,7 @@ fn stepColumns(self: *Matrix) void {
                 // No new spawn. Don't decrement line.space either —
                 // when the user later raises rain_density above 0,
                 // the re-roll in draw() will assign a fresh wait.
-            } else if (!column_has_content) {
-                // Only spawn a new raindrop in a truly empty column.
-                // Prevents the cmatrix-classic "two heads per column"
-                // problem that the user read as stray whites.
+            } else if (spawn_gate_open) {
                 if (line.space > 0) {
                     line.space -= 1;
                 } else {
@@ -490,7 +557,13 @@ fn stepColumns(self: *Matrix) void {
                     else
                         @as(usize, 1001 - rd);
                     const space_max: usize = if (self.locked) space_unlocked * LOCKED_SPACE_MULT else space_unlocked;
-                    const cap: u16 = @intCast(@max(1, @min(space_max, std.math.maxInt(u16))));
+                    // Minimum stagger of 4 advances: at extreme
+                    // density the formula gives space_max=1 which
+                    // would make every column respawn in lock-step
+                    // (a "wave"). Floor at 4 means consecutive
+                    // trails in the same column are offset by 0..3
+                    // advances, breaking the sync over time.
+                    const cap: u16 = @intCast(@max(4, @min(space_max, std.math.maxInt(u16))));
                     line.space = @as(usize, @mod(randint, cap));
                     // Reroll speed on every spawn so consecutive
                     // raindrops in the same column don't share a pace.
@@ -769,6 +842,8 @@ fn saveImpl(self: *Matrix, io: std.Io) !void {
     try w.interface.print("rain_density={d}\n", .{self.rain_density});
     try w.interface.print("min_drop_len={d}\n", .{self.min_drop_len});
     try w.interface.print("max_drop_len={d}\n", .{self.max_drop_len});
+    try w.interface.print("drop_v_margin={d}\n", .{self.drop_v_margin});
+    try w.interface.print("drop_h_margin={d}\n", .{self.drop_h_margin});
     try w.interface.print("glitch_ttl_min={d}\n", .{self.glitch_ttl_min});
     try w.interface.print("glitch_ttl_max={d}\n", .{self.glitch_ttl_max});
     try w.interface.print("overlay_decay_frames={d}\n", .{self.overlay_decay_frames});
@@ -839,6 +914,8 @@ fn loadImpl(self: *Matrix, io: std.Io) !void {
         }
         else if (std.mem.eql(u8, key, "min_drop_len")) self.min_drop_len = std.fmt.parseInt(u8, val, 10) catch self.min_drop_len
         else if (std.mem.eql(u8, key, "max_drop_len")) self.max_drop_len = std.fmt.parseInt(u8, val, 10) catch self.max_drop_len
+        else if (std.mem.eql(u8, key, "drop_v_margin")) self.drop_v_margin = std.fmt.parseInt(u16, val, 10) catch self.drop_v_margin
+        else if (std.mem.eql(u8, key, "drop_h_margin")) self.drop_h_margin = std.fmt.parseInt(u16, val, 10) catch self.drop_h_margin
         else if (std.mem.eql(u8, key, "glitch_ttl_min")) self.glitch_ttl_min = std.fmt.parseInt(u8, val, 10) catch self.glitch_ttl_min
         else if (std.mem.eql(u8, key, "glitch_ttl_max")) self.glitch_ttl_max = std.fmt.parseInt(u8, val, 10) catch self.glitch_ttl_max
         else if (std.mem.eql(u8, key, "overlay_decay_frames")) self.overlay_decay_frames = std.fmt.parseInt(u16, val, 10) catch self.overlay_decay_frames
@@ -939,7 +1016,13 @@ fn draw(self: *Matrix) void {
             const rd: u16 = self.rain_density;
             const space_unlocked: usize = if (rd >= 1000) 1 else @as(usize, 1001 - rd);
             const space_max: usize = if (self.locked) space_unlocked * LOCKED_SPACE_MULT else space_unlocked;
-            const cap_u16: u16 = @intCast(@max(1, @min(space_max, std.math.maxInt(u16))));
+            // Stagger floor: at re-roll time, give columns AT LEAST
+            // half the screen height of spread (or space_max,
+            // whichever is bigger). Without this, all columns get
+            // the same line.space at extreme density and produce one
+            // synchronized wave when the user slides up.
+            const stagger_floor: usize = @max(@as(usize, buf_height) / 2, 16);
+            const cap_u16: u16 = @intCast(@max(2, @min(@max(space_max, stagger_floor), std.math.maxInt(u16))));
             var x_idx: usize = 0;
             while (x_idx < buf_width) : (x_idx += 2) {
                 const r = self.terminal_buffer.random.int(u16);
