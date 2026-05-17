@@ -14,35 +14,25 @@ const TimeOfDay = interop.TimeOfDay;
 // Characters change mid-scroll
 pub const MID_SCROLL_CHANGE = true;
 
-// Per-column speed range in cells/draw-frame. Each column rolls its own
-// speed from a uniform continuous distribution at spawn time — no fixed
-// "slow / medium / fast" buckets. With frame_delay=20ms (50fps) this
-// produces column descent rates from 4 cells/sec (SPEED_MIN, ~12s to
-// cross a 50-row screen) to ~17 cells/sec (SPEED_MAX, ~3s to cross),
-// with every value in between actually used.
-const SPEED_MIN: f32 = 0.06;
-const SPEED_MAX: f32 = 0.15;
+// Defaults for the tunable parameters below. They're stored as fields
+// on the Matrix instance (not const) so the debug menu can mutate them
+// at runtime for live tuning. Original-pin values kept here for
+// reference + reset-to-defaults action.
+const DEFAULT_SPEED_MIN: f32 = 0.06;
+const DEFAULT_SPEED_MAX: f32 = 0.15;
+const DEFAULT_TAIL_CHURN_PROB: f32 = 0.04;
+const DEFAULT_DARK_RUN_START_PCT: u16 = 4;
+const DEFAULT_DARK_RUN_MIN: u8 = 2;
+const DEFAULT_DARK_RUN_MAX: u8 = 5;
+const DEFAULT_GLITCH_SEED_PERMILLE: u16 = 18;
+const DEFAULT_OVERLAY_INITIAL_TTL: u8 = 8;
+const DEFAULT_OVERLAY_LINES_PER_BURST: u8 = 3;
+const DEFAULT_DENSITY_DIV: u8 = 3;
+const DEFAULT_MIN_DROP_LEN: u8 = 10;
 
-// Per-cell per-draw-call probability that a non-head trail glyph cycles
-// to a new random pool entry. Runs every draw call regardless of whether
-// the column's accumulator triggered an advance, so tail churn is fully
-// independent of head descent speed. ~0.10 at 50fps → ~5 changes/sec
-// per visible cell, matching the rapid char-cycling look in canvas
-// "matrix rain" implementations on the web.
-const TAIL_CHURN_PROB: f32 = 0.04;
-
-// Per-head-spawn probability (in %) of starting a new grouped dark-gap
-// run in this column. 4% means roughly every 25th cell in a trail
-// becomes the start of a dark group — sparse enough not to dominate,
-// frequent enough to add visual interest.
-const DARK_RUN_START_PCT: u16 = 4;
-
-// Inclusive length range of a dark-gap run, in cells. Grouping (vs.
-// single random "bullet holes") was the explicit user preference;
-// 2–5 cells produces visibly contiguous gaps without ever blanking
-// more than ~10% of a trail at once.
-const DARK_RUN_MIN: u8 = 2;
-const DARK_RUN_MAX: u8 = 5;
+// Tail-churn / dark-run tunables previously lived here as `const`.
+// They're now instance fields on Matrix (initialised from the
+// DEFAULT_* values up top) so the debug menu can mutate them live.
 
 // Curated glyph pool for a Matrix-movie aesthetic. The cmatrix_*_codepoint
 // config entries are intentionally ignored — a contiguous Unicode range
@@ -138,12 +128,9 @@ const GlitchDot = struct {
 };
 
 const GLITCH_MAX: usize = 32;
-// Per-frame probability of seeding a new glitch dot, expressed as a
-// permille fraction (out of 1000). Low values keep them feeling like
-// genuine errors rather than a regular feature.
-const GLITCH_SEED_PERMILLE: u16 = 18;
-// Lifetime of each glitch dot in frames. 4–10 at 50fps = 80–200ms,
-// long enough to be perceptible without ever "sticking".
+// glitch_seed_permille is an instance field; default lives in
+// DEFAULT_GLITCH_SEED_PERMILLE. The TTL bounds stay const — they're
+// not user-tuned in the debug menu.
 const GLITCH_TTL_MIN: u8 = 4;
 const GLITCH_TTL_MAX: u8 = 10;
 // Stylized red used for glitch dots. Bold + saturated; matches the
@@ -154,14 +141,8 @@ const GLITCH_FG: u32 = 0x01FF3333;
 // per-pixel glitch flash so they read as a different signal).
 const OVERLAY_FG: u32 = 0x01D62828;
 
-// How many resilient "scrub passes" each overlay cell takes before it
-// disappears. One pass = one new rain head walks across the cell.
-// Larger = errors linger longer.
-const OVERLAY_INITIAL_TTL: u8 = 8;
-
-// Lines added to the overlay per failed-auth burst. The user's mental
-// model is "the more wrong attempts, the more red covers the screen".
-const OVERLAY_LINES_PER_BURST: usize = 3;
+// overlay_initial_ttl and overlay_lines_per_burst are instance fields
+// — see DEFAULT_OVERLAY_INITIAL_TTL / DEFAULT_OVERLAY_LINES_PER_BURST.
 
 // Fake-but-plausible error-code lines. Drawn from at random, then
 // rendered on a random row spanning the screen. Picked to look like
@@ -216,6 +197,21 @@ glitch_count: usize,
 // stays on until the ly process restarts, since the user can't
 // authenticate to make sway log out.
 locked: bool,
+// Runtime-tunable parameters exposed to the debug menu. Default to
+// the DEFAULT_* constants at construction; the debug-menu input
+// handlers may mutate them at any time and the next draw frame sees
+// the new value. All ranges should match the menu's clamp logic.
+speed_min: f32,
+speed_max: f32,
+tail_churn_prob: f32,
+dark_run_start_pct: u16,
+dark_run_min: u8,
+dark_run_max: u8,
+glitch_seed_permille: u16,
+overlay_initial_ttl: u8,
+overlay_lines_per_burst: u8,
+density_div: u8,
+min_drop_len: u8,
 
 pub fn init(
     allocator: Allocator,
@@ -253,6 +249,17 @@ pub fn init(
         .glitches = undefined,
         .glitch_count = 0,
         .locked = false,
+        .speed_min = DEFAULT_SPEED_MIN,
+        .speed_max = DEFAULT_SPEED_MAX,
+        .tail_churn_prob = DEFAULT_TAIL_CHURN_PROB,
+        .dark_run_start_pct = DEFAULT_DARK_RUN_START_PCT,
+        .dark_run_min = DEFAULT_DARK_RUN_MIN,
+        .dark_run_max = DEFAULT_DARK_RUN_MAX,
+        .glitch_seed_permille = DEFAULT_GLITCH_SEED_PERMILLE,
+        .overlay_initial_ttl = DEFAULT_OVERLAY_INITIAL_TTL,
+        .overlay_lines_per_burst = DEFAULT_OVERLAY_LINES_PER_BURST,
+        .density_div = DEFAULT_DENSITY_DIV,
+        .min_drop_len = DEFAULT_MIN_DROP_LEN,
     };
 }
 
@@ -334,7 +341,7 @@ fn stepColumns(self: *Matrix) void {
         var line = &self.lines[x];
 
         // ──── Tail churn pass — runs every draw call ────────────────
-        // Non-head trail cells cycle their glyph with TAIL_CHURN_PROB
+        // Non-head trail cells cycle their glyph with self.tail_churn_prob
         // independently of whether this column's accumulator advances
         // the head this frame. Decoupling churn from advance gives the
         // "constantly flickering code" look: tails bubble even while
@@ -346,7 +353,7 @@ fn stepColumns(self: *Matrix) void {
                 if (cell.is_head) continue;
                 const v = cell.value orelse continue;
                 if (v == ' ') continue;
-                if (self.terminal_buffer.random.float(f32) < TAIL_CHURN_PROB) {
+                if (self.terminal_buffer.random.float(f32) < self.tail_churn_prob) {
                     const r = self.terminal_buffer.random.int(u32);
                     const churn_pool: []const u32 = if (self.locked) &LOCKED_GLYPH_POOL else &GLYPH_POOL;
                     cell.value = churn_pool[@mod(r, churn_pool.len)];
@@ -396,7 +403,7 @@ fn stepColumns(self: *Matrix) void {
                 } else {
                     const randint = self.terminal_buffer.random.int(u16);
                     const h = buf_height;
-                    line.length = @mod(randint, h - 10) + 10;
+                    line.length = @mod(randint, h - self.min_drop_len) + self.min_drop_len;
                     const pool: []const u32 = if (self.locked) &LOCKED_GLYPH_POOL else &GLYPH_POOL;
                     self.dots[x].value = pool[@mod(randint, pool.len)];
                     // Inter-raindrop idle gap in cells. Smaller window
@@ -404,12 +411,13 @@ fn stepColumns(self: *Matrix) void {
                     // trail completes). h/3 gives ~3x density vs the
                     // original [0..h] range. Locked mode multiplies
                     // the window so density visibly collapses.
-                    const space_max: usize = if (self.locked) (h / 3 + 1) * LOCKED_SPACE_MULT else h / 3 + 1;
+                    const div_safe: usize = @max(self.density_div, 1);
+                    const space_max: usize = if (self.locked) (h / div_safe + 1) * LOCKED_SPACE_MULT else h / div_safe + 1;
                     line.space = @mod(randint, @as(u16, @intCast(@min(space_max, std.math.maxInt(u16)))));
                     // Reroll speed on every spawn so consecutive
                     // raindrops in the same column don't share a pace.
-                    line.speed = SPEED_MIN +
-                        self.terminal_buffer.random.float(f32) * (SPEED_MAX - SPEED_MIN);
+                    line.speed = self.speed_min +
+                        self.terminal_buffer.random.float(f32) * (self.speed_max - self.speed_min);
                 }
             }
         }
@@ -469,10 +477,10 @@ fn stepColumns(self: *Matrix) void {
             } else {
                 dot.is_dark = false;
                 const start_roll = self.terminal_buffer.random.int(u16);
-                if (@mod(start_roll, 100) < DARK_RUN_START_PCT) {
-                    const span = (DARK_RUN_MAX - DARK_RUN_MIN) + 1;
+                if (@mod(start_roll, 100) < self.dark_run_start_pct) {
+                    const span = (self.dark_run_max - self.dark_run_min) + 1;
                     const len_roll = self.terminal_buffer.random.int(u16);
-                    line.dark_run = @as(u8, @intCast(@mod(len_roll, span))) + DARK_RUN_MIN;
+                    line.dark_run = @as(u8, @intCast(@mod(len_roll, span))) + self.dark_run_min;
                     dot.is_dark = true;
                     line.dark_run -= 1;
                 }
@@ -523,7 +531,7 @@ const LOCKED_FG: u32 = 0x00606060;
 const LOCKED_SPACE_MULT: usize = 3;
 
 // Public: invoked by main.zig on every failed auth attempt. Stamps
-// OVERLAY_LINES_PER_BURST rows of random fake-error-code text into the
+// self.overlay_lines_per_burst rows of random fake-error-code text into the
 // overlay layer. Each cell's TTL counts down only when a rain head
 // walks across it, so the text gets visually "scrubbed away" by
 // passing raindrops — slow when rain is light, fast when dense.
@@ -533,7 +541,7 @@ pub fn pushErrorBurst(self: *Matrix) void {
     if (w == 0 or h == 0) return;
 
     var line_idx: usize = 0;
-    while (line_idx < OVERLAY_LINES_PER_BURST) : (line_idx += 1) {
+    while (line_idx < self.overlay_lines_per_burst) : (line_idx += 1) {
         const row_roll = self.terminal_buffer.random.int(u16);
         const row = @as(usize, @mod(row_roll, @as(u16, @intCast(h)))) + 1;
 
@@ -552,7 +560,7 @@ pub fn pushErrorBurst(self: *Matrix) void {
             const idx = w * row + cx;
             if (idx >= self.dots.len) break;
             self.dots[idx].overlay_ch = @intCast(ch);
-            self.dots[idx].overlay_ttl = OVERLAY_INITIAL_TTL;
+            self.dots[idx].overlay_ttl = self.overlay_initial_ttl;
         }
     }
 }
@@ -576,7 +584,7 @@ fn tickGlitches(self: *Matrix) void {
 
     if (self.glitch_count < GLITCH_MAX) {
         const seed_roll = self.terminal_buffer.random.int(u16);
-        if (@mod(seed_roll, 1000) < GLITCH_SEED_PERMILLE) {
+        if (@mod(seed_roll, 1000) < self.glitch_seed_permille) {
             const w = self.terminal_buffer.width;
             const h = self.terminal_buffer.height;
             if (w >= 2 and h >= 1) {
@@ -740,24 +748,24 @@ fn calculateTimeout(self: *Matrix, _: *anyopaque) !?usize {
 }
 
 fn initBuffers(dots: []Dot, lines: []Line, width: usize, height: usize, random: Random) void {
-    var y: usize = 0;
-    while (y <= height) : (y += 1) {
-        var x: usize = 0;
-        while (x < width) : (x += 2) {
-            dots[y * width + x].value = null;
-        }
-    }
+    // allocator.alloc returns uninitialised memory; the in-struct
+    // defaults (= 0, = false) don't apply to freshly-allocated slots.
+    // Zero every Dot fully so overlay_ttl/is_dark/etc. aren't junk
+    // values that surface as red Tofu (font fallback) on the first
+    // render frame.
+    for (dots) |*d| d.* = .{ .value = null, .is_head = false };
 
     var x: usize = 0;
     while (x < width) : (x += 2) {
         var line = lines[x];
         line.space = @mod(random.int(u16), height / 3) + 1;
         line.length = @mod(random.int(u16), height - 10) + 10;
-        line.speed = SPEED_MIN + random.float(f32) * (SPEED_MAX - SPEED_MIN);
+        line.speed = DEFAULT_SPEED_MIN + random.float(f32) * (DEFAULT_SPEED_MAX - DEFAULT_SPEED_MIN);
         // Random phase so all columns don't trigger their first advance
         // on the same frame.
         line.advance_accum = random.float(f32);
         line.virtual_head_y = 0;
+        line.dark_run = 0;
         lines[x] = line;
 
         dots[width + x].value = ' ';
