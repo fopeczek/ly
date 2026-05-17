@@ -93,6 +93,13 @@ pub const Dot = struct {
     // so the algorithm doesn't get confused into thinking the column
     // has a gap; only the render layer treats it as empty.
     is_dark: bool = false,
+    // Red "error code" overlay state. When ttl > 0, render path shows
+    // overlay_ch in red instead of the rain glyph. Each time a new
+    // raindrop head walks across this cell, ttl is decremented — so
+    // the error text gets "scrubbed away" by passing rain over time.
+    // See pushErrorBurst() for how lines are seeded.
+    overlay_ttl: u8 = 0,
+    overlay_ch: u32 = ' ',
 };
 
 pub const Line = struct {
@@ -143,6 +150,45 @@ const GLITCH_TTL_MAX: u8 = 10;
 // error_fg the rest of ly uses.
 const GLITCH_FG: u32 = 0x01FF3333;
 
+// Red used for the "error code" overlay (slightly less bright than the
+// per-pixel glitch flash so they read as a different signal).
+const OVERLAY_FG: u32 = 0x01D62828;
+
+// How many resilient "scrub passes" each overlay cell takes before it
+// disappears. One pass = one new rain head walks across the cell.
+// Larger = errors linger longer.
+const OVERLAY_INITIAL_TTL: u8 = 8;
+
+// Lines added to the overlay per failed-auth burst. The user's mental
+// model is "the more wrong attempts, the more red covers the screen".
+const OVERLAY_LINES_PER_BURST: usize = 3;
+
+// Fake-but-plausible error-code lines. Drawn from at random, then
+// rendered on a random row spanning the screen. Picked to look like
+// kernel/syslog/auth output without being real diagnostic text.
+const ERROR_LINES = [_][]const u8{
+    "0xDEADBEEF PANIC at 0x7FFE12AB rip=ly_authenticate+0x42",
+    "ERR 0xC0000005 ACCESS_VIOLATION pid=4129 addr=0x40000",
+    "SEGFAULT in ly_dm: bad address (signal 11)",
+    "pam_unix(ly:auth): authentication failure; user=mikolaj",
+    "SECURITY: brute_force_threshold approaching (3/3)",
+    "kerberos: TGT signature mismatch — retry exhausted",
+    "EPERM: operation not permitted on /dev/tty1 ctty",
+    "kernel: trap_pf in user_mode rip=0x7f0fc0debeef",
+    "auth.log: FAIL session=greeter tty=tty1 service=ly",
+    "ECONNREFUSED: logind Varlink socket /run/systemd/login",
+    "SELINUX: avc denied { read } for pid=4129 scontext=greeter_t",
+    "crypto: HMAC-SHA256 verification failed (chunk 0x1A)",
+    "TPM2: PCR mismatch — sealed key bound to current state",
+    "FATAL: heap corruption detected at 0x55a9e3c40000",
+    "WARN: clock skew >5s — NTP synchronization required",
+    "DBUS: org.freedesktop.login1.SessionFailed",
+    "stack smashing detected: terminated",
+    "kernel: oom-killer invoked by ly-dm, gfp_mask=0x6020c0",
+    "audit: type=1100 res=failed acct=mikolaj tty=tty1",
+    "ssh-keygen: PKCS#11 token unavailable (slot 0)",
+};
+
 instance: ?Widget = null,
 start_time: TimeOfDay,
 allocator: Allocator,
@@ -162,6 +208,14 @@ tail_fade: bool,
 // evicted when full. See GlitchDot above.
 glitches: [GLITCH_MAX]GlitchDot,
 glitch_count: usize,
+// Lockout mode: when set by main.zig (via setLocked) after the user
+// exceeds config.auth_fails, the column-spawn logic switches to a
+// sparser, dimmer presentation using LOCKED_GLYPH_POOL instead of
+// the normal Halfwidth Katakana pool. Cleared automatically the
+// next time the column truly empties — but in practice the flag
+// stays on until the ly process restarts, since the user can't
+// authenticate to make sway log out.
+locked: bool,
 
 pub fn init(
     allocator: Allocator,
@@ -198,6 +252,7 @@ pub fn init(
         .tail_fade = tail_fade,
         .glitches = undefined,
         .glitch_count = 0,
+        .locked = false,
     };
 }
 
@@ -293,7 +348,8 @@ fn stepColumns(self: *Matrix) void {
                 if (v == ' ') continue;
                 if (self.terminal_buffer.random.float(f32) < TAIL_CHURN_PROB) {
                     const r = self.terminal_buffer.random.int(u32);
-                    cell.value = GLYPH_POOL[@mod(r, GLYPH_POOL.len)];
+                    const churn_pool: []const u32 = if (self.locked) &LOCKED_GLYPH_POOL else &GLYPH_POOL;
+                    cell.value = churn_pool[@mod(r, churn_pool.len)];
                 }
             }
         }
@@ -341,12 +397,15 @@ fn stepColumns(self: *Matrix) void {
                     const randint = self.terminal_buffer.random.int(u16);
                     const h = buf_height;
                     line.length = @mod(randint, h - 10) + 10;
-                    self.dots[x].value = GLYPH_POOL[@mod(randint, GLYPH_POOL.len)];
+                    const pool: []const u32 = if (self.locked) &LOCKED_GLYPH_POOL else &GLYPH_POOL;
+                    self.dots[x].value = pool[@mod(randint, pool.len)];
                     // Inter-raindrop idle gap in cells. Smaller window
                     // = higher density (column respawns sooner after a
                     // trail completes). h/3 gives ~3x density vs the
-                    // original [0..h] range.
-                    line.space = @mod(randint, h / 3 + 1);
+                    // original [0..h] range. Locked mode multiplies
+                    // the window so density visibly collapses.
+                    const space_max: usize = if (self.locked) (h / 3 + 1) * LOCKED_SPACE_MULT else h / 3 + 1;
+                    line.space = @mod(randint, @as(u16, @intCast(@min(space_max, std.math.maxInt(u16)))));
                     // Reroll speed on every spawn so consecutive
                     // raindrops in the same column don't share a pace.
                     line.speed = SPEED_MIN +
@@ -392,8 +451,14 @@ fn stepColumns(self: *Matrix) void {
             }
 
             const randint = self.terminal_buffer.random.int(u16);
-            dot.value = GLYPH_POOL[@mod(randint, GLYPH_POOL.len)];
+            const head_pool: []const u32 = if (self.locked) &LOCKED_GLYPH_POOL else &GLYPH_POOL;
+            dot.value = head_pool[@mod(randint, head_pool.len)];
             dot.is_head = true;
+            // Rain head walking across an error-overlay cell: count
+            // it as one "scrub pass". Once ttl hits 0 the cell is
+            // back to normal rain. This is the visual decay the
+            // user wanted — the rain itself erases the errors.
+            if (dot.overlay_ttl > 0) dot.overlay_ttl -= 1;
             // Dark-gap-run state machine. If we're mid-run, this head
             // is dark and we decrement. Otherwise, roll the start
             // probability; if it fires, set up a new run of random
@@ -419,6 +484,75 @@ fn stepColumns(self: *Matrix) void {
                 self.dots[x].value = null;
             }
             first_col = false;
+        }
+    }
+}
+
+// Public: switch into locked-out presentation. Main calls this once
+// the user crosses config.auth_fails. The flag is sticky for the
+// lifetime of the Matrix; restoring it would require an unlock event
+// ly doesn't currently emit. See "locked" field doc.
+pub fn setLocked(self: *Matrix, locked: bool) void {
+    self.locked = locked;
+}
+
+// Pool used when locked. Encrypted/obfuscated-looking glyphs — no
+// katakana, no readable letters. Box-drawing + arithmetic operators
+// + a couple punctuation marks. Reads as "scrambled data".
+const LOCKED_GLYPH_POOL = [_]u32{
+    '#', '#', '#', '*', '*', '@', '@', '&', '&', '%',
+    '!', '?', '=', '+', '~', '^', ':', ';', '/', '\\',
+    '|', '<', '>', '$', '_', '.', ',',
+    // Box-drawing for visual texture (JBMono ships these).
+    0x2500, 0x2502, 0x2503, 0x2504, 0x2506, 0x250C, 0x2510,
+    0x2514, 0x2518, 0x251C, 0x2524, 0x252C, 0x2534, 0x253C,
+    // Block elements
+    0x2591, 0x2592, 0x2593,
+    // Geometric (subdued)
+    0x25E6, 0x25CB, 0x25A1, 0x25A2,
+};
+
+// Dim gray used as fg when locked. Cool blue-tinted gray reads as
+// "system in safe mode" rather than the panic-red OVERLAY_FG. Bold
+// bit cleared so it stays subdued against the black bg.
+const LOCKED_FG: u32 = 0x00606060;
+
+// In locked mode, line.space rolls from this larger range so columns
+// idle longer between trails — the on-screen density drops sharply
+// without us having to skip whole columns entirely.
+const LOCKED_SPACE_MULT: usize = 3;
+
+// Public: invoked by main.zig on every failed auth attempt. Stamps
+// OVERLAY_LINES_PER_BURST rows of random fake-error-code text into the
+// overlay layer. Each cell's TTL counts down only when a rain head
+// walks across it, so the text gets visually "scrubbed away" by
+// passing raindrops — slow when rain is light, fast when dense.
+pub fn pushErrorBurst(self: *Matrix) void {
+    const w = self.terminal_buffer.width;
+    const h = self.terminal_buffer.height;
+    if (w == 0 or h == 0) return;
+
+    var line_idx: usize = 0;
+    while (line_idx < OVERLAY_LINES_PER_BURST) : (line_idx += 1) {
+        const row_roll = self.terminal_buffer.random.int(u16);
+        const row = @as(usize, @mod(row_roll, @as(u16, @intCast(h)))) + 1;
+
+        const txt_roll = self.terminal_buffer.random.int(u16);
+        const txt = ERROR_LINES[@mod(txt_roll, ERROR_LINES.len)];
+
+        const col_roll = self.terminal_buffer.random.int(u16);
+        // Start at a random offset so successive bursts of the same
+        // line aren't always pinned to column 0.
+        const safe_w: u16 = if (w >= 4) @as(u16, @intCast(w - 4)) else 1;
+        const start_col = @as(usize, @mod(col_roll, safe_w));
+
+        for (txt, 0..) |ch, i| {
+            const cx = start_col + i;
+            if (cx >= w) break;
+            const idx = w * row + cx;
+            if (idx >= self.dots.len) break;
+            self.dots[idx].overlay_ch = @intCast(ch);
+            self.dots[idx].overlay_ttl = OVERLAY_INITIAL_TTL;
         }
     }
 }
@@ -512,7 +646,16 @@ fn draw(self: *Matrix) void {
             while (head_idx < heads.len and heads[head_idx] < y) head_idx += 1;
 
             const dot = self.dots[buf_width * y + x];
-            const cell = if (dot.value == null or dot.value == ' ' or dot.is_dark) self.default_cell else cell_blk: {
+            // Error-code overlay wins over everything: if a cell
+            // still has overlay TTL it renders the overlay glyph in
+            // red, no matter the rain state below. The glyph remains
+            // visible (so it forms a readable "line" across the
+            // screen) until enough rain heads have scrubbed across.
+            const cell = if (dot.overlay_ttl > 0) Cell{
+                .ch = dot.overlay_ch,
+                .fg = OVERLAY_FG,
+                .bg = self.terminal_buffer.bg,
+            } else if (dot.value == null or dot.value == ' ' or dot.is_dark) self.default_cell else cell_blk: {
                 // Pick a head_y to fade against:
                 //   - If there's an on-screen is_head for this cell, use that.
                 //   - If not, use line.virtual_head_y (head has scrolled past
@@ -539,14 +682,19 @@ fn draw(self: *Matrix) void {
                     if (dot.is_head and heads.len > 0 and heads[heads.len - 1] == y and y > 1) {
                         break :inner self.head_col;
                     }
-                    if (!self.tail_fade) break :inner self.fg;
+                    // In locked mode the trail fades against a dim
+                    // gray instead of the configured green so the
+                    // whole screen reads as "safe-mode" rather than
+                    // a normal session.
+                    const trail_fg: u32 = if (self.locked) LOCKED_FG else self.fg;
+                    if (!self.tail_fade) break :inner trail_fg;
                     const distance = head_y_for_fade - y;
                     const tail_len = self.lines[x].length;
                     const denom: f32 = if (tail_len == 0) 1 else @floatFromInt(tail_len);
                     const t_linear = @as(f32, @floatFromInt(distance)) / denom;
                     if (t_linear >= 1.0) break :cell_blk self.default_cell;
                     const t = perceptualT(t_linear);
-                    const faded = lerpColor(self.fg, self.terminal_buffer.bg, t);
+                    const faded = lerpColor(trail_fg, self.terminal_buffer.bg, t);
                     // Pango/kmscon renders a non-space glyph with a default
                     // (often white) foreground when the requested fg matches
                     // bg, on the theory that fg==bg would make the char

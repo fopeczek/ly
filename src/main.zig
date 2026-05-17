@@ -98,6 +98,14 @@ const UiState = struct {
     battery_label: Label,
     clock_label: Label,
     tty_label: Label,
+    // "N attempts left" indicator. Hidden (empty text) until the
+    // first failed auth, then updated to show remaining tries
+    // before state.config.auth_fails kicks in.
+    attempts_label: Label,
+    // Pointer back to the Matrix animation when it's the chosen
+    // animation, so the auth-fail handler can call pushErrorBurst()
+    // and setLocked() on it. null for every other animation choice.
+    matrix_ref: ?*Matrix,
     session_specifier_label: Label,
     login_label: Label,
     password_label: Label,
@@ -123,6 +131,8 @@ const UiState = struct {
     bigclock_format_buf: [16:0]u8,
     clock_buf: [64:0]u8,
     tty_buf: [8:0]u8,
+    // Scratch buffer backing attempts_label's text (e.g. "2 ATTEMPTS LEFT").
+    attempts_buf: [32:0]u8,
     bigclock_buf: [32:0]u8,
     custom_binds: std.ArrayList(CustomBindLabel),
     custom_info: std.ArrayList(CustomInfoLabel),
@@ -629,6 +639,21 @@ pub fn main(init: std.process.Init) !void {
     );
     defer state.tty_label.deinit();
 
+    // Attempts-remaining badge. Same Label init shape as tty_label;
+    // text stays empty until the first failed auth flips it on.
+    // Color is the same red used elsewhere in ly for errors so the
+    // signal reads as "danger" without needing a separate palette.
+    state.attempts_label = Label.init(
+        "",
+        null,
+        state.config.error_fg,
+        state.buffer.bg,
+        null,
+        null,
+    );
+    defer state.attempts_label.deinit();
+    state.matrix_ref = null;
+
     state.bigclock_label = BigLabel.init(
         &state.buffer,
         "",
@@ -1072,8 +1097,13 @@ pub fn main(init: std.process.Init) !void {
         try state.tty_label.setTextBuf(&state.tty_buf, "tty{d}", .{state.active_tty});
     }
 
-    // Initialize the animation, if any
+    // Initialize the animation, if any. matrix_storage holds the
+    // Matrix value at function scope (rather than scoped to the
+    // switch case) so state.matrix_ref can take its address and stay
+    // valid for the rest of main() — the auth-fail handler calls
+    // pushErrorBurst() / setLocked() through that pointer.
     var animation: ?*Widget = null;
+    var matrix_storage: ?Matrix = null;
     switch (state.config.animation) {
         .none => {},
         .doom => {
@@ -1092,7 +1122,7 @@ pub fn main(init: std.process.Init) !void {
             animation = doom.widget();
         },
         .matrix => {
-            var matrix = try Matrix.init(
+            matrix_storage = try Matrix.init(
                 state.allocator,
                 &state.buffer,
                 state.config.cmatrix_fg,
@@ -1104,7 +1134,8 @@ pub fn main(init: std.process.Init) !void {
                 state.config.animation_frame_delay,
                 state.config.cmatrix_tail_fade,
             );
-            animation = matrix.widget();
+            state.matrix_ref = &matrix_storage.?;
+            animation = matrix_storage.?.widget();
         },
         .colormix => {
             var color_mix = try ColorMix.init(
@@ -1286,6 +1317,7 @@ pub fn main(init: std.process.Init) !void {
     if (state.config.show_tty) {
         try layer2.append(state.allocator, state.tty_label.widget());
     }
+    try layer2.append(state.allocator, state.attempts_label.widget());
     if (state.config.bigclock != .none) {
         try layer2.append(state.allocator, state.bigclock_label.widget());
     }
@@ -1765,6 +1797,22 @@ fn authenticate(ptr: *anyopaque) !bool {
         state.auth_fails += 1;
         state.buffer.setActiveWidget(state.password_widget);
 
+        // Drive the Matrix's red-error visuals + lockout state. The
+        // matrix_ref is null for non-matrix animations; callbacks
+        // are no-ops in that case.
+        if (state.matrix_ref) |m| {
+            m.pushErrorBurst();
+            if (state.config.auth_fails > 0 and state.auth_fails >= state.config.auth_fails) {
+                m.setLocked(true);
+            }
+        }
+        // Update "N attempts left" badge. Hidden (empty text) when
+        // ly's own threshold is disabled (config.auth_fails=0).
+        if (state.config.auth_fails > 0) {
+            const remaining = if (state.auth_fails >= state.config.auth_fails) 0 else state.config.auth_fails - state.auth_fails;
+            try state.attempts_label.setTextBuf(&state.attempts_buf, "{d} ATTEMPTS LEFT", .{remaining});
+        }
+
         try state.info_line.addMessage(
             getAuthErrorMsg(err, state.lang),
             state.config.error_bg,
@@ -2190,6 +2238,12 @@ fn positionWidgets(ptr: *anyopaque) !void {
         .add(TerminalBuffer.START_POSITION)
         .invertX(state.buffer.width)
         .removeXIf(TerminalBuffer.strWidth(state.clock_label.text) + tty_label_width + tty_label_gap, state.buffer.width > TerminalBuffer.strWidth(state.clock_label.text) + tty_label_width + tty_label_gap + state.edge_margin.x));
+    // Attempts-left badge pinned to the top-left corner. Stays
+    // anchored at edge_margin regardless of clock/tty status. Text
+    // is empty until the first failed auth, so it's invisible
+    // during normal use.
+    state.attempts_label.positionXY(state.edge_margin
+        .add(TerminalBuffer.START_POSITION));
 
     state.numlock_label.positionX(state.edge_margin
         .add(TerminalBuffer.START_POSITION)
