@@ -532,15 +532,23 @@ fn stepColumns(self: *Matrix) void {
                 } else {
                     const randint = self.terminal_buffer.random.int(u16);
                     const h = buf_height;
-                    // Trail length picked uniformly in
-                    // [min_drop_len, max_eff] where max_eff respects
-                    // both the user-tuned max_drop_len AND the
-                    // screen height (we can't draw a trail longer
-                    // than the visible area without artefacts).
-                    const max_eff_raw: usize = @min(@as(usize, self.max_drop_len), if (h > 1) h - 1 else 1);
-                    const max_eff: usize = if (max_eff_raw < self.min_drop_len) self.min_drop_len else max_eff_raw;
-                    const len_span: usize = max_eff - self.min_drop_len + 1;
-                    line.length = (@as(usize, randint) % len_span) + self.min_drop_len;
+                    // line.length and line.speed are SHARED across
+                    // all trails currently alive in this column
+                    // (multi-trail mode under drop_v_margin). The
+                    // fade renderer divides distance-from-head by
+                    // line.length, so changing it mid-fall would
+                    // visibly shift the existing trail's colors —
+                    // user reported this as "tails change shade
+                    // randomly". Only roll new length + speed when
+                    // the column was empty before this spawn; for
+                    // subsequent spawns (column already has trails)
+                    // keep both stable so the visual stays smooth.
+                    if (!column_has_content) {
+                        const max_eff_raw: usize = @min(@as(usize, self.max_drop_len), if (h > 1) h - 1 else 1);
+                        const max_eff: usize = if (max_eff_raw < self.min_drop_len) self.min_drop_len else max_eff_raw;
+                        const len_span: usize = max_eff - self.min_drop_len + 1;
+                        line.length = (@as(usize, randint) % len_span) + self.min_drop_len;
+                    }
                     const pool: []const u32 = if (self.locked) &LOCKED_GLYPH_POOL else &GLYPH_POOL;
                     self.dots[x].value = pool[@mod(randint, pool.len)];
                     // Inter-raindrop idle gap in cells. rain_density
@@ -565,10 +573,14 @@ fn stepColumns(self: *Matrix) void {
                     // advances, breaking the sync over time.
                     const cap: u16 = @intCast(@max(4, @min(space_max, std.math.maxInt(u16))));
                     line.space = @as(usize, @mod(randint, cap));
-                    // Reroll speed on every spawn so consecutive
-                    // raindrops in the same column don't share a pace.
-                    line.speed = self.speed_min +
-                        self.terminal_buffer.random.float(f32) * (self.speed_max - self.speed_min);
+                    // Reroll speed only when the column was empty —
+                    // changing speed while trails are mid-fall would
+                    // suddenly accelerate or slow every visible trail
+                    // in this column at once, an obvious visual jolt.
+                    if (!column_has_content) {
+                        line.speed = self.speed_min +
+                            self.terminal_buffer.random.float(f32) * (self.speed_max - self.speed_min);
+                    }
                 }
             }
         }
