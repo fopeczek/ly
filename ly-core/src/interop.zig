@@ -349,13 +349,29 @@ pub fn swapControllingTty(target_tty_num: u8) !std.posix.fd_t {
     var tty_path_buf: [16]u8 = undefined;
     const tty_path = try std.fmt.bufPrintZ(&tty_path_buf, "/dev/tty{d}", .{target_tty_num});
     const new_tty_fd = std.c.open(tty_path.ptr, .{ .ACCMODE = .RDWR, .NOCTTY = true });
-    if (new_tty_fd < 0) return error.OpenNewTtyFailed;
+    if (new_tty_fd < 0) {
+        // Can't even open it — restore our previous ctty so caller's
+        // tb_init() (which opens /dev/tty) doesn't run into the
+        // session-has-no-ctty trap. force=1 allowed since we're root.
+        _ = std.c.ioctl(old_ctty_fd, TIOCSCTTY, @as(c_int, 1));
+        return error.OpenNewTtyFailed;
+    }
     defer _ = std.c.close(new_tty_fd);
 
-    // Claim /dev/ttyN as the new controlling terminal. Second arg of 0
-    // = don't steal from another session.
-    const set_status = std.c.ioctl(new_tty_fd, TIOCSCTTY, @as(c_int, 0));
-    if (set_status != 0) return error.SetCtTyFailed;
+    // Claim /dev/ttyN as the new controlling terminal. force=1 tells
+    // the kernel to steal it from any session that already owns it
+    // (systemd's StandardInput=tty + TTYPath=/dev/tty1 setup makes the
+    // wrapper script's session the existing owner). Requires
+    // CAP_SYS_ADMIN, which ly-dm has running as root in the system
+    // service.
+    const set_status = std.c.ioctl(new_tty_fd, TIOCSCTTY, @as(c_int, 1));
+    if (set_status != 0) {
+        // Bail safely: re-acquire the kmscon pty as ctty so the
+        // fallback tb_init() path doesn't crash trying to open
+        // /dev/tty with a session that has no controlling terminal.
+        _ = std.c.ioctl(old_ctty_fd, TIOCSCTTY, @as(c_int, 1));
+        return error.SetCtTyFailed;
+    }
 
     return old_ctty_fd;
 }
