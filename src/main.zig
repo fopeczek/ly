@@ -30,6 +30,7 @@ const DurFile = @import("animations/DurFile.zig");
 const GameOfLife = @import("animations/GameOfLife.zig");
 const Matrix = @import("animations/Matrix.zig");
 const auth = @import("auth.zig");
+const DebugMenu = @import("components/DebugMenu.zig");
 const InfoLine = @import("components/InfoLine.zig");
 const FprintdWatcher = @import("components/FprintdWatcher.zig");
 const Session = @import("components/Session.zig");
@@ -106,6 +107,8 @@ const UiState = struct {
     // animation, so the auth-fail handler can call pushErrorBurst()
     // and setLocked() on it. null for every other animation choice.
     matrix_ref: ?*Matrix,
+    // Live-tunable debug overlay (toggled with Ctrl+Shift+Alt+Esc).
+    debug_menu: DebugMenu,
     session_specifier_label: Label,
     login_label: Label,
     password_label: Label,
@@ -653,6 +656,7 @@ pub fn main(init: std.process.Init) !void {
     );
     defer state.attempts_label.deinit();
     state.matrix_ref = null;
+    state.debug_menu = DebugMenu.init();
 
     state.bigclock_label = BigLabel.init(
         &state.buffer,
@@ -1135,6 +1139,7 @@ pub fn main(init: std.process.Init) !void {
                 state.config.cmatrix_tail_fade,
             );
             state.matrix_ref = &matrix_storage.?;
+            state.debug_menu.attach(&matrix_storage.?, &state.auth_fails, &state.buffer);
             animation = matrix_storage.?.widget();
         },
         .colormix => {
@@ -1356,6 +1361,13 @@ pub fn main(init: std.process.Init) !void {
         try widgets.append(state.allocator, &layer3);
     }
 
+    // Layer 4: debug menu overlay. Drawn last so it sits on top of
+    // everything else. Its draw is a no-op when state.debug_menu is
+    // hidden, so this widget is harmless when the user isn't toggled
+    // into debug mode.
+    var debug_layer = [_]*Widget{state.debug_menu.widget()};
+    try widgets.append(state.allocator, &debug_layer);
+
     for (state.custom_binds.items) |*item| {
         try state.buffer.registerGlobalKeybind(state.io, item.key, &customCommand, item);
     }
@@ -1365,8 +1377,17 @@ pub fn main(init: std.process.Init) !void {
 
     try state.buffer.registerGlobalKeybind(state.io, "Ctrl+C", &quit, &state);
 
-    try state.buffer.registerGlobalKeybind(state.io, "K", &viMoveCursorUp, &state);
-    try state.buffer.registerGlobalKeybind(state.io, "J", &viMoveCursorDown, &state);
+    // Debug menu plumbing. Override Tab/Shift+Tab/J/K with handlers
+    // that conditionally route to the debug menu when visible.
+    // Without these overrides the menu can't capture input
+    // (Tab/Shift+Tab would still wrap login-box widgets).
+    try state.buffer.registerGlobalKeybind(state.io, "Ctrl+Shift+Alt+Esc", &toggleDebugMenu, &state);
+    try state.buffer.registerGlobalKeybind(state.io, "Tab", &debugTabNext, &state);
+    try state.buffer.registerGlobalKeybind(state.io, "Shift+Tab", &debugTabPrev, &state);
+    try state.buffer.registerGlobalKeybind(state.io, "K", &debugItemPrev, &state);
+    try state.buffer.registerGlobalKeybind(state.io, "J", &debugItemNext, &state);
+    try state.buffer.registerGlobalKeybind(state.io, "H", &debugAdjustDown, &state);
+    try state.buffer.registerGlobalKeybind(state.io, "L", &debugAdjustUp, &state);
 
     try state.buffer.registerGlobalKeybind(state.io, "Enter", &authenticate, &state);
 
@@ -1600,6 +1621,94 @@ fn quit(ptr: *anyopaque) !bool {
 
     state.buffer.stopEventLoop();
     return false;
+}
+
+// Debug menu — toggle binding (Ctrl+Shift+Alt+Esc).
+fn toggleDebugMenu(ptr: *anyopaque) !bool {
+    var state: *UiState = @ptrCast(@alignCast(ptr));
+    state.debug_menu.toggle();
+    state.buffer.drawNextFrame(true);
+    return false;
+}
+
+// Debug menu — tab cycling (Tab / Shift+Tab). When menu hidden,
+// delegate to the existing wrapCursor behaviour so login-box
+// navigation still works.
+fn debugTabNext(ptr: *anyopaque) !bool {
+    var state: *UiState = @ptrCast(@alignCast(ptr));
+    if (state.debug_menu.visible) {
+        state.debug_menu.nextTab();
+        state.buffer.drawNextFrame(true);
+        return false;
+    }
+    return try state.buffer.simulateKeybind(state.io, "Down");
+}
+
+fn debugTabPrev(ptr: *anyopaque) !bool {
+    var state: *UiState = @ptrCast(@alignCast(ptr));
+    if (state.debug_menu.visible) {
+        state.debug_menu.prevTab();
+        state.buffer.drawNextFrame(true);
+        return false;
+    }
+    return try state.buffer.simulateKeybind(state.io, "Up");
+}
+
+// j/k while debug visible cycle items; otherwise normal vi nav.
+fn debugItemNext(ptr: *anyopaque) !bool {
+    var state: *UiState = @ptrCast(@alignCast(ptr));
+    if (state.debug_menu.visible) {
+        state.debug_menu.nextItem();
+        state.buffer.drawNextFrame(true);
+        return false;
+    }
+    if (state.insert_mode) return true;
+    return try state.buffer.simulateKeybind(state.io, "Down");
+}
+
+fn debugItemPrev(ptr: *anyopaque) !bool {
+    var state: *UiState = @ptrCast(@alignCast(ptr));
+    if (state.debug_menu.visible) {
+        state.debug_menu.prevItem();
+        state.buffer.drawNextFrame(true);
+        return false;
+    }
+    if (state.insert_mode) return true;
+    return try state.buffer.simulateKeybind(state.io, "Up");
+}
+
+// h/l adjust the selected item when debug visible; no-op otherwise.
+fn debugAdjustDown(ptr: *anyopaque) !bool {
+    var state: *UiState = @ptrCast(@alignCast(ptr));
+    if (!state.debug_menu.visible) return true;
+    if (state.matrix_ref) |m| {
+        const r = state.debug_menu.adjust(m, -1);
+        applyActionResult(state, m, r);
+    }
+    state.buffer.drawNextFrame(true);
+    return false;
+}
+
+fn debugAdjustUp(ptr: *anyopaque) !bool {
+    var state: *UiState = @ptrCast(@alignCast(ptr));
+    if (!state.debug_menu.visible) return true;
+    if (state.matrix_ref) |m| {
+        const r = state.debug_menu.adjust(m, 1);
+        applyActionResult(state, m, r);
+    }
+    state.buffer.drawNextFrame(true);
+    return false;
+}
+
+fn applyActionResult(state: *UiState, m: *Matrix, r: DebugMenu.ActionResult) void {
+    if (r.fire_error_burst) m.pushErrorBurst();
+    if (r.toggle_locked) m.setLocked(!m.locked);
+    if (r.reset_fails) {
+        state.auth_fails = 0;
+        m.setLocked(false);
+        // Clear attempts label since the count is gone.
+        state.attempts_label.setTextBuf(&state.attempts_buf, "", .{}) catch {};
+    }
 }
 
 fn customCommand(ptr: *anyopaque) !bool {
