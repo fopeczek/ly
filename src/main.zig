@@ -1446,6 +1446,11 @@ pub fn main(init: std.process.Init) !void {
     try state.buffer.registerGlobalKeybind(state.io, "Down", &debugArrowDown, &state);
     try state.buffer.registerGlobalKeybind(state.io, "Left", &debugArrowLeft, &state);
     try state.buffer.registerGlobalKeybind(state.io, "Right", &debugArrowRight, &state);
+    // Shift = coarse step (×5), Ctrl = fine step (1/10, f32 fields).
+    try state.buffer.registerGlobalKeybind(state.io, "Shift+Left", &debugArrowLeftBig, &state);
+    try state.buffer.registerGlobalKeybind(state.io, "Shift+Right", &debugArrowRightBig, &state);
+    try state.buffer.registerGlobalKeybind(state.io, "Ctrl+Left", &debugArrowLeftFine, &state);
+    try state.buffer.registerGlobalKeybind(state.io, "Ctrl+Right", &debugArrowRightFine, &state);
 
     try state.buffer.registerGlobalKeybind(state.io, "Enter", &debugEnter, &state);
 
@@ -1798,21 +1803,32 @@ fn debugArrowDown(ptr: *anyopaque) !bool {
 }
 
 fn debugArrowLeft(ptr: *anyopaque) !bool {
-    var state: *UiState = @ptrCast(@alignCast(ptr));
-    if (!state.debug_menu.visible) return true;
-    if (state.matrix_ref) |m| {
-        const r = state.debug_menu.adjust(m, -1);
-        applyActionResult(state, m, r);
-    }
-    state.buffer.drawNextFrame(true);
-    return false;
+    return debugArrowAdjust(ptr, -1, 1.0);
 }
 
 fn debugArrowRight(ptr: *anyopaque) !bool {
+    return debugArrowAdjust(ptr, 1, 1.0);
+}
+
+// Shift+arrows = 5× step; Ctrl+arrows = 0.1× step (fine).
+fn debugArrowLeftBig(ptr: *anyopaque) !bool {
+    return debugArrowAdjust(ptr, -1, 5.0);
+}
+fn debugArrowRightBig(ptr: *anyopaque) !bool {
+    return debugArrowAdjust(ptr, 1, 5.0);
+}
+fn debugArrowLeftFine(ptr: *anyopaque) !bool {
+    return debugArrowAdjust(ptr, -1, 0.1);
+}
+fn debugArrowRightFine(ptr: *anyopaque) !bool {
+    return debugArrowAdjust(ptr, 1, 0.1);
+}
+
+fn debugArrowAdjust(ptr: *anyopaque, delta: i8, scale: f32) !bool {
     var state: *UiState = @ptrCast(@alignCast(ptr));
     if (!state.debug_menu.visible) return true;
     if (state.matrix_ref) |m| {
-        const r = state.debug_menu.adjust(m, 1);
+        const r = state.debug_menu.adjustScaled(m, delta, scale);
         applyActionResult(state, m, r);
     }
     state.buffer.drawNextFrame(true);

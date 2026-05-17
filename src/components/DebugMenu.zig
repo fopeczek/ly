@@ -41,15 +41,17 @@ pub const Item = enum {
     dark_run_start_pct,
     dark_run_min,
     dark_run_max,
-    // Errors tab
+    // Glitches tab
     glitch_seed_permille,
     glitch_ttl_min,
     glitch_ttl_max,
+    // Errors tab
     overlay_initial_ttl,
     overlay_lines_per_burst,
     overlay_decay_frames,
     overlay_drop_peak_prob,
     overlay_scramble_prob,
+    overlay_fall_step,
     action_error_burst,
     action_clear_errors,
     // Lockout tab
@@ -76,6 +78,7 @@ pub const Item = enum {
             .overlay_decay_frames => "decay frames    ",
             .overlay_drop_peak_prob => "drop peak prob  ",
             .overlay_scramble_prob => "scramble prob   ",
+            .overlay_fall_step => "fall step (rows)",
             .action_error_burst => "[ trigger error ]",
             .action_clear_errors => "[ clear errors  ]",
             .action_toggle_locked => "[ toggle locked ]",
@@ -92,6 +95,37 @@ pub const Item = enum {
         };
     }
 
+    // Short description shown in a side popup when the user presses
+    // Enter on an item (or whenever the item is selected in edit
+    // mode). Kept terse to fit a ~28-char panel; one tip per item.
+    pub fn description(self: Item) []const u8 {
+        return switch (self) {
+            .speed_min => "Slowest column's cells/frame.\nSmaller = slower trails.",
+            .speed_max => "Fastest column's cells/frame.\nLarger = quicker trails.",
+            .density_div => "Inter-trail wait per column.\n0 = constant flood test.\n1+ = denser→sparser linearly.",
+            .min_drop_len => "Shortest trail length\nin cells. Affects how short\nthe shortest drops can be.",
+            .tail_churn_prob => "Per-cell chance the trail\nglyph mutates each frame.\nHigher = flickering tails.",
+            .dark_run_start_pct => "% chance a column starts\na dark-gap run at a head\nspawn.",
+            .dark_run_min => "Shortest dark-gap run\n(cells of blank inside\na trail).",
+            .dark_run_max => "Longest dark-gap run.",
+            .glitch_seed_permille => "Per-frame chance (/1000)\nof spawning a red glitch\ndot somewhere visible.",
+            .glitch_ttl_min => "Shortest glitch lifetime\n(frames).",
+            .glitch_ttl_max => "Longest glitch lifetime\n(frames).",
+            .overlay_initial_ttl => "Scrub-passes each error\ncell takes before clearing.\nHigher = stickier text.",
+            .overlay_lines_per_burst => "Error lines added per\nfailed login. More fails\n= more red coverage.",
+            .overlay_decay_frames => "Total decay window in\nframes (1500 ≈ 30s).\nDrop prob ramps over this.",
+            .overlay_drop_peak_prob => "Peak per-frame chance\nan error cell falls at the\nend of the decay window.",
+            .overlay_scramble_prob => "Per-frame chance the error\nchar mutates into a random\nASCII glyph (corruption).",
+            .overlay_fall_step => "Rows the error char drops\non each fall event.\nLarger = faster fall.",
+            .action_error_burst => "Trigger one error burst\n(simulate a failed login).",
+            .action_clear_errors => "Wipe all error overlay\ncells immediately.",
+            .action_toggle_locked => "Toggle locked-mode\n(sparse gray rain).",
+            .action_reset_fails => "Zero auth_fails and\nunlock the matrix.",
+            .readout_locked => "Lockout state (YES/no).",
+            .readout_auth_fails => "Current consecutive\nfailed-login count.",
+        };
+    }
+
     pub fn isReadout(self: Item) bool {
         return switch (self) {
             .readout_locked, .readout_auth_fails => true,
@@ -102,12 +136,14 @@ pub const Item = enum {
 
 pub const Tab = enum {
     rain,
+    glitches,
     errors,
     lockout,
 
     pub fn name(self: Tab) []const u8 {
         return switch (self) {
             .rain => "Rain",
+            .glitches => "Glitches",
             .errors => "Errors",
             .lockout => "Lockout",
         };
@@ -120,11 +156,14 @@ pub const Tab = enum {
                 .tail_churn_prob, .dark_run_start_pct,
                 .dark_run_min, .dark_run_max,
             },
-            .errors => &[_]Item{
+            .glitches => &[_]Item{
                 .glitch_seed_permille, .glitch_ttl_min, .glitch_ttl_max,
+            },
+            .errors => &[_]Item{
                 .overlay_initial_ttl, .overlay_lines_per_burst,
                 .overlay_decay_frames,
                 .overlay_drop_peak_prob, .overlay_scramble_prob,
+                .overlay_fall_step,
                 .action_error_burst, .action_clear_errors,
             },
             .lockout => &[_]Item{
@@ -135,7 +174,7 @@ pub const Tab = enum {
     }
 };
 
-const TABS = [_]Tab{ .rain, .errors, .lockout };
+const TABS = [_]Tab{ .rain, .glitches, .errors, .lockout };
 
 // Two-mode navigation. In .nav, arrow keys cycle items / tabs and
 // Enter "opens" the selected item for editing. In .edit, up/down
@@ -273,32 +312,38 @@ pub const ActionResult = struct {
 };
 
 pub fn adjust(self: *DebugMenu, m: *Matrix, delta: i8) ActionResult {
+    return self.adjustScaled(m, delta, 1.0);
+}
+
+// Scaled adjust used by Shift/Ctrl modifier handlers. `step_scale`:
+//   1.0 = normal (single arrow keypress)
+//   5.0 = Shift held (coarse, 5×)
+//   0.1 = Ctrl held (fine, 1/10 — only changes f32 fields; integer
+//          fields stay at a 1-step minimum so they can't no-op)
+pub fn adjustScaled(self: *DebugMenu, m: *Matrix, delta: i8, step_scale: f32) ActionResult {
     var r: ActionResult = .{};
     const item = self.currentItem();
+    // Effective integer-field step, clamped to at least ±1 so Ctrl
+    // doesn't make integer fields un-adjustable.
+    const int_step: i8 = computeIntStep(delta, step_scale);
     switch (item) {
-        .speed_min => m.speed_min = std.math.clamp(m.speed_min + @as(f32, @floatFromInt(delta)) * 0.01, 0.01, m.speed_max),
-        .speed_max => m.speed_max = std.math.clamp(m.speed_max + @as(f32, @floatFromInt(delta)) * 0.01, m.speed_min, 2.0),
-        // density_div: 0 = constant-rain test mode (still leaves
-        // a few cell gap to avoid all-white-head saturation), 1 =
-        // very dense, default 3, higher = sparser. See Matrix's
-        // space_max formula for the exact mapping.
-        .density_div => m.density_div = u8_adjust(m.density_div, delta, 0, 60),
-        .min_drop_len => m.min_drop_len = u8_adjust(m.min_drop_len, delta, 2, 40),
-        .tail_churn_prob => m.tail_churn_prob = std.math.clamp(m.tail_churn_prob + @as(f32, @floatFromInt(delta)) * 0.01, 0.0, 1.0),
-        .dark_run_start_pct => m.dark_run_start_pct = u16_adjust(m.dark_run_start_pct, delta, 0, 100),
-        .dark_run_min => m.dark_run_min = u8_adjust(m.dark_run_min, delta, 1, m.dark_run_max),
-        .dark_run_max => m.dark_run_max = u8_adjust(m.dark_run_max, delta, m.dark_run_min, 20),
-        .glitch_seed_permille => m.glitch_seed_permille = u16_adjust(m.glitch_seed_permille, delta, 0, 1000),
-        .glitch_ttl_min => m.glitch_ttl_min = u8_adjust(m.glitch_ttl_min, delta, 1, m.glitch_ttl_max),
-        .glitch_ttl_max => m.glitch_ttl_max = u8_adjust(m.glitch_ttl_max, delta, m.glitch_ttl_min, 250),
-        .overlay_initial_ttl => m.overlay_initial_ttl = u8_adjust(m.overlay_initial_ttl, delta, 1, 50),
-        .overlay_lines_per_burst => m.overlay_lines_per_burst = u8_adjust(m.overlay_lines_per_burst, delta, 1, 20),
-        // Decay window in frames. Coarse-stepped by ~50 frames
-        // (≈1s @ 50fps) so the value moves perceptibly. Use the
-        // existing u16_adjust helper with delta clamped to i8.
-        .overlay_decay_frames => m.overlay_decay_frames = adjustDecayFrames(m.overlay_decay_frames, delta),
-        .overlay_drop_peak_prob => m.overlay_drop_peak_prob = std.math.clamp(m.overlay_drop_peak_prob + @as(f32, @floatFromInt(delta)) * 0.005, 0.0, 1.0),
-        .overlay_scramble_prob => m.overlay_scramble_prob = std.math.clamp(m.overlay_scramble_prob + @as(f32, @floatFromInt(delta)) * 0.002, 0.0, 1.0),
+        .speed_min => m.speed_min = std.math.clamp(m.speed_min + @as(f32, @floatFromInt(delta)) * 0.01 * step_scale, 0.01, m.speed_max),
+        .speed_max => m.speed_max = std.math.clamp(m.speed_max + @as(f32, @floatFromInt(delta)) * 0.01 * step_scale, m.speed_min, 2.0),
+        .density_div => m.density_div = u8_adjust(m.density_div, int_step, 0, 60),
+        .min_drop_len => m.min_drop_len = u8_adjust(m.min_drop_len, int_step, 2, 40),
+        .tail_churn_prob => m.tail_churn_prob = std.math.clamp(m.tail_churn_prob + @as(f32, @floatFromInt(delta)) * 0.01 * step_scale, 0.0, 1.0),
+        .dark_run_start_pct => m.dark_run_start_pct = u16_adjust(m.dark_run_start_pct, int_step, 0, 100),
+        .dark_run_min => m.dark_run_min = u8_adjust(m.dark_run_min, int_step, 1, m.dark_run_max),
+        .dark_run_max => m.dark_run_max = u8_adjust(m.dark_run_max, int_step, m.dark_run_min, 20),
+        .glitch_seed_permille => m.glitch_seed_permille = u16_adjust(m.glitch_seed_permille, int_step, 0, 1000),
+        .glitch_ttl_min => m.glitch_ttl_min = u8_adjust(m.glitch_ttl_min, int_step, 1, m.glitch_ttl_max),
+        .glitch_ttl_max => m.glitch_ttl_max = u8_adjust(m.glitch_ttl_max, int_step, m.glitch_ttl_min, 250),
+        .overlay_initial_ttl => m.overlay_initial_ttl = u8_adjust(m.overlay_initial_ttl, int_step, 1, 50),
+        .overlay_lines_per_burst => m.overlay_lines_per_burst = u8_adjust(m.overlay_lines_per_burst, int_step, 1, 20),
+        .overlay_decay_frames => m.overlay_decay_frames = adjustDecayFrames(m.overlay_decay_frames, int_step),
+        .overlay_drop_peak_prob => m.overlay_drop_peak_prob = std.math.clamp(m.overlay_drop_peak_prob + @as(f32, @floatFromInt(delta)) * 0.005 * step_scale, 0.0, 1.0),
+        .overlay_scramble_prob => m.overlay_scramble_prob = std.math.clamp(m.overlay_scramble_prob + @as(f32, @floatFromInt(delta)) * 0.002 * step_scale, 0.0, 1.0),
+        .overlay_fall_step => m.overlay_fall_step = u8_adjust(m.overlay_fall_step, int_step, 1, 30),
         .action_error_burst => if (delta > 0) {
             r.fire_error_burst = true;
         },
@@ -314,6 +359,18 @@ pub fn adjust(self: *DebugMenu, m: *Matrix, delta: i8) ActionResult {
         .readout_locked, .readout_auth_fails => {},
     }
     return r;
+}
+
+// Round delta * step_scale to an integer step. Clamps to at least
+// ±1 so Ctrl (small scale) doesn't make integer fields un-adjustable.
+fn computeIntStep(delta: i8, step_scale: f32) i8 {
+    const raw = @as(f32, @floatFromInt(delta)) * step_scale;
+    if (raw > 0 and raw < 1) return 1;
+    if (raw < 0 and raw > -1) return -1;
+    const ri: i16 = @intFromFloat(raw);
+    if (ri > 127) return 127;
+    if (ri < -127) return -127;
+    return @intCast(ri);
 }
 
 fn u8_adjust(cur: u8, delta: i8, lo: u8, hi: u8) u8 {
@@ -365,6 +422,7 @@ pub fn formatValue(item: Item, m: *const Matrix, auth_fails: u64, buf: []u8) ![]
         .overlay_decay_frames => try std.fmt.bufPrint(buf, "{d}f (~{d}s)", .{ m.overlay_decay_frames, m.overlay_decay_frames / 50 }),
         .overlay_drop_peak_prob => try std.fmt.bufPrint(buf, "{d:.3}", .{m.overlay_drop_peak_prob}),
         .overlay_scramble_prob => try std.fmt.bufPrint(buf, "{d:.3}", .{m.overlay_scramble_prob}),
+        .overlay_fall_step => try std.fmt.bufPrint(buf, "{d}", .{m.overlay_fall_step}),
         .action_error_burst, .action_clear_errors, .action_toggle_locked, .action_reset_fails => try std.fmt.bufPrint(buf, "<press Enter>", .{}),
         .readout_locked => try std.fmt.bufPrint(buf, "{s}", .{if (m.locked) "YES" else "no"}),
         .readout_auth_fails => try std.fmt.bufPrint(buf, "{d}", .{auth_fails}),
@@ -476,12 +534,66 @@ fn drawWidget(self: *DebugMenu) void {
 
     // Help line at bottom
     const help = if (self.mode == .edit)
-        "EDITING: \xe2\x86\x91/\xe2\x86\x93 adjust  Enter done"
+        "EDITING: \xe2\x86\x91/\xe2\x86\x93 adjust  Sh=x5  Ctrl=fine  Enter done"
     else
-        "\xe2\x86\x91/\xe2\x86\x93 item  Tab tab  Enter edit  Sh+F12 close";
+        "\xe2\x86\x91/\xe2\x86\x93 item  Tab tab  Enter info/edit  Sh+F12 close";
     if (help.len < panel_w - 2) {
         putStr(px + 1, py + panel_h - 2, help, COL_HELP, COL_BG);
     } else {
         putStr(px + 1, py + panel_h - 2, "j/k h/l Tab nav", COL_HELP, COL_BG);
+    }
+
+    // Description side panel — sits to the right of the main
+    // panel, ~32 cols wide, shows the currently selected item's
+    // multi-line description. Skip if there's no room.
+    const info_w: usize = 34;
+    const info_x = px + panel_w + 1;
+    if (info_x + info_w + 1 < buf.width) {
+        const item = self.currentItem();
+        const desc = item.description();
+        // Count lines so we can size the box height.
+        var n_lines: usize = 1;
+        for (desc) |c| {
+            if (c == '\n') n_lines += 1;
+        }
+        const info_h: usize = n_lines + 4; // border + title + body + bottom border + spacer
+
+        if (py + info_h <= buf.height) {
+            // Background fill.
+            var ry2: usize = 0;
+            while (ry2 < info_h) : (ry2 += 1) {
+                fillRow(info_x, py + ry2, info_w, COL_LABEL, COL_BG);
+            }
+            // Border.
+            Cell.init(0x250C, COL_BORDER, COL_BG).put(info_x, py);
+            Cell.init(0x2510, COL_BORDER, COL_BG).put(info_x + info_w - 1, py);
+            Cell.init(0x2514, COL_BORDER, COL_BG).put(info_x, py + info_h - 1);
+            Cell.init(0x2518, COL_BORDER, COL_BG).put(info_x + info_w - 1, py + info_h - 1);
+            var ix: usize = 1;
+            while (ix < info_w - 1) : (ix += 1) {
+                Cell.init(0x2500, COL_BORDER, COL_BG).put(info_x + ix, py);
+                Cell.init(0x2500, COL_BORDER, COL_BG).put(info_x + ix, py + info_h - 1);
+            }
+            var jy: usize = 1;
+            while (jy < info_h - 1) : (jy += 1) {
+                Cell.init(0x2502, COL_BORDER, COL_BG).put(info_x, py + jy);
+                Cell.init(0x2502, COL_BORDER, COL_BG).put(info_x + info_w - 1, py + jy);
+            }
+            // Title.
+            putStr(info_x + 2, py, " info ", COL_TAB_ACTIVE, COL_BG);
+            // Body — split desc by '\n' and put each line.
+            var line_y: usize = py + 2;
+            var line_start: usize = 0;
+            for (desc, 0..) |c, idx| {
+                if (c == '\n') {
+                    putStr(info_x + 2, line_y, desc[line_start..idx], COL_VALUE, COL_BG);
+                    line_y += 1;
+                    line_start = idx + 1;
+                }
+            }
+            if (line_start < desc.len) {
+                putStr(info_x + 2, line_y, desc[line_start..], COL_VALUE, COL_BG);
+            }
+        }
     }
 }

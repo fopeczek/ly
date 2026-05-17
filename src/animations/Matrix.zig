@@ -232,6 +232,10 @@ overlay_drop_peak_prob: f32,
 // 0 = no scrambling; small values give a subtle "data corrupting"
 // flicker before the line falls away.
 overlay_scramble_prob: f32,
+// How many rows an overlay glyph descends when a drop event
+// fires. Larger = faster apparent fall. 1 = single-row hop
+// (default, smooth); 2+ feels like the glyph is accelerating.
+overlay_fall_step: u8,
 
 pub fn init(
     allocator: Allocator,
@@ -286,6 +290,7 @@ pub fn init(
         .overlay_decay_frames = 1500,
         .overlay_drop_peak_prob = 0.04,
         .overlay_scramble_prob = 0.005,
+        .overlay_fall_step = 1,
     };
 }
 
@@ -444,7 +449,14 @@ fn stepColumns(self: *Matrix) void {
                     // (default, slightly denser than original), and
                     // 30 → 153 (very sparse). 0 still leaves some
                     // gap so the screen isn't all-white-heads.
-                    const space_unlocked: usize = @as(usize, self.density_div) * 5 + 3;
+                    // density_div=0 is the "constant rain" test mode:
+                    // space_max=1 → line.space always 0 → column
+                    // respawns the instant a trail clears. Heads
+                    // saturate the screen. >0 keeps the old linear
+                    // formula. The user explicitly asked for this
+                    // flood-at-zero behaviour even at the cost of
+                    // white-head dominance.
+                    const space_unlocked: usize = if (self.density_div == 0) 1 else (@as(usize, self.density_div) * 5 + 3);
                     const space_max: usize = if (self.locked) space_unlocked * LOCKED_SPACE_MULT else space_unlocked;
                     line.space = @mod(randint, @as(u16, @intCast(@min(space_max, std.math.maxInt(u16)))));
                     // Reroll speed on every spawn so consecutive
@@ -665,13 +677,16 @@ fn decayOverlay(self: *Matrix) void {
             }
 
             if (self.terminal_buffer.random.float(f32) >= drop_prob) continue;
-            // Try to move the overlay glyph one row down.
-            if (y_iter < h) {
-                const tidx = w * (y_iter + 1) + x;
+            // Move the overlay glyph N rows down where N is
+            // overlay_fall_step (clamped so we don't go past the
+            // last row). If the step would land past bottom, the
+            // glyph just disappears.
+            const step: usize = @max(1, self.overlay_fall_step);
+            const dest = y_iter + step;
+            if (dest <= h) {
+                const tidx = w * dest + x;
                 if (tidx < self.dots.len) {
                     const target = &self.dots[tidx];
-                    // Only overwrite if target slot is empty (or
-                    // also an overlay cell — we displace it).
                     target.overlay_ch = dot.overlay_ch;
                     target.overlay_ttl = dot.overlay_ttl;
                 }
@@ -725,6 +740,7 @@ fn saveImpl(self: *Matrix, io: std.Io) !void {
     try w.interface.print("overlay_decay_frames={d}\n", .{self.overlay_decay_frames});
     try w.interface.print("overlay_drop_peak_prob={d:.4}\n", .{self.overlay_drop_peak_prob});
     try w.interface.print("overlay_scramble_prob={d:.4}\n", .{self.overlay_scramble_prob});
+    try w.interface.print("overlay_fall_step={d}\n", .{self.overlay_fall_step});
     try w.interface.flush();
 }
 
@@ -767,7 +783,8 @@ fn loadImpl(self: *Matrix, io: std.Io) !void {
         else if (std.mem.eql(u8, key, "glitch_ttl_max")) self.glitch_ttl_max = std.fmt.parseInt(u8, val, 10) catch self.glitch_ttl_max
         else if (std.mem.eql(u8, key, "overlay_decay_frames")) self.overlay_decay_frames = std.fmt.parseInt(u16, val, 10) catch self.overlay_decay_frames
         else if (std.mem.eql(u8, key, "overlay_drop_peak_prob")) self.overlay_drop_peak_prob = std.fmt.parseFloat(f32, val) catch self.overlay_drop_peak_prob
-        else if (std.mem.eql(u8, key, "overlay_scramble_prob")) self.overlay_scramble_prob = std.fmt.parseFloat(f32, val) catch self.overlay_scramble_prob;
+        else if (std.mem.eql(u8, key, "overlay_scramble_prob")) self.overlay_scramble_prob = std.fmt.parseFloat(f32, val) catch self.overlay_scramble_prob
+        else if (std.mem.eql(u8, key, "overlay_fall_step")) self.overlay_fall_step = std.fmt.parseInt(u8, val, 10) catch self.overlay_fall_step;
     }
 }
 
