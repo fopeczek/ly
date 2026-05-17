@@ -95,6 +95,10 @@ const UiState = struct {
     brightness_down_label: Label,
     brightness_up_label: Label,
     debug_label: Label,
+    // "Shift = ×5  Ctrl = fine" — only visible when debug_menu is
+    // open. Lives in the bottom-left corner, one row above the
+    // version line. Text gets toggled on/off in positionWidgets.
+    mod_hint_label: Label,
     numlock_label: Label,
     capslock_label: Label,
     battery_label: Label,
@@ -144,6 +148,9 @@ const UiState = struct {
     tty_buf: [8:0]u8,
     // Scratch buffer backing attempts_label's text (e.g. "2 ATTEMPTS LEFT").
     attempts_buf: [32:0]u8,
+    // Backs mod_hint_label's text. 64 bytes is plenty for the static
+    // "Shift = x5  Ctrl = fine" string plus a NUL.
+    mod_hint_buf: [64:0]u8,
     bigclock_buf: [32:0]u8,
     custom_binds: std.ArrayList(CustomBindLabel),
     custom_info: std.ArrayList(CustomInfoLabel),
@@ -434,6 +441,21 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // When running under kmscon (--take-tty set), force TERM to
+    // xterm-256color before termbox loads its terminfo. kmscon
+    // defaults to TERM=linux, but kmscon itself emits xterm-style
+    // sequences (e.g. CSI Z for Shift+Tab) regardless of what TERM
+    // says. Without this override, termbox loads /usr/share/terminfo/
+    // linux which says kcbt=\e\t — so termbox's parser never sees
+    // \e[Z as TB_KEY_BACK_TAB, and Shift+Tab silently does nothing.
+    // Forcing TERM=xterm-256color makes termbox load the matching
+    // capset and Shift+Tab works in the debug menu.
+    if (take_tty_target != null) {
+        interop.setEnvironmentVariable(state.allocator, "TERM", "xterm-256color", true) catch |err| {
+            try state.log_file.err(state.io, "tui", "failed to override TERM=xterm-256color: {s}", .{@errorName(err)});
+        };
+    }
+
     // Initialize terminal buffer
     try state.log_file.info(state.io, "tui", "initializing terminal buffer", .{});
     var labels = [_][]const u8{
@@ -583,6 +605,19 @@ pub fn main(init: std.process.Init) !void {
         null,
     );
     defer state.debug_label.deinit();
+
+    // Bottom-left modifier hint for the debug menu. Empty text until
+    // the menu is opened — positionWidgets fills it in on each frame
+    // based on state.debug_menu.visible.
+    state.mod_hint_label = Label.init(
+        "",
+        null,
+        state.buffer.fg,
+        state.buffer.bg,
+        null,
+        null,
+    );
+    defer state.mod_hint_label.deinit();
 
     if (!state.config.hide_key_hints) {
         try state.shutdown_label.setTextAlloc(
@@ -1359,6 +1394,9 @@ pub fn main(init: std.process.Init) !void {
             try layer2.append(state.allocator, state.brightness_up_label.widget());
         }
         try layer2.append(state.allocator, state.debug_label.widget());
+        // Bottom-left modifier hint (only renders when debug_menu is
+        // visible — positionWidgets toggles its text).
+        try layer2.append(state.allocator, state.mod_hint_label.widget());
     }
     if (state.config.battery_id != null) {
         try layer2.append(state.allocator, state.battery_label.widget());
@@ -2618,6 +2656,24 @@ fn positionWidgets(ptr: *anyopaque) !void {
     state.version_label.positionXY(state.edge_margin
         .add(TerminalBuffer.START_POSITION)
         .invertY(state.buffer.height - 1));
+
+    // Bottom-left modifier hint, one row above the version line.
+    // Empty text when the debug menu is hidden so it's invisible
+    // during normal login. Only the "Shift = ×5  Ctrl = fine"
+    // explanation lives here; the in-panel help line covers nav
+    // keys (Tab / Enter / Sh+F12).
+    if (state.debug_menu.visible) {
+        state.mod_hint_label.setTextBuf(
+            &state.mod_hint_buf,
+            "Shift = x5  Ctrl = fine",
+            .{},
+        ) catch {};
+    } else {
+        state.mod_hint_label.setTextBuf(&state.mod_hint_buf, "", .{}) catch {};
+    }
+    state.mod_hint_label.positionXY(state.edge_margin
+        .add(TerminalBuffer.START_POSITION)
+        .invertY(state.buffer.height - 2));
 }
 
 fn handleInactivity(ptr: *anyopaque) !void {

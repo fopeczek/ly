@@ -35,8 +35,9 @@ pub const Item = enum {
     // Rain tab
     speed_min,
     speed_max,
-    density_div,
+    rain_density,
     min_drop_len,
+    max_drop_len,
     tail_churn_prob,
     dark_run_start_pct,
     dark_run_min,
@@ -61,30 +62,38 @@ pub const Item = enum {
     readout_auth_fails,
 
     pub fn label(self: Item) []const u8 {
+        // Labels are padded to 16 chars so the value column lines
+        // up cleanly across all rows. All wording chosen for first-
+        // read intuitiveness — no "permille", "TTL", "div", etc.
         return switch (self) {
-            .speed_min => "speed min       ",
-            .speed_max => "speed max       ",
-            .density_div => "density divisor ",
-            .min_drop_len => "min drop length ",
-            .tail_churn_prob => "tail churn prob ",
-            .dark_run_start_pct => "dark run start %",
-            .dark_run_min => "dark run min    ",
-            .dark_run_max => "dark run max    ",
-            .glitch_seed_permille => "glitch /1000    ",
-            .glitch_ttl_min => "glitch TTL min  ",
-            .glitch_ttl_max => "glitch TTL max  ",
-            .overlay_initial_ttl => "overlay TTL     ",
-            .overlay_lines_per_burst => "overlay lines/  ",
-            .overlay_decay_frames => "decay frames    ",
-            .overlay_drop_peak_prob => "drop peak prob  ",
-            .overlay_scramble_prob => "scramble prob   ",
-            .overlay_fall_step => "fall step (rows)",
-            .action_error_burst => "[ trigger error ]",
+            // Rain
+            .speed_min => "min speed       ",
+            .speed_max => "max speed       ",
+            .rain_density => "density         ",
+            .min_drop_len => "min trail len   ",
+            .max_drop_len => "max trail len   ",
+            .tail_churn_prob => "trail flicker   ",
+            .dark_run_start_pct => "gap chance      ",
+            .dark_run_min => "min gap length  ",
+            .dark_run_max => "max gap length  ",
+            // Glitches
+            .glitch_seed_permille => "spawn rate      ",
+            .glitch_ttl_min => "min lifetime    ",
+            .glitch_ttl_max => "max lifetime    ",
+            // Errors
+            .overlay_initial_ttl => "sticky passes   ",
+            .overlay_lines_per_burst => "lines per fail  ",
+            .overlay_decay_frames => "fade time       ",
+            .overlay_drop_peak_prob => "fall chance     ",
+            .overlay_scramble_prob => "char corrupt    ",
+            .overlay_fall_step => "fall step       ",
+            .action_error_burst => "[ trigger fail  ]",
             .action_clear_errors => "[ clear errors  ]",
-            .action_toggle_locked => "[ toggle locked ]",
-            .action_reset_fails => "[ reset fails   ]",
+            // Lockout
+            .action_toggle_locked => "[ toggle lock   ]",
+            .action_reset_fails => "[ reset attempts]",
             .readout_locked => "locked          ",
-            .readout_auth_fails => "auth_fails      ",
+            .readout_auth_fails => "fail count      ",
         };
     }
 
@@ -99,30 +108,33 @@ pub const Item = enum {
     // Enter on an item (or whenever the item is selected in edit
     // mode). Kept terse to fit a ~28-char panel; one tip per item.
     pub fn description(self: Item) []const u8 {
+        // All descriptions written in user voice — what changes
+        // when you raise the value, with units when relevant.
         return switch (self) {
-            .speed_min => "Slowest column's cells/frame.\nSmaller = slower trails.",
-            .speed_max => "Fastest column's cells/frame.\nLarger = quicker trails.",
-            .density_div => "Inter-trail wait per column.\n0 = constant flood test.\n1+ = denser→sparser linearly.",
-            .min_drop_len => "Shortest trail length\nin cells. Affects how short\nthe shortest drops can be.",
-            .tail_churn_prob => "Per-cell chance the trail\nglyph mutates each frame.\nHigher = flickering tails.",
-            .dark_run_start_pct => "% chance a column starts\na dark-gap run at a head\nspawn.",
-            .dark_run_min => "Shortest dark-gap run\n(cells of blank inside\na trail).",
+            .speed_min => "Slowest column's fall\nspeed (cells per frame).\nLower = lazier trails.",
+            .speed_max => "Fastest column's fall\nspeed (cells per frame).\nHigher = quicker trails.",
+            .rain_density => "How tightly trails pack\nthe screen.\n0 = sparse, 20 = flood.",
+            .min_drop_len => "Shortest trail length\nallowed (cells).",
+            .max_drop_len => "Longest trail length\nallowed (cells). Capped\nby screen height.",
+            .tail_churn_prob => "Per-cell chance each\nframe that a trail glyph\nchanges. Higher =\nmore flicker.",
+            .dark_run_start_pct => "Chance (%) a new trail\nstarts with a dark gap\nin it.",
+            .dark_run_min => "Shortest dark-gap run\n(blank cells inside a\nfalling trail).",
             .dark_run_max => "Longest dark-gap run.",
-            .glitch_seed_permille => "Per-frame chance (/1000)\nof spawning a red glitch\ndot somewhere visible.",
-            .glitch_ttl_min => "Shortest glitch lifetime\n(frames).",
-            .glitch_ttl_max => "Longest glitch lifetime\n(frames).",
-            .overlay_initial_ttl => "Scrub-passes each error\ncell takes before clearing.\nHigher = stickier text.",
-            .overlay_lines_per_burst => "Error lines added per\nfailed login. More fails\n= more red coverage.",
-            .overlay_decay_frames => "Total decay window in\nframes (1500 ≈ 30s).\nDrop prob ramps over this.",
-            .overlay_drop_peak_prob => "Peak per-frame chance\nan error cell falls at the\nend of the decay window.",
-            .overlay_scramble_prob => "Per-frame chance the error\nchar mutates into a random\nASCII glyph (corruption).",
-            .overlay_fall_step => "Rows the error char drops\non each fall event.\nLarger = faster fall.",
-            .action_error_burst => "Trigger one error burst\n(simulate a failed login).",
-            .action_clear_errors => "Wipe all error overlay\ncells immediately.",
-            .action_toggle_locked => "Toggle locked-mode\n(sparse gray rain).",
-            .action_reset_fails => "Zero auth_fails and\nunlock the matrix.",
-            .readout_locked => "Lockout state (YES/no).",
-            .readout_auth_fails => "Current consecutive\nfailed-login count.",
+            .glitch_seed_permille => "Chance per frame (out\nof 1000) that a red\nglitch dot appears.",
+            .glitch_ttl_min => "Shortest glitch dot\nlifetime in frames\n(50 fps ≈ 1s per 50).",
+            .glitch_ttl_max => "Longest glitch dot\nlifetime in frames.",
+            .overlay_initial_ttl => "How many rain heads\nmust pass before an\nerror char is wiped.\nHigher = stickier.",
+            .overlay_lines_per_burst => "Number of fake error\nlines added per\nfailed login.",
+            .overlay_decay_frames => "Total time before all\nerror text has fallen\naway (1500f ≈ 30s).",
+            .overlay_drop_peak_prob => "Peak per-frame chance\nan error char falls\nat the end of fade.",
+            .overlay_scramble_prob => "Chance per frame each\nerror char garbles into\nanother glyph.",
+            .overlay_fall_step => "Rows an error char\ndrops on each fall\nevent. Higher = faster.",
+            .action_error_burst => "Simulate one failed\nlogin (paints a fresh\nerror burst).",
+            .action_clear_errors => "Wipe all error text\nfrom the screen now.",
+            .action_toggle_locked => "Switch between normal\nand locked rain (sparse\ngray glyphs).",
+            .action_reset_fails => "Reset the failed-login\ncounter to zero and\nclear lockout.",
+            .readout_locked => "Whether the screen is\nin lockout mode\n(YES / no).",
+            .readout_auth_fails => "Current count of\nconsecutive failed\nlogins.",
         };
     }
 
@@ -152,7 +164,8 @@ pub const Tab = enum {
     pub fn items(self: Tab) []const Item {
         return switch (self) {
             .rain => &[_]Item{
-                .speed_min, .speed_max, .density_div, .min_drop_len,
+                .speed_min, .speed_max, .rain_density,
+                .min_drop_len, .max_drop_len,
                 .tail_churn_prob, .dark_run_start_pct,
                 .dark_run_min, .dark_run_max,
             },
@@ -329,8 +342,9 @@ pub fn adjustScaled(self: *DebugMenu, m: *Matrix, delta: i8, step_scale: f32) Ac
     switch (item) {
         .speed_min => m.speed_min = std.math.clamp(m.speed_min + @as(f32, @floatFromInt(delta)) * 0.01 * step_scale, 0.01, m.speed_max),
         .speed_max => m.speed_max = std.math.clamp(m.speed_max + @as(f32, @floatFromInt(delta)) * 0.01 * step_scale, m.speed_min, 2.0),
-        .density_div => m.density_div = u8_adjust(m.density_div, int_step, 0, 60),
-        .min_drop_len => m.min_drop_len = u8_adjust(m.min_drop_len, int_step, 2, 40),
+        .rain_density => m.rain_density = u8_adjust(m.rain_density, int_step, 0, 20),
+        .min_drop_len => m.min_drop_len = u8_adjust(m.min_drop_len, int_step, 2, m.max_drop_len),
+        .max_drop_len => m.max_drop_len = u8_adjust(m.max_drop_len, int_step, m.min_drop_len, 80),
         .tail_churn_prob => m.tail_churn_prob = std.math.clamp(m.tail_churn_prob + @as(f32, @floatFromInt(delta)) * 0.01 * step_scale, 0.0, 1.0),
         .dark_run_start_pct => m.dark_run_start_pct = u16_adjust(m.dark_run_start_pct, int_step, 0, 100),
         .dark_run_min => m.dark_run_min = u8_adjust(m.dark_run_min, int_step, 1, m.dark_run_max),
@@ -408,8 +422,9 @@ pub fn formatValue(item: Item, m: *const Matrix, auth_fails: u64, buf: []u8) ![]
     return switch (item) {
         .speed_min => try std.fmt.bufPrint(buf, "{d:.2}", .{m.speed_min}),
         .speed_max => try std.fmt.bufPrint(buf, "{d:.2}", .{m.speed_max}),
-        .density_div => try std.fmt.bufPrint(buf, "{d}", .{m.density_div}),
+        .rain_density => try std.fmt.bufPrint(buf, "{d}", .{m.rain_density}),
         .min_drop_len => try std.fmt.bufPrint(buf, "{d}", .{m.min_drop_len}),
+        .max_drop_len => try std.fmt.bufPrint(buf, "{d}", .{m.max_drop_len}),
         .tail_churn_prob => try std.fmt.bufPrint(buf, "{d:.2}", .{m.tail_churn_prob}),
         .dark_run_start_pct => try std.fmt.bufPrint(buf, "{d}%", .{m.dark_run_start_pct}),
         .dark_run_min => try std.fmt.bufPrint(buf, "{d}", .{m.dark_run_min}),
@@ -533,8 +548,12 @@ fn drawWidget(self: *DebugMenu) void {
     }
 
     // Help line at bottom
+    // In-panel help focuses on navigation only. Modifier-key
+    // explanation (Shift/Ctrl) lives in the bottom-left corner so
+    // the panel stays tidy and the slider modifiers are always
+    // legible regardless of mode.
     const help = if (self.mode == .edit)
-        "EDITING: \xe2\x86\x91/\xe2\x86\x93 adjust  Sh=x5  Ctrl=fine  Enter done"
+        "EDITING: \xe2\x86\x91/\xe2\x86\x93 adjust  Enter done"
     else
         "\xe2\x86\x91/\xe2\x86\x93 item  Tab tab  Enter info/edit  Sh+F12 close";
     if (help.len < panel_w - 2) {

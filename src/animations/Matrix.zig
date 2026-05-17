@@ -27,8 +27,16 @@ const DEFAULT_DARK_RUN_MAX: u8 = 5;
 const DEFAULT_GLITCH_SEED_PERMILLE: u16 = 18;
 const DEFAULT_OVERLAY_INITIAL_TTL: u8 = 8;
 const DEFAULT_OVERLAY_LINES_PER_BURST: u8 = 3;
-const DEFAULT_DENSITY_DIV: u8 = 3;
+// Inter-trail spawn gap. 0 = very sparse, 20 = constant flood (no
+// gap; every column respawns the instant its current trail clears).
+// Default ~15 keeps the screen busy without saturating it.
+const DEFAULT_RAIN_DENSITY: u8 = 15;
 const DEFAULT_MIN_DROP_LEN: u8 = 10;
+// Upper bound on a freshly-spawned raindrop's trail length. Spawn
+// formula rolls in [min, min(max, screen_height - 1)] so the value
+// can never exceed the visible area. Default 30 (~movie-feel medium
+// trails). User-tunable + persisted.
+const DEFAULT_MAX_DROP_LEN: u8 = 30;
 
 // Tail-churn / dark-run tunables previously lived here as `const`.
 // They're now instance fields on Matrix (initialised from the
@@ -213,8 +221,13 @@ dark_run_max: u8,
 glitch_seed_permille: u16,
 overlay_initial_ttl: u8,
 overlay_lines_per_burst: u8,
-density_div: u8,
+rain_density: u8,
 min_drop_len: u8,
+// Inclusive upper bound on a freshly-spawned raindrop's trail
+// length (in cells). Spawn rolls a length in
+// [min_drop_len, min(max_drop_len, screen_height - 1)] so the
+// value can never overflow the visible area.
+max_drop_len: u8,
 // Inclusive glitch-dot lifetime range. Higher values = dots
 // linger longer. Tunable via debug menu, persisted by savePrefs.
 glitch_ttl_min: u8,
@@ -282,8 +295,9 @@ pub fn init(
         .glitch_seed_permille = DEFAULT_GLITCH_SEED_PERMILLE,
         .overlay_initial_ttl = DEFAULT_OVERLAY_INITIAL_TTL,
         .overlay_lines_per_burst = DEFAULT_OVERLAY_LINES_PER_BURST,
-        .density_div = DEFAULT_DENSITY_DIV,
+        .rain_density = DEFAULT_RAIN_DENSITY,
         .min_drop_len = DEFAULT_MIN_DROP_LEN,
+        .max_drop_len = DEFAULT_MAX_DROP_LEN,
         .glitch_ttl_min = DEFAULT_GLITCH_TTL_MIN,
         .glitch_ttl_max = DEFAULT_GLITCH_TTL_MAX,
         .overlay_decay_counter = std.math.maxInt(u32),
@@ -434,29 +448,32 @@ fn stepColumns(self: *Matrix) void {
                 } else {
                     const randint = self.terminal_buffer.random.int(u16);
                     const h = buf_height;
-                    line.length = @mod(randint, h - self.min_drop_len) + self.min_drop_len;
+                    // Trail length picked uniformly in
+                    // [min_drop_len, max_eff] where max_eff respects
+                    // both the user-tuned max_drop_len AND the
+                    // screen height (we can't draw a trail longer
+                    // than the visible area without artefacts).
+                    const max_eff_raw: usize = @min(@as(usize, self.max_drop_len), if (h > 1) h - 1 else 1);
+                    const max_eff: usize = if (max_eff_raw < self.min_drop_len) self.min_drop_len else max_eff_raw;
+                    const len_span: usize = max_eff - self.min_drop_len + 1;
+                    line.length = (@as(usize, randint) % len_span) + self.min_drop_len;
                     const pool: []const u32 = if (self.locked) &LOCKED_GLYPH_POOL else &GLYPH_POOL;
                     self.dots[x].value = pool[@mod(randint, pool.len)];
-                    // Inter-raindrop idle gap in cells. Smaller window
-                    // = higher density (column respawns sooner after a
-                    // trail completes). h/3 gives ~3x density vs the
-                    // original [0..h] range. Locked mode multiplies
-                    // the window so density visibly collapses.
-                    // density_div semantics: smaller = denser. New
-                    // linear scale (max-wait between trails in
-                    // cells) maps 0 → 3 (test mode, every column
-                    // ~always ready), 1 → 8 (very dense), 3 → 18
-                    // (default, slightly denser than original), and
-                    // 30 → 153 (very sparse). 0 still leaves some
-                    // gap so the screen isn't all-white-heads.
-                    // density_div=0 is the "constant rain" test mode:
-                    // space_max=1 → line.space always 0 → column
-                    // respawns the instant a trail clears. Heads
-                    // saturate the screen. >0 keeps the old linear
-                    // formula. The user explicitly asked for this
-                    // flood-at-zero behaviour even at the cost of
-                    // white-head dominance.
-                    const space_unlocked: usize = if (self.density_div == 0) 1 else (@as(usize, self.density_div) * 5 + 3);
+                    // Inter-raindrop idle gap in cells. rain_density
+                    // semantics: higher = denser (user-facing
+                    // slider direction). 20 = constant flood: every
+                    // column respawns the instant its current trail
+                    // clears, so heads saturate the screen. 0 = very
+                    // sparse (max-wait 105 cells). Scale was inverted
+                    // from the old density_div divisor at user
+                    // request — see project_ly_matrix_pending memory.
+                    // Locked mode multiplies the wait so density
+                    // visibly collapses in lockout state.
+                    const rd: u16 = @as(u16, self.rain_density);
+                    const space_unlocked: usize = if (rd >= 20)
+                        1
+                    else
+                        (@as(usize, 21 - rd) * 5);
                     const space_max: usize = if (self.locked) space_unlocked * LOCKED_SPACE_MULT else space_unlocked;
                     line.space = @mod(randint, @as(u16, @intCast(@min(space_max, std.math.maxInt(u16)))));
                     // Reroll speed on every spawn so consecutive
@@ -733,8 +750,9 @@ fn saveImpl(self: *Matrix, io: std.Io) !void {
     try w.interface.print("glitch_seed_permille={d}\n", .{self.glitch_seed_permille});
     try w.interface.print("overlay_initial_ttl={d}\n", .{self.overlay_initial_ttl});
     try w.interface.print("overlay_lines_per_burst={d}\n", .{self.overlay_lines_per_burst});
-    try w.interface.print("density_div={d}\n", .{self.density_div});
+    try w.interface.print("rain_density={d}\n", .{self.rain_density});
     try w.interface.print("min_drop_len={d}\n", .{self.min_drop_len});
+    try w.interface.print("max_drop_len={d}\n", .{self.max_drop_len});
     try w.interface.print("glitch_ttl_min={d}\n", .{self.glitch_ttl_min});
     try w.interface.print("glitch_ttl_max={d}\n", .{self.glitch_ttl_max});
     try w.interface.print("overlay_decay_frames={d}\n", .{self.overlay_decay_frames});
@@ -777,8 +795,18 @@ fn loadImpl(self: *Matrix, io: std.Io) !void {
         else if (std.mem.eql(u8, key, "glitch_seed_permille")) self.glitch_seed_permille = std.fmt.parseInt(u16, val, 10) catch self.glitch_seed_permille
         else if (std.mem.eql(u8, key, "overlay_initial_ttl")) self.overlay_initial_ttl = std.fmt.parseInt(u8, val, 10) catch self.overlay_initial_ttl
         else if (std.mem.eql(u8, key, "overlay_lines_per_burst")) self.overlay_lines_per_burst = std.fmt.parseInt(u8, val, 10) catch self.overlay_lines_per_burst
-        else if (std.mem.eql(u8, key, "density_div")) self.density_div = std.fmt.parseInt(u8, val, 10) catch self.density_div
+        // density_div was the pre-rename divisor (smaller = denser).
+        // Translate to the new rain_density (higher = denser) so old
+        // /var/lib/ly/matrix-prefs files migrate transparently. The
+        // old divisor's effective range was 0..60; clamp into 0..20.
+        else if (std.mem.eql(u8, key, "density_div")) {
+            const old_div = std.fmt.parseInt(u8, val, 10) catch continue;
+            const migrated: u8 = if (old_div >= 20) 0 else 20 - old_div;
+            self.rain_density = migrated;
+        }
+        else if (std.mem.eql(u8, key, "rain_density")) self.rain_density = std.fmt.parseInt(u8, val, 10) catch self.rain_density
         else if (std.mem.eql(u8, key, "min_drop_len")) self.min_drop_len = std.fmt.parseInt(u8, val, 10) catch self.min_drop_len
+        else if (std.mem.eql(u8, key, "max_drop_len")) self.max_drop_len = std.fmt.parseInt(u8, val, 10) catch self.max_drop_len
         else if (std.mem.eql(u8, key, "glitch_ttl_min")) self.glitch_ttl_min = std.fmt.parseInt(u8, val, 10) catch self.glitch_ttl_min
         else if (std.mem.eql(u8, key, "glitch_ttl_max")) self.glitch_ttl_max = std.fmt.parseInt(u8, val, 10) catch self.glitch_ttl_max
         else if (std.mem.eql(u8, key, "overlay_decay_frames")) self.overlay_decay_frames = std.fmt.parseInt(u16, val, 10) catch self.overlay_decay_frames
