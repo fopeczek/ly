@@ -131,8 +131,11 @@ const GLITCH_MAX: usize = 32;
 // glitch_seed_permille is an instance field; default lives in
 // DEFAULT_GLITCH_SEED_PERMILLE. The TTL bounds stay const — they're
 // not user-tuned in the debug menu.
-const GLITCH_TTL_MIN: u8 = 4;
-const GLITCH_TTL_MAX: u8 = 10;
+// Glitch-dot lifetime bounds (now instance fields below — these
+// remain as the *defaults* used to initialise the Matrix). 4–10
+// at 50fps = 80–200ms.
+const DEFAULT_GLITCH_TTL_MIN: u8 = 4;
+const DEFAULT_GLITCH_TTL_MAX: u8 = 10;
 // Stylized red used for glitch dots. Bold + saturated; matches the
 // error_fg the rest of ly uses.
 const GLITCH_FG: u32 = 0x01FF3333;
@@ -212,12 +215,23 @@ overlay_initial_ttl: u8,
 overlay_lines_per_burst: u8,
 density_div: u8,
 min_drop_len: u8,
-// Frames elapsed since the most recent error burst. Used to
-// compute the per-frame "fall-down" probability for overlay
-// cells — starts at 0 (no decay) and ramps to OVERLAY_DECAY_FRAMES
-// where all overlay cells are aggressively dropped. New error
-// bursts reset this back to 0.
-overlay_decay_frames: u32,
+// Inclusive glitch-dot lifetime range. Higher values = dots
+// linger longer. Tunable via debug menu, persisted by savePrefs.
+glitch_ttl_min: u8,
+glitch_ttl_max: u8,
+// Frames elapsed since the most recent error burst (runtime
+// counter, not a tunable). Drives the decay curve in decayOverlay.
+overlay_decay_counter: u32,
+// Total frames over which the error overlay decays. Counter
+// climbs from 0 to this value; per-cell drop probability scales
+// phase² × overlay_drop_peak_prob.
+overlay_decay_frames: u16,
+overlay_drop_peak_prob: f32,
+// Per-frame probability that an overlay cell's glyph cycles to
+// a random printable ASCII char (independent of the drop logic).
+// 0 = no scrambling; small values give a subtle "data corrupting"
+// flicker before the line falls away.
+overlay_scramble_prob: f32,
 
 pub fn init(
     allocator: Allocator,
@@ -266,7 +280,12 @@ pub fn init(
         .overlay_lines_per_burst = DEFAULT_OVERLAY_LINES_PER_BURST,
         .density_div = DEFAULT_DENSITY_DIV,
         .min_drop_len = DEFAULT_MIN_DROP_LEN,
-        .overlay_decay_frames = std.math.maxInt(u32),
+        .glitch_ttl_min = DEFAULT_GLITCH_TTL_MIN,
+        .glitch_ttl_max = DEFAULT_GLITCH_TTL_MAX,
+        .overlay_decay_counter = std.math.maxInt(u32),
+        .overlay_decay_frames = 1500,
+        .overlay_drop_peak_prob = 0.04,
+        .overlay_scramble_prob = 0.005,
     };
 }
 
@@ -560,7 +579,7 @@ pub fn pushErrorBurst(self: *Matrix) void {
     // its full settle period before falling. Multiple bursts in
     // quick succession therefore accumulate and persist longer —
     // matching the user's intuition that more attempts = more red.
-    self.overlay_decay_frames = 0;
+    self.overlay_decay_counter = 0;
 
     const w = self.terminal_buffer.width;
     const h = self.terminal_buffer.height;
@@ -598,29 +617,28 @@ pub fn clearOverlay(self: *Matrix) void {
         d.overlay_ttl = 0;
         d.overlay_ch = ' ';
     }
-    self.overlay_decay_frames = std.math.maxInt(u32);
+    self.overlay_decay_counter = std.math.maxInt(u32);
 }
 
-// Per-frame overlay decay. As overlay_decay_frames climbs toward
-// OVERLAY_DECAY_FRAMES, each overlay cell has an increasing
+// Per-frame overlay decay. As overlay_decay_counter climbs toward
+// overlay_decay_frames, each overlay cell has an increasing
 // probability of "falling" — moving its glyph one row down (or
 // disappearing if at the bottom). Iterate bottom-up so a moved
 // glyph isn't re-processed in the same frame.
 fn decayOverlay(self: *Matrix) void {
-    if (self.overlay_decay_frames >= OVERLAY_DECAY_FRAMES) {
-        // Saturating: clamp to the threshold; no further work.
-        self.overlay_decay_frames = OVERLAY_DECAY_FRAMES;
+    if (self.overlay_decay_counter >= self.overlay_decay_frames) {
+        self.overlay_decay_counter = self.overlay_decay_frames;
         return;
     }
-    self.overlay_decay_frames += 1;
+    self.overlay_decay_counter += 1;
 
     // Ramp 0..1 across the decay window. Squared so the drop rate
     // is gentle at the start and accelerates as we approach the
-    // end of the faillock window — matches the user's spec
-    // ("higher chance to drop char" near the end).
-    const phase: f32 = @as(f32, @floatFromInt(self.overlay_decay_frames)) /
-        @as(f32, @floatFromInt(OVERLAY_DECAY_FRAMES));
-    const drop_prob: f32 = phase * phase * 0.04;
+    // end of the faillock window.
+    const phase: f32 = @as(f32, @floatFromInt(self.overlay_decay_counter)) /
+        @as(f32, @floatFromInt(@max(self.overlay_decay_frames, 1)));
+    const drop_prob: f32 = phase * phase * self.overlay_drop_peak_prob;
+    const scramble_prob: f32 = self.overlay_scramble_prob;
 
     const w = self.terminal_buffer.width;
     const h = self.terminal_buffer.height;
@@ -634,6 +652,18 @@ fn decayOverlay(self: *Matrix) void {
             if (idx >= self.dots.len) continue;
             const dot = &self.dots[idx];
             if (dot.overlay_ttl == 0) continue;
+
+            // Scramble pass: with probability scramble_prob, replace
+            // the overlay glyph with a random printable ASCII char
+            // (33..126). Visually reads as the error text
+            // "corrupting" before lines fall.
+            if (scramble_prob > 0 and
+                self.terminal_buffer.random.float(f32) < scramble_prob)
+            {
+                const sr = self.terminal_buffer.random.int(u16);
+                dot.overlay_ch = 33 + @as(u32, @mod(sr, 94));
+            }
+
             if (self.terminal_buffer.random.float(f32) >= drop_prob) continue;
             // Try to move the overlay glyph one row down.
             if (y_iter < h) {
@@ -690,6 +720,11 @@ fn saveImpl(self: *Matrix, io: std.Io) !void {
     try w.interface.print("overlay_lines_per_burst={d}\n", .{self.overlay_lines_per_burst});
     try w.interface.print("density_div={d}\n", .{self.density_div});
     try w.interface.print("min_drop_len={d}\n", .{self.min_drop_len});
+    try w.interface.print("glitch_ttl_min={d}\n", .{self.glitch_ttl_min});
+    try w.interface.print("glitch_ttl_max={d}\n", .{self.glitch_ttl_max});
+    try w.interface.print("overlay_decay_frames={d}\n", .{self.overlay_decay_frames});
+    try w.interface.print("overlay_drop_peak_prob={d:.4}\n", .{self.overlay_drop_peak_prob});
+    try w.interface.print("overlay_scramble_prob={d:.4}\n", .{self.overlay_scramble_prob});
     try w.interface.flush();
 }
 
@@ -727,7 +762,12 @@ fn loadImpl(self: *Matrix, io: std.Io) !void {
         else if (std.mem.eql(u8, key, "overlay_initial_ttl")) self.overlay_initial_ttl = std.fmt.parseInt(u8, val, 10) catch self.overlay_initial_ttl
         else if (std.mem.eql(u8, key, "overlay_lines_per_burst")) self.overlay_lines_per_burst = std.fmt.parseInt(u8, val, 10) catch self.overlay_lines_per_burst
         else if (std.mem.eql(u8, key, "density_div")) self.density_div = std.fmt.parseInt(u8, val, 10) catch self.density_div
-        else if (std.mem.eql(u8, key, "min_drop_len")) self.min_drop_len = std.fmt.parseInt(u8, val, 10) catch self.min_drop_len;
+        else if (std.mem.eql(u8, key, "min_drop_len")) self.min_drop_len = std.fmt.parseInt(u8, val, 10) catch self.min_drop_len
+        else if (std.mem.eql(u8, key, "glitch_ttl_min")) self.glitch_ttl_min = std.fmt.parseInt(u8, val, 10) catch self.glitch_ttl_min
+        else if (std.mem.eql(u8, key, "glitch_ttl_max")) self.glitch_ttl_max = std.fmt.parseInt(u8, val, 10) catch self.glitch_ttl_max
+        else if (std.mem.eql(u8, key, "overlay_decay_frames")) self.overlay_decay_frames = std.fmt.parseInt(u16, val, 10) catch self.overlay_decay_frames
+        else if (std.mem.eql(u8, key, "overlay_drop_peak_prob")) self.overlay_drop_peak_prob = std.fmt.parseFloat(f32, val) catch self.overlay_drop_peak_prob
+        else if (std.mem.eql(u8, key, "overlay_scramble_prob")) self.overlay_scramble_prob = std.fmt.parseFloat(f32, val) catch self.overlay_scramble_prob;
     }
 }
 
@@ -754,19 +794,42 @@ fn tickGlitches(self: *Matrix) void {
             const w = self.terminal_buffer.width;
             const h = self.terminal_buffer.height;
             if (w >= 2 and h >= 1) {
-                const rx = self.terminal_buffer.random.int(u16);
-                const ry = self.terminal_buffer.random.int(u16);
-                const rttl = self.terminal_buffer.random.int(u16);
-                const ttl_span = (GLITCH_TTL_MAX - GLITCH_TTL_MIN) + 1;
-                // Even x only — columns are spaced 2 cells apart in
-                // this animation (gaps for legibility).
-                const gx = (@as(usize, @mod(rx, @as(u16, @intCast(w / 2)))) * 2);
-                // Match the render loop's y space (1..=buf_height) so
-                // glitchAt comparisons line up without arithmetic.
-                const gy = @as(usize, @mod(ry, @as(u16, @intCast(h)))) + 1;
-                const gttl = @as(u8, @intCast(@mod(rttl, ttl_span))) + GLITCH_TTL_MIN;
-                self.glitches[self.glitch_count] = .{ .x = gx, .y = gy, .ttl = gttl };
-                self.glitch_count += 1;
+                // Pick a random cell, but skip empty / dark cells.
+                // A glitch landing on an invisible cell renders
+                // nothing — the dot would silently vanish. Try a
+                // few times before giving up so we don't bias
+                // toward any particular region.
+                const ttl_min = self.glitch_ttl_min;
+                const ttl_max_raw = self.glitch_ttl_max;
+                const ttl_max = if (ttl_max_raw < ttl_min) ttl_min else ttl_max_raw;
+                const ttl_span: u8 = ttl_max - ttl_min + 1;
+
+                var attempts: u8 = 0;
+                while (attempts < 8) : (attempts += 1) {
+                    const rx = self.terminal_buffer.random.int(u16);
+                    const ry = self.terminal_buffer.random.int(u16);
+                    // Even x only — columns are spaced 2 cells apart.
+                    const gx = (@as(usize, @mod(rx, @as(u16, @intCast(w / 2)))) * 2);
+                    const gy = @as(usize, @mod(ry, @as(u16, @intCast(h)))) + 1;
+
+                    const idx = w * gy + gx;
+                    if (idx >= self.dots.len) continue;
+                    const dot = self.dots[idx];
+                    // Skip empty cells (no rain glyph here at all).
+                    if (dot.value == null or dot.value == ' ') continue;
+                    // Skip dark-gap cells — those render as default
+                    // (blank) so a red overlay would be invisible.
+                    if (dot.is_dark) continue;
+                    // Skip cells already covered by another glitch
+                    // (the lookup in glitchAt is cheap enough).
+                    if (self.glitchAt(gx, gy)) continue;
+
+                    const rttl = self.terminal_buffer.random.int(u16);
+                    const gttl = @as(u8, @intCast(@mod(rttl, ttl_span))) + ttl_min;
+                    self.glitches[self.glitch_count] = .{ .x = gx, .y = gy, .ttl = gttl };
+                    self.glitch_count += 1;
+                    break;
+                }
             }
         }
     }

@@ -43,8 +43,13 @@ pub const Item = enum {
     dark_run_max,
     // Errors tab
     glitch_seed_permille,
+    glitch_ttl_min,
+    glitch_ttl_max,
     overlay_initial_ttl,
     overlay_lines_per_burst,
+    overlay_decay_frames,
+    overlay_drop_peak_prob,
+    overlay_scramble_prob,
     action_error_burst,
     action_clear_errors,
     // Lockout tab
@@ -64,8 +69,13 @@ pub const Item = enum {
             .dark_run_min => "dark run min    ",
             .dark_run_max => "dark run max    ",
             .glitch_seed_permille => "glitch /1000    ",
+            .glitch_ttl_min => "glitch TTL min  ",
+            .glitch_ttl_max => "glitch TTL max  ",
             .overlay_initial_ttl => "overlay TTL     ",
             .overlay_lines_per_burst => "overlay lines/  ",
+            .overlay_decay_frames => "decay frames    ",
+            .overlay_drop_peak_prob => "drop peak prob  ",
+            .overlay_scramble_prob => "scramble prob   ",
             .action_error_burst => "[ trigger error ]",
             .action_clear_errors => "[ clear errors  ]",
             .action_toggle_locked => "[ toggle locked ]",
@@ -111,8 +121,10 @@ pub const Tab = enum {
                 .dark_run_min, .dark_run_max,
             },
             .errors => &[_]Item{
-                .glitch_seed_permille, .overlay_initial_ttl,
-                .overlay_lines_per_burst,
+                .glitch_seed_permille, .glitch_ttl_min, .glitch_ttl_max,
+                .overlay_initial_ttl, .overlay_lines_per_burst,
+                .overlay_decay_frames,
+                .overlay_drop_peak_prob, .overlay_scramble_prob,
                 .action_error_burst, .action_clear_errors,
             },
             .lockout => &[_]Item{
@@ -277,8 +289,16 @@ pub fn adjust(self: *DebugMenu, m: *Matrix, delta: i8) ActionResult {
         .dark_run_min => m.dark_run_min = u8_adjust(m.dark_run_min, delta, 1, m.dark_run_max),
         .dark_run_max => m.dark_run_max = u8_adjust(m.dark_run_max, delta, m.dark_run_min, 20),
         .glitch_seed_permille => m.glitch_seed_permille = u16_adjust(m.glitch_seed_permille, delta, 0, 1000),
+        .glitch_ttl_min => m.glitch_ttl_min = u8_adjust(m.glitch_ttl_min, delta, 1, m.glitch_ttl_max),
+        .glitch_ttl_max => m.glitch_ttl_max = u8_adjust(m.glitch_ttl_max, delta, m.glitch_ttl_min, 250),
         .overlay_initial_ttl => m.overlay_initial_ttl = u8_adjust(m.overlay_initial_ttl, delta, 1, 50),
         .overlay_lines_per_burst => m.overlay_lines_per_burst = u8_adjust(m.overlay_lines_per_burst, delta, 1, 20),
+        // Decay window in frames. Coarse-stepped by ~50 frames
+        // (≈1s @ 50fps) so the value moves perceptibly. Use the
+        // existing u16_adjust helper with delta clamped to i8.
+        .overlay_decay_frames => m.overlay_decay_frames = adjustDecayFrames(m.overlay_decay_frames, delta),
+        .overlay_drop_peak_prob => m.overlay_drop_peak_prob = std.math.clamp(m.overlay_drop_peak_prob + @as(f32, @floatFromInt(delta)) * 0.005, 0.0, 1.0),
+        .overlay_scramble_prob => m.overlay_scramble_prob = std.math.clamp(m.overlay_scramble_prob + @as(f32, @floatFromInt(delta)) * 0.002, 0.0, 1.0),
         .action_error_burst => if (delta > 0) {
             r.fire_error_burst = true;
         },
@@ -312,6 +332,18 @@ fn u16_adjust(cur: u16, delta: i8, lo: u16, hi: u16) u16 {
     return @intCast(nxt);
 }
 
+// Special step size for overlay_decay_frames — 1 keypress = 50
+// frames (~1s @ 50fps) so the user can sweep the full range
+// quickly. Lower bound 50 keeps decay non-trivial; upper 30000
+// frames ≈ 10 minutes.
+fn adjustDecayFrames(cur: u16, delta: i8) u16 {
+    const cur_i: i32 = @intCast(cur);
+    const nxt = cur_i + @as(i32, delta) * 50;
+    if (nxt < 50) return 50;
+    if (nxt > 30000) return 30000;
+    return @intCast(nxt);
+}
+
 // Format an item's current value into the given buffer. Returns the
 // portion of buf actually written. The caller embeds this in a
 // rendered line like "  speed_min      0.06".
@@ -326,8 +358,13 @@ pub fn formatValue(item: Item, m: *const Matrix, auth_fails: u64, buf: []u8) ![]
         .dark_run_min => try std.fmt.bufPrint(buf, "{d}", .{m.dark_run_min}),
         .dark_run_max => try std.fmt.bufPrint(buf, "{d}", .{m.dark_run_max}),
         .glitch_seed_permille => try std.fmt.bufPrint(buf, "{d}", .{m.glitch_seed_permille}),
+        .glitch_ttl_min => try std.fmt.bufPrint(buf, "{d}", .{m.glitch_ttl_min}),
+        .glitch_ttl_max => try std.fmt.bufPrint(buf, "{d}", .{m.glitch_ttl_max}),
         .overlay_initial_ttl => try std.fmt.bufPrint(buf, "{d}", .{m.overlay_initial_ttl}),
         .overlay_lines_per_burst => try std.fmt.bufPrint(buf, "{d}", .{m.overlay_lines_per_burst}),
+        .overlay_decay_frames => try std.fmt.bufPrint(buf, "{d}f (~{d}s)", .{ m.overlay_decay_frames, m.overlay_decay_frames / 50 }),
+        .overlay_drop_peak_prob => try std.fmt.bufPrint(buf, "{d:.3}", .{m.overlay_drop_peak_prob}),
+        .overlay_scramble_prob => try std.fmt.bufPrint(buf, "{d:.3}", .{m.overlay_scramble_prob}),
         .action_error_burst, .action_clear_errors, .action_toggle_locked, .action_reset_fails => try std.fmt.bufPrint(buf, "<press Enter>", .{}),
         .readout_locked => try std.fmt.bufPrint(buf, "{s}", .{if (m.locked) "YES" else "no"}),
         .readout_auth_fails => try std.fmt.bufPrint(buf, "{d}", .{auth_fails}),
