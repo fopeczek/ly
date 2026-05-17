@@ -640,3 +640,57 @@ fn drawWidget(self: *DebugMenu) void {
         }
     }
 }
+
+// ─── Unit tests ───────────────────────────────────────────────────
+const testing = std.testing;
+
+test "computeIntStep handles scale and direction" {
+    // Plain step: ±1 → ±1.
+    try testing.expectEqual(@as(i8, 1), computeIntStep(1, 1.0));
+    try testing.expectEqual(@as(i8, -1), computeIntStep(-1, 1.0));
+    // Shift x5.
+    try testing.expectEqual(@as(i8, 5), computeIntStep(1, 5.0));
+    try testing.expectEqual(@as(i8, -5), computeIntStep(-1, 5.0));
+    // Ctrl fine: 0.1 — would round to 0, but clamped to ±1 so int
+    // sliders stay adjustable.
+    try testing.expectEqual(@as(i8, 1), computeIntStep(1, 0.1));
+    try testing.expectEqual(@as(i8, -1), computeIntStep(-1, 0.1));
+}
+
+test "u8_adjust clamps to bounds" {
+    try testing.expectEqual(@as(u8, 5), u8_adjust(4, 1, 0, 10));
+    try testing.expectEqual(@as(u8, 10), u8_adjust(10, 1, 0, 10)); // upper clamp
+    try testing.expectEqual(@as(u8, 0), u8_adjust(0, -1, 0, 10)); // lower clamp
+    try testing.expectEqual(@as(u8, 10), u8_adjust(7, 5, 0, 10)); // overshoot clamp
+}
+
+test "u16_adjust handles negative delta from any value" {
+    try testing.expectEqual(@as(u16, 0), u16_adjust(0, -50, 0, 1000));
+    try testing.expectEqual(@as(u16, 950), u16_adjust(1000, -50, 0, 1000));
+    try testing.expectEqual(@as(u16, 1000), u16_adjust(990, 50, 0, 1000));
+}
+
+test "adjustRainDensity step scales" {
+    // Plain ±10 step.
+    try testing.expectEqual(@as(u16, 60), adjustRainDensity(50, 1, 1.0));
+    try testing.expectEqual(@as(u16, 40), adjustRainDensity(50, -1, 1.0));
+    // Shift ×5: ±50 step.
+    try testing.expectEqual(@as(u16, 100), adjustRainDensity(50, 1, 5.0));
+    try testing.expectEqual(@as(u16, 0), adjustRainDensity(50, -1, 5.0));
+    // Ctrl fine: ±1 step.
+    try testing.expectEqual(@as(u16, 51), adjustRainDensity(50, 1, 0.1));
+    try testing.expectEqual(@as(u16, 49), adjustRainDensity(50, -1, 0.1));
+}
+
+test "adjustRainDensity clamps to 0..1000" {
+    try testing.expectEqual(@as(u16, 0), adjustRainDensity(5, -1, 5.0));
+    try testing.expectEqual(@as(u16, 1000), adjustRainDensity(995, 1, 5.0));
+    try testing.expectEqual(@as(u16, 0), adjustRainDensity(0, -1, 1.0));
+    try testing.expectEqual(@as(u16, 1000), adjustRainDensity(1000, 1, 1.0));
+}
+
+test "adjustDecayFrames step is 50 per keypress, clamped" {
+    try testing.expectEqual(@as(u16, 100), adjustDecayFrames(50, 1));
+    try testing.expectEqual(@as(u16, 50), adjustDecayFrames(50, -1)); // lower clamp 50
+    try testing.expectEqual(@as(u16, 30000), adjustDecayFrames(30000, 1)); // upper clamp
+}

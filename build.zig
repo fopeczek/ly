@@ -89,6 +89,31 @@ pub fn build(b: *std.Build) !void {
 
     b.installArtifact(exe);
 
+    // ─── Test step ────────────────────────────────────────────────
+    // `zig build test` compiles and runs the inline `test` blocks
+    // from src/main.zig's module graph (Matrix.zig, DebugMenu.zig,
+    // etc.). Keeps the same imports as the exe so paths like
+    // @import("ly-ui") resolve. Pure-function tests only; the
+    // rendering/input loop is exercised via the SIGUSR1 snapshot
+    // harness — see /tmp/ly-snapshot.sh.
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+        .use_llvm = true,
+    });
+    tests.root_module.addImport("ly-ui", ly_ui.module("ly-ui"));
+    tests.root_module.addOptions("build_options", build_options);
+    tests.root_module.addImport("clap", clap.module("clap"));
+    tests.root_module.linkSystemLibrary("pam", .{});
+    if (enable_x11_support) tests.root_module.linkSystemLibrary("xcb", .{});
+    const run_tests = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_tests.step);
+
     const run_cmd = b.addRunArtifact(exe);
 
     run_cmd.step.dependOn(b.getInstallStep());

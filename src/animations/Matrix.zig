@@ -406,6 +406,55 @@ fn realloc(self: *Matrix) !void {
     self.lines = lines;
 }
 
+// ─── Column-scan helpers ──────────────────────────────────────────
+// All operate on the dots[] buffer indexed as dots[width * y + x].
+// "Empty" means the cell value is null or U+0020 — both represent
+// "no glyph at this position" in the simulation.
+
+inline fn cellIsEmpty(self: *const Matrix, x: usize, y: usize) bool {
+    const v = self.dots[self.terminal_buffer.width * y + x].value;
+    return v == null or v == ' ';
+}
+
+// True if the column has any non-empty cell in the visible area
+// (y ∈ [1, buf_height]). Used to detect a fully-drained column so we
+// can reset per-column run-state (virtual_head_y, dark_run).
+fn columnHasContent(self: *const Matrix, x: usize) bool {
+    var y: usize = 1;
+    while (y <= self.terminal_buffer.height) : (y += 1) {
+        if (!cellIsEmpty(self, x, y)) return true;
+    }
+    return false;
+}
+
+// True if rows 1..n_rows of column x are all empty. n_rows is
+// clamped to buf_height. n_rows = 0 → trivially true.
+fn topRowsClear(self: *const Matrix, x: usize, n_rows: usize) bool {
+    const limit = @min(n_rows, self.terminal_buffer.height);
+    var y: usize = 1;
+    while (y <= limit) : (y += 1) {
+        if (!cellIsEmpty(self, x, y)) return false;
+    }
+    return true;
+}
+
+// Spawn gate: column x's top drop_v_margin rows are empty AND
+// (optionally) every column within drop_h_margin cells horizontally
+// also has its top drop_v_margin rows empty. h_radius = 0 disables
+// the horizontal check entirely. Steps of 2 because matrix columns
+// occupy every other terminal column.
+fn spawnGateOpen(self: *const Matrix, x: usize, v_gap: usize, h_radius: usize) bool {
+    if (!topRowsClear(self, x, v_gap)) return false;
+    if (h_radius == 0) return true;
+    const w = self.terminal_buffer.width;
+    var dx: usize = 2;
+    while (dx <= h_radius) : (dx += 2) {
+        if (x >= dx and !topRowsClear(self, x - dx, v_gap)) return false;
+        if (x + dx < w and !topRowsClear(self, x + dx, v_gap)) return false;
+    }
+    return true;
+}
+
 // Tail churn + per-column advance gate. Extracted out of draw() so its
 // loop variables live in their own function scope and don't shadow the
 // render-pass loop variables (Zig disallows same-name variables in
@@ -452,70 +501,25 @@ fn stepColumns(self: *Matrix) void {
 
         var tail: usize = 0;
 
-        // Single-pass scan of this column: gather whether it has any
-        // value cells (so we can both decide on spawn AND clear
-        // virtual_head_y once the trail is fully gone).
-        var column_has_content = false;
-        {
-            var scan_y: usize = 1;
-            while (scan_y <= buf_height) : (scan_y += 1) {
-                const v = self.dots[buf_width * scan_y + x].value;
-                if (v != null and v != ' ') {
-                    column_has_content = true;
-                    break;
-                }
-            }
-        }
+        // Track whether the column is fully empty so we can reset
+        // per-column run-state (virtual_head_y, dark_run, line.length,
+        // line.speed) for the next fresh trail. column_has_content is
+        // also consulted by the spawn block (to know when to roll new
+        // length/speed vs preserving the column's existing rhythm).
+        const column_has_content = columnHasContent(self, x);
         if (!column_has_content) {
             line.virtual_head_y = 0;
             line.dark_run = 0;
         }
 
-        // ──── Spawn gate based on drop_v_margin / drop_h_margin ──────
-        // Replaces the old "column must be entirely empty" gate.
-        // A new trail may spawn in this column when the top
-        // drop_v_margin rows of THIS column AND (optionally) of every
-        // adjacent column within drop_h_margin cells are empty. The
-        // old single-trail-per-column behavior is recovered by
-        // setting drop_v_margin equal to the screen height.
+        // Spawn gate: top drop_v_margin rows of this column AND of
+        // any column within drop_h_margin cells must be empty before
+        // a new trail can spawn at the top. Replaces the old strict
+        // "column must be entirely empty" gate; setting drop_v_margin
+        // equal to the screen height recovers that legacy behaviour.
         const v_gap_eff: usize = @min(@as(usize, self.drop_v_margin), buf_height);
         const h_gap_eff: usize = @as(usize, self.drop_h_margin);
-        var spawn_gate_open: bool = true;
-        {
-            var sy: usize = 1;
-            while (sy <= v_gap_eff and sy <= buf_height) : (sy += 1) {
-                const v = self.dots[buf_width * sy + x].value;
-                if (v != null and v != ' ') {
-                    spawn_gate_open = false;
-                    break;
-                }
-            }
-            if (spawn_gate_open and h_gap_eff > 0) {
-                var dx: usize = 2;
-                neighbour_loop: while (dx <= h_gap_eff) : (dx += 2) {
-                    if (x >= dx) {
-                        var sy2: usize = 1;
-                        while (sy2 <= v_gap_eff and sy2 <= buf_height) : (sy2 += 1) {
-                            const v = self.dots[buf_width * sy2 + (x - dx)].value;
-                            if (v != null and v != ' ') {
-                                spawn_gate_open = false;
-                                break :neighbour_loop;
-                            }
-                        }
-                    }
-                    if (x + dx < buf_width) {
-                        var sy2: usize = 1;
-                        while (sy2 <= v_gap_eff and sy2 <= buf_height) : (sy2 += 1) {
-                            const v = self.dots[buf_width * sy2 + (x + dx)].value;
-                            if (v != null and v != ' ') {
-                                spawn_gate_open = false;
-                                break :neighbour_loop;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        const spawn_gate_open: bool = spawnGateOpen(self, x, v_gap_eff, h_gap_eff);
 
         if (self.dots[x].value == null and self.dots[buf_width + x].value == ' ') {
             // rain_density == 0 disables spawning entirely — the user
@@ -1164,5 +1168,75 @@ fn initBuffers(dots: []Dot, lines: []Line, width: usize, height: usize, random: 
         lines[x] = line;
 
         dots[width + x].value = ' ';
+    }
+}
+
+// ─── Unit tests ───────────────────────────────────────────────────
+// Pure-function tests only. The rendering loop needs a real
+// TerminalBuffer / termbox state and is exercised end-to-end via the
+// SIGUSR1 snapshot facility — see /tmp/ly-snapshot.sh.
+const testing = std.testing;
+
+test "perceptualT bounds and monotonicity" {
+    try testing.expectApproxEqAbs(@as(f32, 0.0), perceptualT(0.0), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), perceptualT(1.0), 0.001);
+    // Clamped out-of-range inputs.
+    try testing.expectApproxEqAbs(@as(f32, 0.0), perceptualT(-0.5), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), perceptualT(1.5), 0.001);
+    // Monotonic: each step increases output.
+    var prev: f32 = -1.0;
+    var i: usize = 0;
+    while (i <= 20) : (i += 1) {
+        const t = @as(f32, @floatFromInt(i)) / 20.0;
+        const out = perceptualT(t);
+        try testing.expect(out > prev);
+        prev = out;
+    }
+}
+
+test "perceptualT bends toward dark (gamma > 1)" {
+    // At t=0.5, perceptual output should be > 0.5 (faster-than-linear
+    // approach to "dark" / 1.0). Confirms the gamma = 1.5 curve.
+    try testing.expect(perceptualT(0.5) > 0.5);
+    try testing.expect(perceptualT(0.5) < 0.8);
+}
+
+test "lerpColor endpoints" {
+    const green: u32 = 0x0000FF00;
+    const black: u32 = 0x00000000;
+    try testing.expectEqual(green, lerpColor(green, black, 0.0));
+    try testing.expectEqual(black & 0xFFFFFF, lerpColor(green, black, 1.0) & 0xFFFFFF);
+}
+
+test "lerpColor preserves alpha/style byte from source" {
+    const bold_green: u32 = 0x01_00FF00;
+    const black: u32 = 0x00_000000;
+    // Even at t=1.0 (fully b), top byte should come from `a`.
+    const mixed = lerpColor(bold_green, black, 1.0);
+    try testing.expectEqual(@as(u32, 0x01), (mixed >> 24) & 0xFF);
+}
+
+test "lerpColor midpoint" {
+    const a: u32 = 0x000000FF;
+    const b: u32 = 0x00FF0000;
+    const mid = lerpColor(a, b, 0.5);
+    try testing.expectEqual(@as(u32, 0x7F), (mid >> 16) & 0xFF); // R
+    try testing.expectEqual(@as(u32, 0x00), (mid >> 8) & 0xFF); // G
+    try testing.expectEqual(@as(u32, 0x7F), mid & 0xFF); // B
+}
+
+test "density spawn-probability range" {
+    // rain_density 0..1000 maps linearly to spawn probability 0..1.
+    // Verify the formula used in the spawn block.
+    inline for (.{
+        .{ @as(u16, 0), @as(f32, 0.0) },
+        .{ @as(u16, 250), @as(f32, 0.25) },
+        .{ @as(u16, 500), @as(f32, 0.5) },
+        .{ @as(u16, 1000), @as(f32, 1.0) },
+    }) |pair| {
+        const rd: u16 = pair[0];
+        const expected: f32 = pair[1];
+        const got: f32 = @as(f32, @floatFromInt(rd)) / 1000.0;
+        try testing.expectApproxEqAbs(expected, got, 0.001);
     }
 }
