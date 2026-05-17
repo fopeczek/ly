@@ -94,6 +94,7 @@ const UiState = struct {
     toggle_password_label: Label,
     brightness_down_label: Label,
     brightness_up_label: Label,
+    debug_label: Label,
     numlock_label: Label,
     capslock_label: Label,
     battery_label: Label,
@@ -546,6 +547,16 @@ pub fn main(init: std.process.Init) !void {
     );
     defer state.brightness_up_label.deinit();
 
+    state.debug_label = Label.init(
+        "",
+        null,
+        state.buffer.fg,
+        state.buffer.bg,
+        null,
+        null,
+    );
+    defer state.debug_label.deinit();
+
     if (!state.config.hide_key_hints) {
         try state.shutdown_label.setTextAlloc(
             state.allocator,
@@ -590,6 +601,11 @@ pub fn main(init: std.process.Init) !void {
                 .{ key, state.lang.brightness_up },
             );
         }
+        try state.debug_label.setTextAlloc(
+            state.allocator,
+            "{s} debug",
+            .{"Shift+F12"},
+        );
     }
 
     state.numlock_label = Label.init(
@@ -1312,6 +1328,7 @@ pub fn main(init: std.process.Init) !void {
         if (state.config.brightness_up_key != null) {
             try layer2.append(state.allocator, state.brightness_up_label.widget());
         }
+        try layer2.append(state.allocator, state.debug_label.widget());
     }
     if (state.config.battery_id != null) {
         try layer2.append(state.allocator, state.battery_label.widget());
@@ -1381,7 +1398,10 @@ pub fn main(init: std.process.Init) !void {
     // that conditionally route to the debug menu when visible.
     // Without these overrides the menu can't capture input
     // (Tab/Shift+Tab would still wrap login-box widgets).
-    try state.buffer.registerGlobalKeybind(state.io, "Ctrl+Shift+Alt+Esc", &toggleDebugMenu, &state);
+    // Shift+F12 chosen because F-keys + Shift encode reliably through
+    // termbox under kmscon, unlike Esc-with-modifiers which the
+    // terminal layer doesn't always disambiguate.
+    try state.buffer.registerGlobalKeybind(state.io, "Shift+F12", &toggleDebugMenu, &state);
     try state.buffer.registerGlobalKeybind(state.io, "Tab", &debugTabNext, &state);
     try state.buffer.registerGlobalKeybind(state.io, "Shift+Tab", &debugTabPrev, &state);
     try state.buffer.registerGlobalKeybind(state.io, "K", &debugItemPrev, &state);
@@ -2311,6 +2331,13 @@ fn positionWidgets(ptr: *anyopaque) !void {
         state.brightness_up_label.positionXY(last_label
             .childrenPosition()
             .addX(1));
+        if (state.config.brightness_up_key != null) {
+            last_label = state.brightness_up_label;
+        }
+        state.debug_label.positionXY(last_label
+            .childrenPosition()
+            .addX(1));
+        last_label = state.debug_label;
         for (state.custom_binds.items) |*item| {
             item.lbl.positionXY(state.edge_margin
                 .addY(y_offset)

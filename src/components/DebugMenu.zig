@@ -378,10 +378,10 @@ fn drawWidget(self: *DebugMenu) void {
     }
 
     // Help line at bottom
-    const help = "Tab/Sh-Tab tabs   j/k item   h/l adjust   Ctrl-Sh-Alt-Esc close";
+    const help = "Tab tabs  j/k item  h/l adjust  Sh+F12 close";
     if (help.len < panel_w - 2) {
         putStr(px + 1, py + panel_h - 2, help, COL_HELP, COL_BG);
     } else {
-        putStr(px + 1, py + panel_h - 2, "j/k h/l Tab to navigate", COL_HELP, COL_BG);
+        putStr(px + 1, py + panel_h - 2, "j/k h/l Tab nav", COL_HELP, COL_BG);
     }
 }
