@@ -438,6 +438,19 @@ fn stepColumns(self: *Matrix) void {
             line.dark_run = 0;
         }
 
+        // Recompute the current density's max idle gap up-front so we
+        // can clamp `line.space` to it. Without this clamp a freshly
+        // increased rain_density (user slid the slider up) wouldn't
+        // visibly take effect until every column's CURRENT idle wait
+        // finished — at rd=0 that's up to 105 frames (~2s+). Clamping
+        // makes density changes feel immediate.
+        const rd_now: u16 = @as(u16, self.rain_density);
+        const space_unlocked_now: usize = if (rd_now >= 20) 1 else (@as(usize, 21 - rd_now) * 5);
+        const space_max_now: usize = if (self.locked) space_unlocked_now * LOCKED_SPACE_MULT else space_unlocked_now;
+        if (line.space >= space_max_now) {
+            line.space = if (space_max_now == 0) 0 else space_max_now - 1;
+        }
+
         if (self.dots[x].value == null and self.dots[buf_width + x].value == ' ') {
             // Only spawn a new raindrop in a truly empty column.
             // Prevents the cmatrix-classic "two heads per column"

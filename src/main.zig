@@ -442,17 +442,18 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // When running under kmscon (--take-tty set), force TERM to
-    // xterm-256color before termbox loads its terminfo. kmscon
-    // defaults to TERM=linux, but kmscon itself emits xterm-style
-    // sequences (e.g. CSI Z for Shift+Tab) regardless of what TERM
-    // says. Without this override, termbox loads /usr/share/terminfo/
-    // linux which says kcbt=\e\t — so termbox's parser never sees
-    // \e[Z as TB_KEY_BACK_TAB, and Shift+Tab silently does nothing.
-    // Forcing TERM=xterm-256color makes termbox load the matching
-    // capset and Shift+Tab works in the debug menu.
+    // linux-c before termbox loads its terminfo. linux-c is the
+    // ncurses-canonical "linux console + kcbt=\E[Z" entry: same
+    // arrow / function-key caps as plain "linux" (kcuu1=\E[A etc.)
+    // BUT with kcbt=\E[Z to match what kmscon actually emits for
+    // Shift+Tab. kmscon defaults to TERM=linux, where kcbt=\E^I, so
+    // termbox never sees \e[Z as TB_KEY_BACK_TAB and Shift+Tab does
+    // nothing. Choosing linux-c (rather than xterm-256color)
+    // preserves linux-style CSI arrows — xterm-256color's kcuu1=\EOA
+    // doesn't match what kmscon sends and silently breaks Up/Down.
     if (take_tty_target != null) {
-        interop.setEnvironmentVariable(state.allocator, "TERM", "xterm-256color", true) catch |err| {
-            try state.log_file.err(state.io, "tui", "failed to override TERM=xterm-256color: {s}", .{@errorName(err)});
+        interop.setEnvironmentVariable(state.allocator, "TERM", "linux-c", true) catch |err| {
+            try state.log_file.err(state.io, "tui", "failed to override TERM=linux-c: {s}", .{@errorName(err)});
         };
     }
 
@@ -1740,6 +1741,15 @@ fn quit(ptr: *anyopaque) !bool {
 fn toggleDebugMenu(ptr: *anyopaque) !bool {
     var state: *UiState = @ptrCast(@alignCast(ptr));
     state.debug_menu.toggle();
+    // Show / hide the bottom-left modifier hint in lockstep with
+    // the menu's visibility. positionWidgets only runs at startup
+    // and on resize, so without an explicit setTextBuf here the
+    // label stays empty.
+    if (state.debug_menu.visible) {
+        state.mod_hint_label.setTextBuf(&state.mod_hint_buf, "Shift = x5  Ctrl = fine", .{}) catch {};
+    } else {
+        state.mod_hint_label.setTextBuf(&state.mod_hint_buf, "", .{}) catch {};
+    }
     state.buffer.drawNextFrame(true);
     return false;
 }
@@ -2136,9 +2146,15 @@ fn authenticate(ptr: *anyopaque) !bool {
         }
         // Update "N attempts left" badge. Hidden (empty text) when
         // ly's own threshold is disabled (config.auth_fails=0).
+        // positionWidgets re-runs because the label's text width
+        // changed — its X coord is computed off `strWidth(text)` so
+        // without a relayout the label renders at the right margin
+        // instead of being shifted left by its own width and stays
+        // off-screen.
         if (state.config.auth_fails > 0) {
             const remaining = if (state.auth_fails >= state.config.auth_fails) 0 else state.config.auth_fails - state.auth_fails;
             try state.attempts_label.setTextBuf(&state.attempts_buf, "{d} ATTEMPTS LEFT", .{remaining});
+            try positionWidgets(state);
         }
 
         try state.info_line.addMessage(
