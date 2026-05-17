@@ -285,7 +285,7 @@ fn stepColumns(self: *Matrix) void {
                 } else {
                     const randint = self.terminal_buffer.random.int(u16);
                     const h = buf_height;
-                    line.length = @mod(randint, h - 3) + 3;
+                    line.length = @mod(randint, h - 10) + 10;
                     self.dots[x].value = GLYPH_POOL[@mod(randint, GLYPH_POOL.len)];
                     line.space = @mod(randint, h + 1);
                     // Reroll speed on every spawn so consecutive
@@ -469,7 +469,7 @@ fn initBuffers(dots: []Dot, lines: []Line, width: usize, height: usize, random: 
     while (x < width) : (x += 2) {
         var line = lines[x];
         line.space = @mod(random.int(u16), height) + 1;
-        line.length = @mod(random.int(u16), height - 3) + 3;
+        line.length = @mod(random.int(u16), height - 10) + 10;
         line.speed = SPEED_MIN + random.float(f32) * (SPEED_MAX - SPEED_MIN);
         // Random phase so all columns don't trigger their first advance
         // on the same frame.
