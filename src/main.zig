@@ -1617,16 +1617,15 @@ fn uiErrorHandler(err: anyerror, ctx: *anyopaque) anyerror!void {
 fn disableInsertMode(ptr: *anyopaque) !bool {
     var state: *UiState = @ptrCast(@alignCast(ptr));
 
-    // Esc inside the debug menu first exits edit-mode (back to
-    // navigation); a second Esc closes the menu. This matches the
-    // common modal-editor convention.
+    // Esc inside the debug menu only exits edit-mode (back to
+    // navigation). It explicitly does NOT close the whole menu,
+    // because under kmscon's pty Shift+Tab arrives as ESC followed
+    // by '[Z' — a "second Esc closes" rule made Shift+Tab accidentally
+    // dismiss the menu. To close, use Shift+F12 again.
     if (state.debug_menu.visible) {
         if (state.debug_menu.exitEdit()) {
             state.buffer.drawNextFrame(true);
-            return false;
         }
-        state.debug_menu.visible = false;
-        state.buffer.drawNextFrame(true);
         return false;
     }
 

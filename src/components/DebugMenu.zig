@@ -427,9 +427,9 @@ fn drawWidget(self: *DebugMenu) void {
 
     // Help line at bottom
     const help = if (self.mode == .edit)
-        "EDITING: \xe2\x86\x91/\xe2\x86\x93 adjust  Enter/Esc done"
+        "EDITING: \xe2\x86\x91/\xe2\x86\x93 adjust  Enter done"
     else
-        "\xe2\x86\x91/\xe2\x86\x93 item  Tab tab  Enter edit  Esc close";
+        "\xe2\x86\x91/\xe2\x86\x93 item  Tab tab  Enter edit  Sh+F12 close";
     if (help.len < panel_w - 2) {
         putStr(px + 1, py + panel_h - 2, help, COL_HELP, COL_BG);
     } else {
