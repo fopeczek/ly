@@ -758,9 +758,17 @@ fn writeAuthOnlyState(
         .custom => if (env.is_terminal) "tty" else "unspecified",
     };
 
+    const home = user_entry.home orelse return error.NoHome;
+
     try w.interface.print("LY_USER='{s}'\n", .{username});
     try w.interface.print("LY_SHELL='{s}'\n", .{shell});
-    try w.interface.print("LY_SESSION_CMD='{s} {s} {s}'\n", .{
+    // The session command runs `cd $HOME` first so the user's
+    // shell/desktop inherits their home directory as cwd. Without
+    // this, the wrapper's systemd-imposed cwd of `/` propagates
+    // through runuser → sway → kitty / kid terminals and every
+    // new terminal opens at /.
+    try w.interface.print("LY_SESSION_CMD='cd \"{s}\" ; exec {s} {s} {s}'\n", .{
+        home,
         options.setup_cmd,
         options.login_cmd orelse "",
         env.cmd orelse shell,
