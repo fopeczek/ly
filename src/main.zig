@@ -66,6 +66,18 @@ fn ttyControlTransferSignalHandler(_: std.posix.SIG) callconv(.c) void {
     TerminalBuffer.shutdown();
 }
 
+// SIGUSR1: trigger a one-shot dump of the termbox back buffer as an
+// ANSI-truecolor-encoded text file. Used by the off-tty test harness
+// (/tmp/ly-test-tty3.sh) so a remote inspector can `cat` the file and
+// see exactly what the greeter is rendering, without needing to
+// VT-switch and lose their interactive session. Signal handler is
+// async-signal-safe: only flips a static boolean. The actual dump is
+// performed after the next frame finishes rendering, in main()'s
+// event loop, where it can call into termbox/std safely.
+fn snapshotRequestHandler(_: std.posix.SIG) callconv(.c) void {
+    TerminalBuffer.requestSnapshot();
+}
+
 const CustomBindLabel = struct {
     cmd: custom.CustomCommandBind,
     key: []const u8,
@@ -506,6 +518,17 @@ pub fn main(init: std.process.Init) !void {
         .flags = 0,
     };
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+
+    // SIGUSR1 → snapshot the rendered screen to /tmp/ly-snapshot.txt
+    // (ANSI-truecolor text). Used for remote inspection of the greeter
+    // while a separate sway session holds the foreground VT — see
+    // /tmp/ly-snapshot.sh for the caller side.
+    const snapshot_act = std.posix.Sigaction{
+        .handler = .{ .handler = &snapshotRequestHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.USR1, &snapshot_act, null);
 
     // Ignore SIGINT — keystroke Ctrl+C would otherwise drop the user out of
     // the greeter onto a bare console with no way back in. ly@tty1 has

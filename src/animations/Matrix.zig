@@ -632,9 +632,20 @@ fn stepColumns(self: *Matrix) void {
             }
             line.virtual_head_y = y;
 
-            if (seg_len > line.length or !first_col) {
+            // Truncation: shorten the segment from its top when it
+            // exceeds line.length. Done PER SEGMENT, not coupled to
+            // first_col — multi-trail-per-column means we may have
+            // multiple segments, and each must respect line.length
+            // independently. The dots[x]=null is only meaningful
+            // when truncating the TOP segment (tail==0): row 0 is
+            // the legacy "spawn buffer" cell and clearing it signals
+            // "row 0 available for a new spawn glyph". Touching it
+            // from a lower segment was the multi-trail tail-stub bug.
+            if (seg_len > line.length) {
                 self.dots[buf_width * tail + x].value = ' ';
-                self.dots[x].value = null;
+                if (tail == 0) {
+                    self.dots[x].value = null;
+                }
             }
             first_col = false;
         }
@@ -1063,16 +1074,15 @@ fn draw(self: *Matrix) void {
                 };
 
                 const fg_color: u32 = inner: {
-                    // Head renders as the bright head_col cell EXCEPT
-                    // during the first frame after spawn, when the
-                    // body cell at y=0 is not rendered (render loop
-                    // starts at y=1). Without the y>1 guard, a newly-
-                    // spawned head appears as a lone bright-white cell
-                    // at the top of the column with no trail behind it
-                    // — the "white ends" the user was reporting that
-                    // had no green tail. Wait one tick for the body
-                    // to scroll into visible y>=1 territory.
-                    if (dot.is_head and heads.len > 0 and heads[heads.len - 1] == y and y > 1) {
+                    // Every head renders as the bright head_col cell.
+                    // Previous logic gated this on "bottom-most head
+                    // in the column", which made newly-spawned trails
+                    // (above older ones in multi-trail mode) render
+                    // as plain green — user reported as "raindrops
+                    // stopped spawning with white heads".
+                    // y>1 guard remains so a lone head at row 1 with
+                    // no body doesn't pop as a single white cell.
+                    if (dot.is_head and y > 1) {
                         break :inner self.head_col;
                     }
                     // In locked mode the trail fades against a dim

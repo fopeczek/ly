@@ -261,6 +261,16 @@ pub fn runEventLoop(
             // matrix rain.
             _ = termbox.tb_hide_cursor();
             TerminalBuffer.presentBuffer();
+
+            // If a SIGUSR1 came in, dump the freshly-presented back
+            // buffer to /tmp/ly-snapshot.txt. swap()→false consumes
+            // the flag atomically so the next signal is required to
+            // produce another snapshot.
+            if (snapshot_request.swap(false, .seq_cst)) {
+                writeSnapshot(io, "/tmp/ly-snapshot.txt") catch |err| {
+                    self.log_file.err(io, "tui", "snapshot failed: {s}", .{@errorName(err)}) catch {};
+                };
+            }
         }
 
         if (inactivity_event_fn) |inactivity_fn| {
@@ -380,6 +390,75 @@ pub fn shutdown() void {
 
 pub fn presentBuffer() void {
     _ = termbox.tb_present();
+}
+
+// ─── Snapshot facility ────────────────────────────────────────────
+// Async-signal-safe flag flipped by main()'s SIGUSR1 handler.
+// runEventLoop consumes the flag after each present() and writes
+// the current back buffer to /tmp/ly-snapshot.txt as ANSI-truecolor
+// text — lets an out-of-band observer `cat` the file and see what
+// the greeter is rendering on its own VT, without VT-switching.
+pub var snapshot_request = std.atomic.Value(bool).init(false);
+
+pub fn requestSnapshot() void {
+    snapshot_request.store(true, .seq_cst);
+}
+
+// Dump the back buffer to `path` as a UTF-8 ANSI-coloured text file.
+// One terminal row per text line; each cell encoded as truecolor
+// CSI escapes + glyph; SGR 0 reset at end of each row. Caller-side
+// `cat` of the file in any truecolor-capable terminal reproduces
+// the on-screen image (within the limits of font availability).
+pub fn writeSnapshot(io: std.Io, path: []const u8) !void {
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{
+        .permissions = .fromMode(0o644),
+    });
+    defer file.close(io);
+
+    var buf: [4096]u8 = undefined;
+    var fw = file.writer(io, &buf);
+    var w = &fw.interface;
+
+    const w_int = termbox.tb_width();
+    const h_int = termbox.tb_height();
+
+    var y: c_int = 0;
+    while (y < h_int) : (y += 1) {
+        // Reset SGR at the start of each row so per-row fg/bg state
+        // can't leak between lines if the dump is truncated.
+        try w.writeAll("\x1b[0m");
+        var prev_fg: u32 = 0xFFFFFFFF;
+        var prev_bg: u32 = 0xFFFFFFFF;
+        var x: c_int = 0;
+        while (x < w_int) : (x += 1) {
+            var maybe_cell: ?*termbox.tb_cell = undefined;
+            if (termbox.tb_get_cell(x, y, 1, &maybe_cell) != 0) continue;
+            const cell = maybe_cell orelse continue;
+            const fg: u32 = @as(u32, @intCast(cell.fg)) & 0x00FFFFFF;
+            const bg: u32 = @as(u32, @intCast(cell.bg)) & 0x00FFFFFF;
+            if (fg != prev_fg) {
+                try w.print("\x1b[38;2;{d};{d};{d}m", .{ (fg >> 16) & 0xFF, (fg >> 8) & 0xFF, fg & 0xFF });
+                prev_fg = fg;
+            }
+            if (bg != prev_bg) {
+                try w.print("\x1b[48;2;{d};{d};{d}m", .{ (bg >> 16) & 0xFF, (bg >> 8) & 0xFF, bg & 0xFF });
+                prev_bg = bg;
+            }
+            const ch = cell.ch;
+            if (ch == 0 or ch == ' ') {
+                try w.writeByte(' ');
+            } else {
+                var utf8: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(@intCast(ch), &utf8) catch {
+                    try w.writeByte('?');
+                    continue;
+                };
+                try w.writeAll(utf8[0..n]);
+            }
+        }
+        try w.writeAll("\x1b[0m\n");
+    }
+    try w.flush();
 }
 
 pub fn getCell(x: usize, y: usize) ?Cell {
