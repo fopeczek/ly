@@ -122,6 +122,27 @@ pub const Line = struct {
     dark_run: u8 = 0,
 };
 
+// Single transient "glitch dot" — a cell that flashes red for a few
+// frames to look like a momentary memory/error blip in the matrix.
+const GlitchDot = struct {
+    x: usize,
+    y: usize,
+    ttl: u8,
+};
+
+const GLITCH_MAX: usize = 32;
+// Per-frame probability of seeding a new glitch dot, expressed as a
+// permille fraction (out of 1000). Low values keep them feeling like
+// genuine errors rather than a regular feature.
+const GLITCH_SEED_PERMILLE: u16 = 18;
+// Lifetime of each glitch dot in frames. 4–10 at 50fps = 80–200ms,
+// long enough to be perceptible without ever "sticking".
+const GLITCH_TTL_MIN: u8 = 4;
+const GLITCH_TTL_MAX: u8 = 10;
+// Stylized red used for glitch dots. Bold + saturated; matches the
+// error_fg the rest of ly uses.
+const GLITCH_FG: u32 = 0x01FF3333;
+
 instance: ?Widget = null,
 start_time: TimeOfDay,
 allocator: Allocator,
@@ -137,6 +158,10 @@ timeout_sec: u12,
 frame_delay: u16,
 default_cell: Cell,
 tail_fade: bool,
+// Active red glitch dots. Fixed-capacity ring; oldest entries get
+// evicted when full. See GlitchDot above.
+glitches: [GLITCH_MAX]GlitchDot,
+glitch_count: usize,
 
 pub fn init(
     allocator: Allocator,
@@ -171,6 +196,8 @@ pub fn init(
         .frame_delay = frame_delay,
         .default_cell = .{ .ch = ' ', .fg = fg, .bg = terminal_buffer.bg },
         .tail_fade = tail_fade,
+        .glitches = undefined,
+        .glitch_count = 0,
     };
 }
 
@@ -396,6 +423,58 @@ fn stepColumns(self: *Matrix) void {
     }
 }
 
+// Decrement every active glitch dot's TTL and reap dead ones. Then
+// roll the seed probability and possibly spawn a new one at a random
+// cell. Called once per draw frame, BEFORE the render pass uses the
+// dots' positions.
+fn tickGlitches(self: *Matrix) void {
+    var i: usize = 0;
+    while (i < self.glitch_count) {
+        if (self.glitches[i].ttl <= 1) {
+            // Swap-and-pop instead of memmove — order doesn't matter.
+            self.glitches[i] = self.glitches[self.glitch_count - 1];
+            self.glitch_count -= 1;
+            continue;
+        }
+        self.glitches[i].ttl -= 1;
+        i += 1;
+    }
+
+    if (self.glitch_count < GLITCH_MAX) {
+        const seed_roll = self.terminal_buffer.random.int(u16);
+        if (@mod(seed_roll, 1000) < GLITCH_SEED_PERMILLE) {
+            const w = self.terminal_buffer.width;
+            const h = self.terminal_buffer.height;
+            if (w >= 2 and h >= 1) {
+                const rx = self.terminal_buffer.random.int(u16);
+                const ry = self.terminal_buffer.random.int(u16);
+                const rttl = self.terminal_buffer.random.int(u16);
+                const ttl_span = (GLITCH_TTL_MAX - GLITCH_TTL_MIN) + 1;
+                // Even x only — columns are spaced 2 cells apart in
+                // this animation (gaps for legibility).
+                const gx = (@as(usize, @mod(rx, @as(u16, @intCast(w / 2)))) * 2);
+                // Match the render loop's y space (1..=buf_height) so
+                // glitchAt comparisons line up without arithmetic.
+                const gy = @as(usize, @mod(ry, @as(u16, @intCast(h)))) + 1;
+                const gttl = @as(u8, @intCast(@mod(rttl, ttl_span))) + GLITCH_TTL_MIN;
+                self.glitches[self.glitch_count] = .{ .x = gx, .y = gy, .ttl = gttl };
+                self.glitch_count += 1;
+            }
+        }
+    }
+}
+
+// Lookup helper: does any active glitch dot overlap this cell? Linear
+// scan is fine — GLITCH_MAX is 32 and we hit this for every rendered
+// cell, but the cache line stays hot and branch is predictable.
+fn glitchAt(self: *const Matrix, x: usize, y: usize) bool {
+    var i: usize = 0;
+    while (i < self.glitch_count) : (i += 1) {
+        if (self.glitches[i].x == x and self.glitches[i].y == y) return true;
+    }
+    return false;
+}
+
 fn draw(self: *Matrix) void {
     if (!self.animate.*) return;
 
@@ -403,6 +482,7 @@ fn draw(self: *Matrix) void {
     const buf_width = self.terminal_buffer.width;
 
     self.stepColumns();
+    self.tickGlitches();
 
     // Stack-allocated buffer for per-column head positions. A column can
     // host multiple concurrent trails; without per-cell head lookup the
@@ -480,9 +560,14 @@ fn draw(self: *Matrix) void {
                     }
                     break :inner faded;
                 };
+                // Glitch dot override: an active dot at this (x, y)
+                // recolors the cell red while preserving the glyph
+                // and bg. Single-line check, no impact on cells
+                // without a glitch.
+                const final_fg: u32 = if (self.glitchAt(x, y)) GLITCH_FG else fg_color;
                 break :cell_blk Cell{
                     .ch = @intCast(dot.value.?),
-                    .fg = fg_color,
+                    .fg = final_fg,
                     .bg = self.terminal_buffer.bg,
                 };
             };
