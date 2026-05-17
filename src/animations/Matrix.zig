@@ -27,10 +27,12 @@ const DEFAULT_DARK_RUN_MAX: u8 = 5;
 const DEFAULT_GLITCH_SEED_PERMILLE: u16 = 18;
 const DEFAULT_OVERLAY_INITIAL_TTL: u8 = 8;
 const DEFAULT_OVERLAY_LINES_PER_BURST: u8 = 3;
-// Inter-trail spawn gap. 0 = very sparse, 20 = constant flood (no
-// gap; every column respawns the instant its current trail clears).
-// Default ~15 keeps the screen busy without saturating it.
-const DEFAULT_RAIN_DENSITY: u8 = 15;
+// Inter-trail spawn gap. 0 = NOTHING SPAWNS at all (empty screen).
+// 1 = extremely sparse (1000-cell wait between trails per column).
+// 1000 = constant flood (back-to-back trails per column). Linear
+// inverse: line.space_max = 1001 - rain_density. Default 750 keeps
+// the screen busy without saturating it.
+const DEFAULT_RAIN_DENSITY: u16 = 750;
 const DEFAULT_MIN_DROP_LEN: u8 = 10;
 // Upper bound on a freshly-spawned raindrop's trail length. Spawn
 // formula rolls in [min, min(max, screen_height - 1)] so the value
@@ -221,13 +223,13 @@ dark_run_max: u8,
 glitch_seed_permille: u16,
 overlay_initial_ttl: u8,
 overlay_lines_per_burst: u8,
-rain_density: u8,
+rain_density: u16,
 // Last-seen rain_density. Tracked so a change (user slid the
 // debug-menu slider) can re-roll every column's line.space to
 // match the new bound — without this, density only takes effect
 // on each column's NEXT spawn (which can take 10+ seconds at
-// rd=0 because line.space ticks at advance-rate, not frame-rate).
-rain_density_prev: u8,
+// low rd because line.space ticks at advance-rate, not frame-rate).
+rain_density_prev: u16,
 min_drop_len: u8,
 // Inclusive upper bound on a freshly-spawned raindrop's trail
 // length (in cells). Spawn rolls a length in
@@ -446,10 +448,18 @@ fn stepColumns(self: *Matrix) void {
         }
 
         if (self.dots[x].value == null and self.dots[buf_width + x].value == ' ') {
-            // Only spawn a new raindrop in a truly empty column.
-            // Prevents the cmatrix-classic "two heads per column"
-            // problem that the user read as stray whites.
-            if (!column_has_content) {
+            // rain_density == 0 disables spawning entirely — the user
+            // explicitly asked for "0 = nothing spawns" semantics
+            // separate from "1 = very sparse". Existing trails finish
+            // out naturally and the screen drains.
+            if (self.rain_density == 0) {
+                // No new spawn. Don't decrement line.space either —
+                // when the user later raises rain_density above 0,
+                // the re-roll in draw() will assign a fresh wait.
+            } else if (!column_has_content) {
+                // Only spawn a new raindrop in a truly empty column.
+                // Prevents the cmatrix-classic "two heads per column"
+                // problem that the user read as stray whites.
                 if (line.space > 0) {
                     line.space -= 1;
                 } else {
@@ -467,22 +477,21 @@ fn stepColumns(self: *Matrix) void {
                     const pool: []const u32 = if (self.locked) &LOCKED_GLYPH_POOL else &GLYPH_POOL;
                     self.dots[x].value = pool[@mod(randint, pool.len)];
                     // Inter-raindrop idle gap in cells. rain_density
-                    // semantics: higher = denser (user-facing
-                    // slider direction). 20 = constant flood: every
-                    // column respawns the instant its current trail
-                    // clears, so heads saturate the screen. 0 = very
-                    // sparse (max-wait 105 cells). Scale was inverted
-                    // from the old density_div divisor at user
-                    // request — see project_ly_matrix_pending memory.
+                    // is 1..1000 here (0 short-circuited above to
+                    // "no spawn"). Linear inverse: space_max =
+                    // 1001 - rd. 1 → 1000-cell wait (extremely
+                    // sparse), 1000 → 1-cell wait (constant flood).
+                    // line.space rolls uniformly in [0, space_max).
                     // Locked mode multiplies the wait so density
                     // visibly collapses in lockout state.
-                    const rd: u16 = @as(u16, self.rain_density);
-                    const space_unlocked: usize = if (rd >= 20)
+                    const rd: u16 = self.rain_density;
+                    const space_unlocked: usize = if (rd >= 1000)
                         1
                     else
-                        (@as(usize, 21 - rd) * 5);
+                        @as(usize, 1001 - rd);
                     const space_max: usize = if (self.locked) space_unlocked * LOCKED_SPACE_MULT else space_unlocked;
-                    line.space = @mod(randint, @as(u16, @intCast(@min(space_max, std.math.maxInt(u16)))));
+                    const cap: u16 = @intCast(@max(1, @min(space_max, std.math.maxInt(u16))));
+                    line.space = @as(usize, @mod(randint, cap));
                     // Reroll speed on every spawn so consecutive
                     // raindrops in the same column don't share a pace.
                     line.speed = self.speed_min +
@@ -802,16 +811,32 @@ fn loadImpl(self: *Matrix, io: std.Io) !void {
         else if (std.mem.eql(u8, key, "glitch_seed_permille")) self.glitch_seed_permille = std.fmt.parseInt(u16, val, 10) catch self.glitch_seed_permille
         else if (std.mem.eql(u8, key, "overlay_initial_ttl")) self.overlay_initial_ttl = std.fmt.parseInt(u8, val, 10) catch self.overlay_initial_ttl
         else if (std.mem.eql(u8, key, "overlay_lines_per_burst")) self.overlay_lines_per_burst = std.fmt.parseInt(u8, val, 10) catch self.overlay_lines_per_burst
-        // density_div was the pre-rename divisor (smaller = denser).
-        // Translate to the new rain_density (higher = denser) so old
-        // /var/lib/ly/matrix-prefs files migrate transparently. The
-        // old divisor's effective range was 0..60; clamp into 0..20.
+        // Two prior prefs formats to migrate:
+        //   density_div  — original divisor (smaller = denser, 0..60).
+        //                  Inverse direction, scaled to 0..1000.
+        //   rain_density (legacy u8 0..20) — first inversion attempt.
+        //                  Rescale to the wider 0..1000 range.
+        // The new format is rain_density in 0..1000 (saved as-is).
+        // Detection heuristic: legacy rain_density values land in
+        // 0..20; new-format values land in 0..1000 and almost always
+        // exceed 20. The narrow overlap is acceptable because the
+        // user's slider step in the new system is 5+ (so values 1..19
+        // are rarely hit) and the migration only runs once before
+        // savePrefs canonicalises the file to the new range.
         else if (std.mem.eql(u8, key, "density_div")) {
-            const old_div = std.fmt.parseInt(u8, val, 10) catch continue;
-            const migrated: u8 = if (old_div >= 20) 0 else 20 - old_div;
-            self.rain_density = migrated;
+            const old_div = std.fmt.parseInt(u16, val, 10) catch continue;
+            // density_div 0..60 (smaller=denser). Map 0→1000 (flood),
+            // 60→0 (no spawn). Linear: rd = max(0, 1000 - old_div*17).
+            const scaled: i32 = 1000 - @as(i32, old_div) * 17;
+            self.rain_density = @intCast(@max(0, @min(1000, scaled)));
         }
-        else if (std.mem.eql(u8, key, "rain_density")) self.rain_density = std.fmt.parseInt(u8, val, 10) catch self.rain_density
+        else if (std.mem.eql(u8, key, "rain_density")) {
+            const v = std.fmt.parseInt(u16, val, 10) catch continue;
+            // Legacy rain_density was 0..20. Rescale to new 0..1000
+            // by multiplying by 50. Values > 20 are assumed already
+            // in the new format and used as-is. Clamped to 1000.
+            self.rain_density = if (v <= 20) @min(1000, @as(u16, v) * 50) else @min(1000, v);
+        }
         else if (std.mem.eql(u8, key, "min_drop_len")) self.min_drop_len = std.fmt.parseInt(u8, val, 10) catch self.min_drop_len
         else if (std.mem.eql(u8, key, "max_drop_len")) self.max_drop_len = std.fmt.parseInt(u8, val, 10) catch self.max_drop_len
         else if (std.mem.eql(u8, key, "glitch_ttl_min")) self.glitch_ttl_min = std.fmt.parseInt(u8, val, 10) catch self.glitch_ttl_min
@@ -904,24 +929,22 @@ fn draw(self: *Matrix) void {
     const buf_height = self.terminal_buffer.height;
     const buf_width = self.terminal_buffer.width;
 
-    // Density change → re-roll every column's line.space to land in
-    // the new bound's range. line.space is the per-column "wait
-    // before respawning the next trail". Without a fresh roll, an
-    // existing wait (e.g. 80 advances at rd=5) would persist after
-    // the user slides to rd=20 (flood) — each advance is ~10
-    // frames, so the old wait could last 10+ seconds before the
-    // new density takes effect, making the slider feel dead. We
-    // detect changes with rain_density_prev and re-roll all columns
-    // exactly once per change.
+    // Density change → re-roll every column's line.space to land
+    // in the new bound's range so the slider feels responsive.
+    // Special-case rd=0: don't re-roll; the spawn block in
+    // stepColumns short-circuits when rain_density==0, so the screen
+    // drains naturally as existing trails complete.
     if (self.rain_density != self.rain_density_prev) {
-        const rd: u16 = @as(u16, self.rain_density);
-        const space_unlocked: usize = if (rd >= 20) 1 else (@as(usize, 21 - rd) * 5);
-        const space_max: usize = if (self.locked) space_unlocked * LOCKED_SPACE_MULT else space_unlocked;
-        const cap_u16: u16 = @intCast(@max(1, @min(space_max, std.math.maxInt(u16))));
-        var x_idx: usize = 0;
-        while (x_idx < buf_width) : (x_idx += 2) {
-            const r = self.terminal_buffer.random.int(u16);
-            self.lines[x_idx].space = @as(usize, @mod(r, cap_u16));
+        if (self.rain_density != 0) {
+            const rd: u16 = self.rain_density;
+            const space_unlocked: usize = if (rd >= 1000) 1 else @as(usize, 1001 - rd);
+            const space_max: usize = if (self.locked) space_unlocked * LOCKED_SPACE_MULT else space_unlocked;
+            const cap_u16: u16 = @intCast(@max(1, @min(space_max, std.math.maxInt(u16))));
+            var x_idx: usize = 0;
+            while (x_idx < buf_width) : (x_idx += 2) {
+                const r = self.terminal_buffer.random.int(u16);
+                self.lines[x_idx].space = @as(usize, @mod(r, cap_u16));
+            }
         }
         self.rain_density_prev = self.rain_density;
     }

@@ -113,7 +113,7 @@ pub const Item = enum {
         return switch (self) {
             .speed_min => "Slowest column's fall\nspeed (cells per frame).\nLower = lazier trails.",
             .speed_max => "Fastest column's fall\nspeed (cells per frame).\nHigher = quicker trails.",
-            .rain_density => "How tightly trails pack\nthe screen.\n0 = sparse, 20 = flood.",
+            .rain_density => "Raindrops on screen.\n0 = nothing spawns.\n1 = very sparse, 1000 =\nconstant flood.\nShift=x5, Ctrl=fine.",
             .min_drop_len => "Shortest trail length\nallowed (cells).",
             .max_drop_len => "Longest trail length\nallowed (cells). Capped\nby screen height.",
             .tail_churn_prob => "Per-cell chance each\nframe that a trail glyph\nchanges. Higher =\nmore flicker.",
@@ -342,7 +342,7 @@ pub fn adjustScaled(self: *DebugMenu, m: *Matrix, delta: i8, step_scale: f32) Ac
     switch (item) {
         .speed_min => m.speed_min = std.math.clamp(m.speed_min + @as(f32, @floatFromInt(delta)) * 0.01 * step_scale, 0.01, m.speed_max),
         .speed_max => m.speed_max = std.math.clamp(m.speed_max + @as(f32, @floatFromInt(delta)) * 0.01 * step_scale, m.speed_min, 2.0),
-        .rain_density => m.rain_density = u8_adjust(m.rain_density, int_step, 0, 20),
+        .rain_density => m.rain_density = adjustRainDensity(m.rain_density, delta, step_scale),
         .min_drop_len => m.min_drop_len = u8_adjust(m.min_drop_len, int_step, 2, m.max_drop_len),
         .max_drop_len => m.max_drop_len = u8_adjust(m.max_drop_len, int_step, m.min_drop_len, 80),
         .tail_churn_prob => m.tail_churn_prob = std.math.clamp(m.tail_churn_prob + @as(f32, @floatFromInt(delta)) * 0.01 * step_scale, 0.0, 1.0),
@@ -403,6 +403,19 @@ fn u16_adjust(cur: u16, delta: i8, lo: u16, hi: u16) u16 {
     return @intCast(nxt);
 }
 
+// Special step size for rain_density — range is 0..1000 so the
+// usual ±1 step would feel glacial. Default 10 cells per arrow,
+// 50 with Shift (coarse sweep), 1 with Ctrl (fine). 0 is the
+// explicit "no spawn" floor; 1000 is constant flood.
+fn adjustRainDensity(cur: u16, delta: i8, step_scale: f32) u16 {
+    var base: i32 = @as(i32, delta) * 10;
+    if (step_scale >= 4.0) base = @as(i32, delta) * 50;
+    if (step_scale < 0.5) base = @as(i32, delta) * 1;
+    const cur_i: i32 = @intCast(cur);
+    const nxt: i32 = @max(0, @min(1000, cur_i + base));
+    return @intCast(nxt);
+}
+
 // Special step size for overlay_decay_frames — 1 keypress = 50
 // frames (~1s @ 50fps) so the user can sweep the full range
 // quickly. Lower bound 50 keeps decay non-trivial; upper 30000
@@ -422,7 +435,7 @@ pub fn formatValue(item: Item, m: *const Matrix, auth_fails: u64, buf: []u8) ![]
     return switch (item) {
         .speed_min => try std.fmt.bufPrint(buf, "{d:.2}", .{m.speed_min}),
         .speed_max => try std.fmt.bufPrint(buf, "{d:.2}", .{m.speed_max}),
-        .rain_density => try std.fmt.bufPrint(buf, "{d}", .{m.rain_density}),
+        .rain_density => try std.fmt.bufPrint(buf, "{d}{s}", .{ m.rain_density, if (m.rain_density == 0) " (off)" else "" }),
         .min_drop_len => try std.fmt.bufPrint(buf, "{d}", .{m.min_drop_len}),
         .max_drop_len => try std.fmt.bufPrint(buf, "{d}", .{m.max_drop_len}),
         .tail_churn_prob => try std.fmt.bufPrint(buf, "{d:.2}", .{m.tail_churn_prob}),

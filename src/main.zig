@@ -442,18 +442,22 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // When running under kmscon (--take-tty set), force TERM to
-    // linux-c before termbox loads its terminfo. linux-c is the
-    // ncurses-canonical "linux console + kcbt=\E[Z" entry: same
-    // arrow / function-key caps as plain "linux" (kcuu1=\E[A etc.)
-    // BUT with kcbt=\E[Z to match what kmscon actually emits for
-    // Shift+Tab. kmscon defaults to TERM=linux, where kcbt=\E^I, so
-    // termbox never sees \e[Z as TB_KEY_BACK_TAB and Shift+Tab does
-    // nothing. Choosing linux-c (rather than xterm-256color)
-    // preserves linux-style CSI arrows — xterm-256color's kcuu1=\EOA
-    // doesn't match what kmscon sends and silently breaks Up/Down.
+    // rxvt-256color before termbox loads its terminfo. This entry
+    // has the magic combination that matches what kmscon emits:
+    //   kcbt=\E[Z       (Shift+Tab — kmscon emits CSI Z)
+    //   kcuu1=\E[A      (arrows in normal-mode CSI, not app-mode)
+    //   civis=\E[?25l   (cursor hide — defined, unlike linux-c which
+    //                    leaves civis empty, making tb_hide_cursor()
+    //                    a no-op so the pty cursor stays visible and
+    //                    blinks at the bottom row over the matrix).
+    // Other candidates fail: linux uses kcbt=\E^I (Shift+Tab broken),
+    // xterm-256color uses kcuu1=\EOA (arrows broken), linux-c has no
+    // civis (cursor flashes). Shift+F-key sequences (\E[24$ etc.)
+    // are recognized by termbox's builtin_mod_caps regardless of TERM
+    // so Shift+F12 (debug menu) still works.
     if (take_tty_target != null) {
-        interop.setEnvironmentVariable(state.allocator, "TERM", "linux-c", true) catch |err| {
-            try state.log_file.err(state.io, "tui", "failed to override TERM=linux-c: {s}", .{@errorName(err)});
+        interop.setEnvironmentVariable(state.allocator, "TERM", "rxvt-256color", true) catch |err| {
+            try state.log_file.err(state.io, "tui", "failed to override TERM=rxvt-256color: {s}", .{@errorName(err)});
         };
     }
 
