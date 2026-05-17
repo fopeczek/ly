@@ -318,12 +318,31 @@ pub fn swapControllingTty(target_tty_num: u8) !std.posix.fd_t {
     if (old_ctty_fd < 0) return error.OpenCurrentCttyFailed;
     errdefer _ = std.c.close(old_ctty_fd);
 
+    // CRITICAL: ignore SIGHUP across the TIOCNOTTY call. The kernel
+    // sends SIGHUP to the foreground process group of a session that
+    // disowns its controlling terminal. Without ignoring it, ly kills
+    // itself the instant we detach from kmscon's pty — symptom is a
+    // ly-respawn loop that never reaches TerminalBuffer.init.
+    const empty_mask: std.c.sigset_t = std.mem.zeroes(std.c.sigset_t);
+    const sig_ign: std.c.Sigaction = .{
+        .handler = .{ .handler = std.c.SIG.IGN },
+        .mask = empty_mask,
+        .flags = 0,
+    };
+    var prev_sighup: std.c.Sigaction = undefined;
+    _ = std.c.sigaction(std.c.SIG.HUP, &sig_ign, &prev_sighup);
+
     // Detach the session from the current ctty. After this, the
     // session has no controlling terminal — required precondition for
     // TIOCSCTTY below. If we weren't a session leader the ioctl is a
     // no-op; the subsequent TIOCSCTTY would then fail with EPERM,
     // which we surface as SetCtTyFailed.
     _ = std.c.ioctl(old_ctty_fd, TIOCNOTTY);
+
+    // Restore the previous SIGHUP handler now that the dangerous window
+    // is closed. (We deliberately don't keep ignoring SIGHUP forever —
+    // ly may legitimately want to react to it later.)
+    _ = std.c.sigaction(std.c.SIG.HUP, &prev_sighup, null);
 
     // Open the target tty WITHOUT claiming it as ctty implicitly
     // (O_NOCTTY). We claim it explicitly below.
