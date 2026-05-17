@@ -117,7 +117,7 @@ pub const Item = enum {
         return switch (self) {
             .speed_min => "Slowest column's fall\nspeed (cells per frame).\nLower = lazier trails.",
             .speed_max => "Fastest column's fall\nspeed (cells per frame).\nHigher = quicker trails.",
-            .rain_density => "Raindrops on screen.\n0 = nothing spawns.\n1 = very sparse, 1000 =\nconstant flood.\nShift=x5, Ctrl=fine.",
+            .rain_density => "Spawn rate. Each column\nrolls a fresh chance per\nadvance.\n0 = no spawns.\n1 = ~1 trail / 1000 ticks.\n1000 = constant.",
             .drop_v_margin => "Vertical clearance (in\ncells) that must be free\nat the top of a column\nbefore a new trail can\nspawn there. Larger =\nmore stagger between\nraindrops, less wave.",
             .drop_h_margin => "Horizontal clearance to\nadjacent columns. 0 = no\ncheck; columns may have\nheads at the same row.\nHigher = no two trails\nstart side-by-side.",
             .min_drop_len => "Shortest trail length\nallowed (cells).",

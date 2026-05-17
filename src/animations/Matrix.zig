@@ -527,22 +527,30 @@ fn stepColumns(self: *Matrix) void {
                 // when the user later raises rain_density above 0,
                 // the re-roll in draw() will assign a fresh wait.
             } else if (spawn_gate_open) {
-                if (line.space > 0) {
-                    line.space -= 1;
-                } else {
+                // Per-advance Poisson spawn: probability =
+                // rain_density / 1000. Each column rolls an
+                // independent random number every advance, so
+                // spawns are statistically independent (no
+                // synchronized wave) AND the slider is perceptually
+                // linear — a 100-unit slider move changes the
+                // spawn rate by the same fraction-of-max no matter
+                // where on the scale it lands. Replaces the prior
+                // line.space=1001-rd countdown which exaggerated
+                // the high end (1000→900 was a 100x change).
+                const prob_base: f32 = @as(f32, @floatFromInt(self.rain_density)) / 1000.0;
+                const spawn_prob: f32 = if (self.locked)
+                    prob_base / @as(f32, @floatFromInt(LOCKED_SPACE_MULT))
+                else
+                    prob_base;
+                if (self.terminal_buffer.random.float(f32) < spawn_prob) {
                     const randint = self.terminal_buffer.random.int(u16);
                     const h = buf_height;
-                    // line.length and line.speed are SHARED across
-                    // all trails currently alive in this column
-                    // (multi-trail mode under drop_v_margin). The
-                    // fade renderer divides distance-from-head by
-                    // line.length, so changing it mid-fall would
-                    // visibly shift the existing trail's colors —
-                    // user reported this as "tails change shade
-                    // randomly". Only roll new length + speed when
-                    // the column was empty before this spawn; for
-                    // subsequent spawns (column already has trails)
-                    // keep both stable so the visual stays smooth.
+                    // line.length / line.speed are SHARED across all
+                    // trails alive in a column (single Line struct).
+                    // Only roll new values when the column was
+                    // empty before this spawn; subsequent spawns
+                    // inherit the existing length/speed so existing
+                    // trails' colors don't shift mid-fall.
                     if (!column_has_content) {
                         const max_eff_raw: usize = @min(@as(usize, self.max_drop_len), if (h > 1) h - 1 else 1);
                         const max_eff: usize = if (max_eff_raw < self.min_drop_len) self.min_drop_len else max_eff_raw;
@@ -551,32 +559,6 @@ fn stepColumns(self: *Matrix) void {
                     }
                     const pool: []const u32 = if (self.locked) &LOCKED_GLYPH_POOL else &GLYPH_POOL;
                     self.dots[x].value = pool[@mod(randint, pool.len)];
-                    // Inter-raindrop idle gap in cells. rain_density
-                    // is 1..1000 here (0 short-circuited above to
-                    // "no spawn"). Linear inverse: space_max =
-                    // 1001 - rd. 1 → 1000-cell wait (extremely
-                    // sparse), 1000 → 1-cell wait (constant flood).
-                    // line.space rolls uniformly in [0, space_max).
-                    // Locked mode multiplies the wait so density
-                    // visibly collapses in lockout state.
-                    const rd: u16 = self.rain_density;
-                    const space_unlocked: usize = if (rd >= 1000)
-                        1
-                    else
-                        @as(usize, 1001 - rd);
-                    const space_max: usize = if (self.locked) space_unlocked * LOCKED_SPACE_MULT else space_unlocked;
-                    // Minimum stagger of 4 advances: at extreme
-                    // density the formula gives space_max=1 which
-                    // would make every column respawn in lock-step
-                    // (a "wave"). Floor at 4 means consecutive
-                    // trails in the same column are offset by 0..3
-                    // advances, breaking the sync over time.
-                    const cap: u16 = @intCast(@max(4, @min(space_max, std.math.maxInt(u16))));
-                    line.space = @as(usize, @mod(randint, cap));
-                    // Reroll speed only when the column was empty —
-                    // changing speed while trails are mid-fall would
-                    // suddenly accelerate or slow every visible trail
-                    // in this column at once, an obvious visual jolt.
                     if (!column_has_content) {
                         line.speed = self.speed_min +
                             self.terminal_buffer.random.float(f32) * (self.speed_max - self.speed_min);
@@ -1018,31 +1000,12 @@ fn draw(self: *Matrix) void {
     const buf_height = self.terminal_buffer.height;
     const buf_width = self.terminal_buffer.width;
 
-    // Density change → re-roll every column's line.space to land
-    // in the new bound's range so the slider feels responsive.
-    // Special-case rd=0: don't re-roll; the spawn block in
-    // stepColumns short-circuits when rain_density==0, so the screen
-    // drains naturally as existing trails complete.
-    if (self.rain_density != self.rain_density_prev) {
-        if (self.rain_density != 0) {
-            const rd: u16 = self.rain_density;
-            const space_unlocked: usize = if (rd >= 1000) 1 else @as(usize, 1001 - rd);
-            const space_max: usize = if (self.locked) space_unlocked * LOCKED_SPACE_MULT else space_unlocked;
-            // Stagger floor: at re-roll time, give columns AT LEAST
-            // half the screen height of spread (or space_max,
-            // whichever is bigger). Without this, all columns get
-            // the same line.space at extreme density and produce one
-            // synchronized wave when the user slides up.
-            const stagger_floor: usize = @max(@as(usize, buf_height) / 2, 16);
-            const cap_u16: u16 = @intCast(@max(2, @min(@max(space_max, stagger_floor), std.math.maxInt(u16))));
-            var x_idx: usize = 0;
-            while (x_idx < buf_width) : (x_idx += 2) {
-                const r = self.terminal_buffer.random.int(u16);
-                self.lines[x_idx].space = @as(usize, @mod(r, cap_u16));
-            }
-        }
-        self.rain_density_prev = self.rain_density;
-    }
+    // No density-change re-roll needed anymore: spawn is now
+    // probabilistic per-advance (rain_density/1000), so the slider
+    // takes effect on the very next advance per column. rain_density_prev
+    // is kept on the struct for ABI stability but no longer read.
+    _ = self.rain_density_prev; // suppress "field unused" reads
+    self.rain_density_prev = self.rain_density;
 
     self.stepColumns();
     self.tickGlitches();
