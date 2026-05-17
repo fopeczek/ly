@@ -2474,12 +2474,13 @@ fn positionWidgets(ptr: *anyopaque) !void {
         if (state.config.brightness_up_key != null) {
             last_label = state.brightness_up_label;
         }
-        // positionX (not positionXY) — keeps the same row instead of
-        // copying brightness_up's y which was advanced one line.
-        state.debug_label.positionX(last_label
-            .childrenPosition()
-            .addX(1));
-        last_label = state.debug_label;
+        // debug_label gets its own row, left-aligned. Was previously
+        // appended to the end of the hint row which on a wide
+        // screen put it at mid-column; the user asked for it on
+        // the left edge instead. New row = hint row Y + 1.
+        state.debug_label.positionXY(state.edge_margin
+            .add(TerminalBuffer.START_POSITION)
+            .addY(1));
         for (state.custom_binds.items) |*item| {
             item.lbl.positionXY(state.edge_margin
                 .addY(y_offset)

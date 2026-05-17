@@ -190,14 +190,17 @@ pub fn runEventLoop(
     inactivity_event_fn: ?*const fn (*anyopaque) anyerror!void,
     context: *anyopaque,
 ) !void {
-    try self.registerGlobalKeybind(io, "Ctrl+K", &moveCursorUp, self);
-    try self.registerGlobalKeybind(io, "Up", &moveCursorUp, self);
-
-    try self.registerGlobalKeybind(io, "Ctrl+J", &moveCursorDown, self);
-    try self.registerGlobalKeybind(io, "Down", &moveCursorDown, self);
-
-    try self.registerGlobalKeybind(io, "Tab", &wrapCursor, self);
-    try self.registerGlobalKeybind(io, "Shift+Tab", &wrapCursorReverse, self);
+    // Default cursor-wrap bindings. Skip re-registering if the caller
+    // (e.g. main.zig's debug-menu overrides) already bound them —
+    // runEventLoop is called AFTER main.zig finishes its keybind
+    // setup, and without this check the defaults would silently
+    // clobber whatever main registered for these keys.
+    try self.maybeRegisterGlobalKeybind(io, "Ctrl+K", &moveCursorUp, self);
+    try self.maybeRegisterGlobalKeybind(io, "Up", &moveCursorUp, self);
+    try self.maybeRegisterGlobalKeybind(io, "Ctrl+J", &moveCursorDown, self);
+    try self.maybeRegisterGlobalKeybind(io, "Down", &moveCursorDown, self);
+    try self.maybeRegisterGlobalKeybind(io, "Tab", &wrapCursor, self);
+    try self.maybeRegisterGlobalKeybind(io, "Shift+Tab", &wrapCursorReverse, self);
 
     defer self.handlable_widgets.deinit(allocator);
 
@@ -454,6 +457,23 @@ pub fn registerGlobalKeybind(
     callback: KeybindCallbackFn,
     context: *anyopaque,
 ) !void {
+    try self.registerKeybind(io, &self.keybinds, keybind, callback, context);
+}
+
+// Like registerGlobalKeybind but a no-op if the key is already bound.
+// Used by runEventLoop's default bindings so caller-side overrides
+// (e.g. main.zig's debug-menu Tab handler) survive — runEventLoop's
+// setup happens AFTER main's keybind registrations, and without this
+// the defaults would clobber whatever main bound.
+pub fn maybeRegisterGlobalKeybind(
+    self: *TerminalBuffer,
+    io: std.Io,
+    keybind: []const u8,
+    callback: KeybindCallbackFn,
+    context: *anyopaque,
+) !void {
+    const key = try self.parseKeybind(io, keybind);
+    if (self.keybinds.get(key) != null) return;
     try self.registerKeybind(io, &self.keybinds, keybind, callback, context);
 }
 
