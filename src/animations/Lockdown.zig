@@ -182,6 +182,12 @@ snapshot: ?[]Cell = null,
 // Frame-counter for scramble re-roll cadence.
 scramble_frame: u32 = 0,
 
+// True once the tick phase has progressed past GROW_UI_DELAY_SEC
+// and we've handed control back to Matrix so the user sees locked-
+// mode rain fall behind the clock + restored widgets. Reset by
+// start(); flipped back via end_unlock through hook_matrix_locked.
+tick_locked_set: bool = false,
+
 buf_width: usize = 0,
 buf_height: usize = 0,
 
@@ -407,6 +413,7 @@ pub fn start(
     self.lockdown_started = now;
     self.last_external_check = now;
     self.scramble_frame = 0;
+    self.tick_locked_set = false;
 
     // Save + flip side-effect state for restore. Done in BOTH
     // preview AND real modes — preview is meant to look identical
@@ -504,6 +511,16 @@ pub fn update(self: *Lockdown, now: f64) bool {
             new_phase = .tick;
         },
         .tick => {
+            // Once we've crossed GROW_UI_DELAY_SEC, hand the rain
+            // back over to Matrix in locked mode so the user sees
+            // sparse-gray drops fall behind the clock + restored
+            // widgets. Idempotent via tick_locked_set so we don't
+            // hammer the hook every frame.
+            if (!self.tick_locked_set and elapsed >= GROW_UI_DELAY_SEC) {
+                if (self.hook_matrix_suppressed) |s| s.* = false;
+                if (self.hook_matrix_locked) |m| m.* = true;
+                self.tick_locked_set = true;
+            }
             // External-reset poll.
             if (now - self.last_external_check >= FAILLOCK_POLL_SEC) {
                 self.last_external_check = now;
@@ -522,11 +539,32 @@ pub fn update(self: *Lockdown, now: f64) bool {
         },
     }
     if (new_phase) |p| {
+        // Seamless scramble→shrink: bake the scrambled glyphs into
+        // the snapshot so the shrink-fade palette starts from the
+        // characters the user just saw, not the originals captured
+        // at start(). We CAN'T re-snapshot the back buffer here —
+        // renderOneFrame's clearScreen(false) just wiped it at the
+        // top of this frame, before our update() ran. The scram[]
+        // buffer is what drawScramble actually painted in the
+        // previous frame, so copying its codepoints into
+        // snapshot[].ch is the deterministic source.
+        if (self.phase == .scramble and p == .shrink_fade) {
+            self.bakeScrambleIntoSnapshot();
+        }
         self.phase = p;
         self.phase_started = now;
         if (p == .end_unlock) return true;
     }
     return false;
+}
+
+fn bakeScrambleIntoSnapshot(self: *Lockdown) void {
+    const snap = self.snapshot orelse return;
+    const scram = self.scramble_glyph orelse return;
+    var i: usize = 0;
+    while (i < snap.len) : (i += 1) {
+        if (scram[i] != 0) snap[i].ch = scram[i];
+    }
 }
 
 // Caller invokes after handling .end_unlock side-effects (restore
