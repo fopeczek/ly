@@ -100,9 +100,15 @@ pub fn clearRendered(self: InfoLine, allocator: Allocator) !void {
     );
 }
 
-fn draw(self: *InfoLine) void {
-    // Custom draw — bypasses CyclableLabel.draw() so the `<` and `>` arrows
-    // don't render. Info line shows a single current message; not navigable.
+// Custom draw — bypasses CyclableLabel.draw() so the `<` and `>` arrows
+// don't render. Info line shows a single current message; not navigable.
+//
+// MUST be used in place of self.label.draw() everywhere — calling the
+// underlying CyclableLabel.draw() directly renders the navigation
+// arrows, which has been the source of "title bar < > glitches" the
+// user reported after failed password attempts (the auth flow had
+// three call sites bypassing this).
+pub fn draw(self: *InfoLine) void {
     const label = self.label;
     if (label.list.items.len == 0) return;
     if (label.width < 2) return;

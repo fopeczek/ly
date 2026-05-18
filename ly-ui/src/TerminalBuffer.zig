@@ -100,6 +100,12 @@ handlable_widgets: std.ArrayList(*Widget),
 run: bool,
 update: bool,
 active_widget_index: usize,
+// Layers and context captured by runEventLoop so other code paths
+// (notably the auth wait-pump in main.zig::authenticate) can call
+// renderOneFrame() without re-threading them through every fn that
+// might need to drive a frame. null until runEventLoop sets them.
+current_layers: ?[][]*Widget,
+current_context: ?*anyopaque,
 
 pub fn init(
     allocator: Allocator,
@@ -170,6 +176,8 @@ pub fn init(
         .run = true,
         .update = true,
         .active_widget_index = 0,
+        .current_layers = null,
+        .current_context = null,
     };
 }
 
@@ -220,6 +228,11 @@ pub fn runEventLoop(
 
     try @call(.auto, position_widgets_fn, .{context});
 
+    // Stash layers + context so external callers (auth wait-pump)
+    // can drive a frame via renderOneFrame.
+    self.current_layers = layers;
+    self.current_context = context;
+
     var event: termbox.tb_event = undefined;
     var inactivity_cmd_ran = false;
     var inactivity_time_start = try interop.getTimeOfDay();
@@ -228,49 +241,7 @@ pub fn runEventLoop(
         var maybe_timeout: ?usize = null;
 
         if (self.update) {
-            try TerminalBuffer.clearScreen(false);
-
-            // Reset cursor
-            const current_widget = self.getActiveWidget();
-            current_widget.handle(null) catch |err| {
-                shared_error.writeError(error.SetCursorFailed);
-                try self.log_file.err(
-                    io,
-                    "tui",
-                    "failed to set cursor in active widget '{s}': {s}",
-                    .{ current_widget.display_name, @errorName(err) },
-                );
-            };
-
-            for (layers) |layer| {
-                for (layer) |widget| {
-                    try widget.update(context);
-                    widget.draw();
-
-                    if (try widget.calculateTimeout(context)) |widget_timeout| {
-                        if (maybe_timeout == null or widget_timeout < maybe_timeout.?) maybe_timeout = widget_timeout;
-                    }
-                }
-            }
-
-            // Hide the cursor before flushing the frame. termbox2's
-            // tb_set_cursor clamps negative coords to (0,0) rather than
-            // hiding — must use tb_hide_cursor() proper. Without this
-            // kmscon renders the pty cursor at the active widget's
-            // last cursor position as a visible bright block over the
-            // matrix rain.
-            _ = termbox.tb_hide_cursor();
-            TerminalBuffer.presentBuffer();
-
-            // If a SIGUSR1 came in, dump the freshly-presented back
-            // buffer to /tmp/ly-snapshot.txt. swap()→false consumes
-            // the flag atomically so the next signal is required to
-            // produce another snapshot.
-            if (snapshot_request.swap(false, .seq_cst)) {
-                writeSnapshot(io, "/tmp/ly-snapshot.txt") catch |err| {
-                    self.log_file.err(io, "tui", "snapshot failed: {s}", .{@errorName(err)}) catch {};
-                };
-            }
+            maybe_timeout = try self.renderOneFrame(io, shared_error);
         }
 
         if (inactivity_event_fn) |inactivity_fn| {
@@ -342,6 +313,63 @@ pub fn runEventLoop(
             self.update = true;
         }
     }
+}
+
+// Render one frame of the UI: clear, run handle on active widget,
+// update + draw every widget in every layer, hide cursor, present.
+// Returns the smallest widget timeout (used by runEventLoop to set
+// tb_peek_event's deadline). Layers come from `current_layers` set
+// by runEventLoop on start. Called both from runEventLoop's main
+// loop AND from the auth wait-pump (so the matrix animation keeps
+// ticking while PAM is checking the password).
+pub fn renderOneFrame(
+    self: *TerminalBuffer,
+    io: std.Io,
+    shared_error: SharedError,
+) !?usize {
+    const layers = self.current_layers orelse return null;
+    const context = self.current_context orelse return null;
+
+    try TerminalBuffer.clearScreen(false);
+
+    // Reset cursor via active widget's handle().
+    const current_widget = self.getActiveWidget();
+    current_widget.handle(null) catch |err| {
+        shared_error.writeError(error.SetCursorFailed);
+        try self.log_file.err(
+            io,
+            "tui",
+            "failed to set cursor in active widget '{s}': {s}",
+            .{ current_widget.display_name, @errorName(err) },
+        );
+    };
+
+    var maybe_timeout: ?usize = null;
+    for (layers) |layer| {
+        for (layer) |widget| {
+            try widget.update(context);
+            widget.draw();
+            if (try widget.calculateTimeout(context)) |t| {
+                if (maybe_timeout == null or t < maybe_timeout.?) maybe_timeout = t;
+            }
+        }
+    }
+
+    // Hide the cursor before flushing — termbox2's tb_set_cursor
+    // clamps negative coords to (0,0) rather than hiding; must use
+    // tb_hide_cursor() proper. Otherwise kmscon renders the pty
+    // cursor as a visible block over the matrix.
+    _ = termbox.tb_hide_cursor();
+    TerminalBuffer.presentBuffer();
+
+    // Consume any pending SIGUSR1 snapshot request.
+    if (snapshot_request.swap(false, .seq_cst)) {
+        writeSnapshot(io, "/tmp/ly-snapshot.txt") catch |err| {
+            self.log_file.err(io, "tui", "snapshot failed: {s}", .{@errorName(err)}) catch {};
+        };
+    }
+
+    return maybe_timeout;
 }
 
 pub fn stopEventLoop(self: *TerminalBuffer) void {

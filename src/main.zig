@@ -1653,7 +1653,7 @@ fn pamMessageCallback(msg: [*c]const u8, kind: auth.PamMsgKind, ctx: ?*anyopaque
     const fg = if (kind == .err) state.config.error_fg else state.config.fg;
     state.info_line.addMessage(owned, bg, fg) catch return;
     state.info_line.clearRendered(state.allocator) catch {};
-    state.info_line.label.draw();
+    state.info_line.draw();
     TerminalBuffer.presentBuffer();
 }
 
@@ -2005,7 +2005,7 @@ fn authenticate(ptr: *anyopaque) !bool {
                 .{@errorName(err)},
             );
         };
-        state.info_line.label.draw();
+        state.info_line.draw();
         TerminalBuffer.presentBuffer();
         return false;
     }
@@ -2028,7 +2028,7 @@ fn authenticate(ptr: *anyopaque) !bool {
             .{@errorName(err)},
         );
     };
-    state.info_line.label.draw();
+    state.info_line.draw();
     TerminalBuffer.presentBuffer();
 
     if (state.config.save) save_last_settings: {
@@ -2131,11 +2131,33 @@ fn authenticate(ptr: *anyopaque) !bool {
             std.process.exit(0);
         }
 
+        // Non-blocking wait-pump. PAM check takes ~1-2 seconds for
+        // a real password, during which the parent used to block on
+        // waitpid(...0) — freezing the matrix animation. Now we
+        // poll waitpid with WNOHANG and drive renderOneFrame between
+        // polls so the animation stays alive.
+        //
+        // The legacy 1-second sleep after waitpid was kept for
+        // non-auth-only mode where the child forks a session shell;
+        // for auth-only mode (the only path we use under
+        // ly-via-kmscon) the child is purely the PAM checker and
+        // exits cleanly, so the post-wait sleep is now redundant.
+        const WNOHANG: u32 = 1;
         var session_status: c_int = undefined;
-        _ = std.posix.system.waitpid(session_pid, &session_status, 0);
-        // HACK: It seems like the session process is not exiting immediately after the waitpid call.
-        // This is a workaround to ensure the session process has exited before re-initializing the TTY.
-        state.io.sleep(.fromSeconds(1), .real) catch {};
+        // Frame interval ≈ config.animation_frame_delay ms.
+        const frame_ms: u64 = @max(@as(u64, state.config.animation_frame_delay), 16);
+        // Reuse the existing shared_err allocated above so we don't
+        // double-allocate or risk pipe-fd churn during a hot path.
+        while (true) {
+            const wait_res = std.posix.system.waitpid(session_pid, &session_status, WNOHANG);
+            if (wait_res == session_pid) break;
+            if (wait_res < 0) break;
+            // Pump one animation frame. Errors here are non-fatal —
+            // we still need to keep polling waitpid.
+            state.buffer.drawNextFrame(true);
+            _ = state.buffer.renderOneFrame(state.io, shared_err) catch {};
+            state.io.sleep(.fromMilliseconds(@as(u32, @intCast(frame_ms))), .real) catch break;
+        }
         session_pid = -1;
 
         try state.log_file.reinit(state.io);
