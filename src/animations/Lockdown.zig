@@ -40,6 +40,7 @@ const Cell = ly_ui.Cell;
 const TerminalBuffer = ly_ui.TerminalBuffer;
 const Widget = ly_ui.Widget;
 const Label = ly_ui.Label;
+const Box = ly_ui.Box;
 const ly_core = ly_ui.ly_core;
 const interop = ly_core.interop;
 const TimeOfDay = interop.TimeOfDay;
@@ -199,6 +200,11 @@ hook_auth_fails: ?*u64 = null,
 hook_matrix_locked: ?*bool = null,
 hook_matrix_suppressed: ?*bool = null,
 hook_password_label: ?*Label = null,
+// Box pointer for clock positioning — we anchor the clock 3 rows
+// above the box's top border so it reads as "this is what the
+// login box is waiting for". null falls back to vertical screen
+// centre (only used in tests / edge cases).
+hook_box: ?*Box = null,
 // Saved values for restore at end_unlock. Captured at start().
 saved_top_title: ?[]const u8 = null,
 saved_password_label_text: []const u8 = "",
@@ -233,6 +239,7 @@ pub fn attachHooks(
     matrix_locked: ?*bool,
     matrix_suppressed: ?*bool,
     password_label: *Label,
+    box: *Box,
 ) void {
     self.hook_password_should_insert = password_should_insert;
     self.hook_box_top_title = box_top_title;
@@ -240,6 +247,7 @@ pub fn attachHooks(
     self.hook_matrix_locked = matrix_locked;
     self.hook_matrix_suppressed = matrix_suppressed;
     self.hook_password_label = password_label;
+    self.hook_box = box;
 }
 
 pub fn deinit(self: *Lockdown) void {
@@ -315,24 +323,22 @@ pub fn cacheUsername(self: *Lockdown, username: []const u8) void {
 }
 
 fn runEndUnlockHooks(self: *Lockdown) void {
-    // Restore the side-effects start() captured. preview_mode means
-    // we didn't touch them, so skip the restore path.
+    // Restore the side-effects start() captured. Always restore the
+    // UI bits (title, password input, label). auth_fails + matrix
+    // locked are only flipped in non-preview mode — preview must
+    // not touch the real auth state.
+    if (self.hook_box_top_title) |t| {
+        t.* = self.saved_top_title;
+    }
+    if (self.hook_password_should_insert) |p| {
+        p.* = true;
+    }
+    if (self.hook_password_label) |lbl| {
+        lbl.setText(self.saved_password_label_text);
+    }
     if (!self.preview_mode) {
-        if (self.hook_box_top_title) |t| {
-            t.* = self.saved_top_title;
-        }
-        if (self.hook_password_should_insert) |p| {
-            p.* = true;
-        }
-        if (self.hook_auth_fails) |a| {
-            a.* = 0;
-        }
-        if (self.hook_matrix_locked) |m| {
-            m.* = false;
-        }
-        if (self.hook_password_label) |lbl| {
-            lbl.setText(self.saved_password_label_text);
-        }
+        if (self.hook_auth_fails) |a| a.* = 0;
+        if (self.hook_matrix_locked) |m| m.* = false;
     }
     if (self.hook_matrix_suppressed) |s| s.* = false;
     self.saved_top_title = null;
@@ -402,22 +408,20 @@ pub fn start(
     self.last_external_check = now;
     self.scramble_frame = 0;
 
-    // Save side-effect state for restore. Skip in preview mode so
-    // real password.should_insert, box.top_title, and password_label
-    // remain untouched — preview must be visually identical but
-    // auth-stack invisible.
-    if (!preview) {
-        if (self.hook_box_top_title) |t| {
-            self.saved_top_title = t.*;
-            t.* = null;
-        }
-        if (self.hook_password_should_insert) |p| {
-            p.* = false;
-        }
-        if (self.hook_password_label) |lbl| {
-            self.saved_password_label_text = lbl.text;
-            lbl.setText("");
-        }
+    // Save + flip side-effect state for restore. Done in BOTH
+    // preview AND real modes — preview is meant to look identical
+    // to the real thing, including the missing password field and
+    // box title. end_unlock restores everything regardless of mode.
+    if (self.hook_box_top_title) |t| {
+        self.saved_top_title = t.*;
+        t.* = null;
+    }
+    if (self.hook_password_should_insert) |p| {
+        p.* = false;
+    }
+    if (self.hook_password_label) |lbl| {
+        self.saved_password_label_text = lbl.text;
+        lbl.setText("");
     }
 
     // Preview overrides unlock to a short window so the user sees
@@ -760,14 +764,36 @@ fn draw(self: *Lockdown, buf: *TerminalBuffer) void {
             if (tick_elapsed < GROW_UI_DELAY_SEC) {
                 self.drawBlank(buf);
             } else {
-                const cy = buf.height / 2;
-                const y0 = if (cy >= 2) cy - 2 else 0;
-                const y1 = if (y0 + 4 < buf.height) y0 + 4 else buf.height;
-                self.drawBlankBand(buf, y0, y1);
+                const band = self.clockBand(buf);
+                self.drawBlankBand(buf, band.y0, band.y1);
             }
             self.drawClock(buf, now, false);
         },
     }
+}
+
+// Locate the clock band rows. Anchored to box top when the hook is
+// attached so the clock sits 3 rows above the login box; falls back
+// to screen vertical centre otherwise. The band spans cy-1..cy+1 so
+// the accent dashes above and below the clock are kept blank too.
+fn clockBand(self: *const Lockdown, buf: *TerminalBuffer) struct { y0: usize, y1: usize, cy: usize, cx: usize, cw: usize } {
+    const text_w: usize = 5; // "MM:SS"
+    var cy: usize = buf.height / 2;
+    var cx: usize = if (buf.width > text_w) (buf.width - text_w) / 2 else 0;
+    var cw: usize = buf.width;
+    if (self.hook_box) |b| {
+        // box.left_pos.y is the row of the interior (one below the
+        // top border). The border is at y-1. Place clock at y-3 so
+        // there's a clear gap between clock and box, and the accent
+        // dash above (cy-1) doesn't overdraw the border itself.
+        if (b.left_pos.y >= 3) cy = b.left_pos.y - 3;
+        cw = b.width + 2; // box width + borders
+        const box_centre = b.left_pos.x + b.width / 2;
+        cx = if (box_centre >= text_w / 2) box_centre - text_w / 2 else 0;
+    }
+    const y0: usize = if (cy >= 1) cy - 1 else 0;
+    const y1: usize = if (cy + 2 < buf.height) cy + 2 else buf.height;
+    return .{ .y0 = y0, .y1 = y1, .cy = cy, .cx = cx, .cw = cw };
 }
 
 fn drawBlank(self: *Lockdown, buf: *TerminalBuffer) void {
@@ -842,12 +868,11 @@ fn drawClock(self: *Lockdown, buf: *TerminalBuffer, now: f64, growing: bool) voi
     const secs = self.remainingSeconds(now);
     const text = formatClock(secs, &buf6);
 
-    // Center horizontally + vertically. Render with high padding
-    // on each side so it reads as "the only thing on screen".
+    const band = self.clockBand(buf);
     const tw = text.len;
     if (buf.width < tw + 4 or buf.height < 4) return;
-    const cx = (buf.width - tw) / 2;
-    const cy = buf.height / 2;
+    const cx = band.cx;
+    const cy = band.cy;
 
     if (growing) {
         const elapsed = now - self.phase_started;
@@ -868,12 +893,12 @@ fn drawClock(self: *Lockdown, buf: *TerminalBuffer, now: f64, growing: bool) voi
         }
         // Underline / overline accent so it reads as "this is the
         // time you're waiting for, not just stray text". 1-row
-        // bracket above and below.
+        // bracket above and below the digit row.
         const dash_fg: u32 = CLOCK_DIM;
         var j: usize = 0;
         while (j < tw) : (j += 1) {
-            Cell.init(0x2500, dash_fg, BG).put(cx + j, cy - 1);
-            Cell.init(0x2500, dash_fg, BG).put(cx + j, cy + 1);
+            if (cy >= 1) Cell.init(0x2500, dash_fg, BG).put(cx + j, cy - 1);
+            if (cy + 1 < buf.height) Cell.init(0x2500, dash_fg, BG).put(cx + j, cy + 1);
         }
     }
 }

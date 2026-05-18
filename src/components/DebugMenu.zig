@@ -174,7 +174,7 @@ pub const Tab = enum {
             .glitches => "Glitches",
             .errors => "Errors",
             .lockout => "Lockout",
-            .animations => "Anim",
+            .animations => "Animations",
         };
     }
 
@@ -529,8 +529,12 @@ fn drawWidget(self: *DebugMenu) void {
     const buf = self.buffer_ptr orelse return;
 
     // Panel geometry: centered, fixed size. Width tuned for label +
-    // value layout (left ~24 chars label, right ~12 chars value).
-    const panel_w: usize = 44;
+    // value layout (left ~24 chars label, right ~12 chars value) PLUS
+    // enough tab-row room for all five tabs including "Animations"
+    // (the longest at 10 chars). The five tabs render as
+    // `[Rain][Glitches][Errors][Lockout][Animations]` which takes
+    // 50 chars + the leading 2-char margin → 52 minimum.
+    const panel_w: usize = 54;
     const panel_h: usize = 18;
     if (buf.width < panel_w + 2 or buf.height < panel_h + 2) return;
     const px = (buf.width - panel_w) / 2;

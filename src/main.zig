@@ -23,7 +23,8 @@ const IniParser = ly_core.IniParser;
 const ini = ly_core.ini;
 const Ini = ini.Ini;
 
-const Cascade = @import("animations/Cascade.zig");
+// Cascade animation removed in favour of Lockdown — see layer 3
+// comment near the widget layer setup for the rationale.
 const ColorMix = @import("animations/ColorMix.zig");
 const Doom = @import("animations/Doom.zig");
 const DurFile = @import("animations/DurFile.zig");
@@ -1293,6 +1294,7 @@ pub fn main(init: std.process.Init) !void {
                 &matrix_storage.?.locked,
                 &matrix_storage.?.suppressed,
                 &state.password_label,
+                &state.box,
             );
             animation = matrix_storage.?.widget();
         },
@@ -1342,12 +1344,8 @@ pub fn main(init: std.process.Init) !void {
     }
     defer if (animation) |a| a.deinit();
 
-    var cascade = Cascade.init(
-        state.io,
-        &state.buffer,
-        &state.auth_fails,
-        state.config.auth_fails,
-    );
+    // Cascade animation deliberately not constructed — see the
+    // commented-out layer 3 below for context.
 
     state.auth_fails = 0;
     state.animate = state.config.animation != .none;
@@ -1513,13 +1511,14 @@ pub fn main(init: std.process.Init) !void {
 
     try widgets.append(state.allocator, layer2.items);
 
-    // Layer 3
-    if (state.config.auth_fails > 0) {
-        var layer3 = [_]*Widget{cascade.widget()};
-        try widgets.append(state.allocator, &layer3);
-    }
+    // Cascade animation removed — the legacy "characters fall down"
+    // wipe used to fire on auth_fails >= max BEFORE our lockdown
+    // sequence got a chance to run, leaving the user watching two
+    // sequential animations. Lockdown owns the post-fail visuals for
+    // BOTH selectable types (legacy_sparse keeps Matrix.locked sparse
+    // gray; scramble_shrink runs the full scramble→clock cycle).
 
-    // Layer 4: lockdown overlay. Drawn between regular widgets and
+    // Layer 3: lockdown overlay. Drawn between regular widgets and
     // the settings panel — it should cover the rain + most widgets
     // during scramble/shrink/blank/grow_clock phases but be itself
     // covered by the settings panel when the user opens it for
