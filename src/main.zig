@@ -31,6 +31,7 @@ const DurFile = @import("animations/DurFile.zig");
 const GameOfLife = @import("animations/GameOfLife.zig");
 const Matrix = @import("animations/Matrix.zig");
 const Lockdown = @import("animations/Lockdown.zig");
+const InputState = @import("InputState.zig");
 const auth = @import("auth.zig");
 const DebugMenu = @import("components/DebugMenu.zig");
 const InfoLine = @import("components/InfoLine.zig");
@@ -150,6 +151,14 @@ const UiState = struct {
     // Saved password text — restored on end_unlock so the user is
     // not surprised by missing input. Cleared during lockdown.
     saved_should_insert: bool,
+    // Raw evdev keyboard-state tracker. Used as the both-shifts-held
+    // anti-misclick gate for shutdown/restart so an accidental
+    // single-shift press of F10/F11 can't fire the dangerous action.
+    // input_state_available: false when /dev/input/event* couldn't be
+    // opened — in that case the gate degrades to whatever the
+    // configured key alone demands (typically Ctrl+Shift+F10).
+    input_state: InputState,
+    input_state_available: bool,
     // Auth-only knobs (--auth-only / --state CLI flags). When
     // auth_only_mode is true and PAM succeeds, ly writes session info
     // to auth_only_state_path and exits 0 instead of forking the
@@ -800,6 +809,19 @@ pub fn main(init: std.process.Init) !void {
     state.lockdown = Lockdown.init(state.allocator, &state.buffer);
     state.saved_top_title = null;
     state.saved_should_insert = true;
+    // Raw evdev shift-state tracker — anti-misclick gate for
+    // shutdown/restart. start() returns NoInputDevices on systems
+    // where /dev/input/event* isn't readable; we mark the gate as
+    // unavailable and fall back to the configured-key gate alone
+    // (Ctrl+Shift+F10 / Ctrl+Shift+F11 by default).
+    state.input_state = InputState.init(state.allocator);
+    state.input_state_available = false;
+    state.input_state.start() catch |e| {
+        try state.log_file.info(state.io, "input", "evdev L+R gate unavailable: {s}", .{@errorName(e)});
+    };
+    if (state.input_state.fds.items.len > 0) state.input_state_available = true;
+    defer state.input_state.stop();
+    defer state.input_state.deinit();
 
     state.bigclock_label = BigLabel.init(
         &state.buffer,
@@ -2365,9 +2387,37 @@ fn authenticate(ptr: *anyopaque) !bool {
     return false;
 }
 
+// Anti-misclick gate. When the evdev shift-state tracker is up, we
+// REQUIRE both LShift and RShift to be held when the configured
+// shutdown/restart key fires; one-hand presses bounce off as a
+// visible info-line warning. When evdev isn't available, the
+// configured key alone (Ctrl+Shift+F10 by default) provides basic
+// anti-misclick.
+fn antiMisclickAllowed(state: *UiState) bool {
+    if (!state.input_state_available) return true;
+    return state.input_state.bothShiftsHeld();
+}
+
+fn warnSingleShift(state: *UiState, what: []const u8) void {
+    // Buffer composed inline so a temporary failure to format doesn't
+    // crash the event loop — info_line.addMessage takes a slice.
+    var buf: [128]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &buf,
+        "hold BOTH shifts to {s}",
+        .{what},
+    ) catch return;
+    state.info_line.addMessage(msg, state.config.error_bg, state.config.error_fg) catch {};
+    state.info_line.draw();
+    TerminalBuffer.presentBuffer();
+}
+
 fn shutdownCmd(ptr: *anyopaque) !bool {
     var state: *UiState = @ptrCast(@alignCast(ptr));
-
+    if (!antiMisclickAllowed(state)) {
+        warnSingleShift(state, "shut down");
+        return false;
+    }
     shutdown = true;
     state.buffer.stopEventLoop();
     return false;
@@ -2375,7 +2425,10 @@ fn shutdownCmd(ptr: *anyopaque) !bool {
 
 fn restartCmd(ptr: *anyopaque) !bool {
     var state: *UiState = @ptrCast(@alignCast(ptr));
-
+    if (!antiMisclickAllowed(state)) {
+        warnSingleShift(state, "reboot");
+        return false;
+    }
     restart = true;
     state.buffer.stopEventLoop();
     return false;
