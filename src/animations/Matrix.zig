@@ -609,12 +609,25 @@ fn walkColumn(self: *Matrix, x: usize, line: *Line) void {
             y += 1;
             seg_len += 1;
             if (y > buf_height) {
-                // Trail head walked off the bottom — fade body
-                // against virtual_head_y (which keeps advancing
-                // each frame past buf_height so the body smoothly
-                // dims to nothing).
+                // Trail head walked off the bottom. We fade the
+                // body cells against virtual_head_y, which must
+                // advance one cell per walk so the body fades
+                // smoothly to nothing over `line.length` walks.
+                //
+                // Distinguishing "fresh walk-off" from "continued
+                // drain" lets us reset vhy to buf_height+1 on the
+                // first off-screen walk for THIS trail without
+                // clobbering an ongoing drain from a different
+                // trail in the same column (multi-trail mode).
+                //
+                // Signal: a fully-grown trail has seg_len ==
+                // line.length at off-screen. After 1 drain, the
+                // top cell is truncated and seg_len == line.length
+                // - 1 next time. So seg_len >= line.length means
+                // this is the FRESH walk-off; otherwise it's the
+                // SAME trail still draining.
                 self.dots[buf_width * tail + x].value = ' ';
-                if (line.virtual_head_y <= buf_height) {
+                if (seg_len >= line.length) {
                     line.virtual_head_y = buf_height + 1;
                 } else {
                     line.virtual_head_y += 1;
@@ -651,7 +664,14 @@ fn walkColumn(self: *Matrix, x: usize, line: *Line) void {
                 line.dark_run -= 1;
             }
         }
-        line.virtual_head_y = y;
+        // NOTE: do NOT touch line.virtual_head_y here. vhy belongs
+        // exclusively to the off-screen drain logic (see the y >
+        // buf_height branch above). Setting it to an on-screen
+        // head's position breaks the bottom-row fade because the
+        // off-screen branch resets vhy to buf_height+1 every time
+        // it fires — cells just below the bottom never get to
+        // drift further away from the virtual head, so they stay
+        // at distance=1 (bright green) forever instead of fading.
 
         // Truncate the segment from the top when it exceeds
         // line.length. seg_len grows by 1 each advance until this
