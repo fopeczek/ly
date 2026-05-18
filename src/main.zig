@@ -1500,11 +1500,9 @@ pub fn main(init: std.process.Init) !void {
     try state.buffer.registerGlobalKeybind(state.io, "Shift+F12", &toggleDebugMenu, &state);
     try state.buffer.registerGlobalKeybind(state.io, "Tab", &debugTabNext, &state);
     try state.buffer.registerGlobalKeybind(state.io, "Shift+Tab", &debugTabPrev, &state);
-    try state.buffer.registerGlobalKeybind(state.io, "K", &debugItemPrev, &state);
-    try state.buffer.registerGlobalKeybind(state.io, "J", &debugItemNext, &state);
-    try state.buffer.registerGlobalKeybind(state.io, "H", &debugAdjustDown, &state);
-    try state.buffer.registerGlobalKeybind(state.io, "L", &debugAdjustUp, &state);
-    // Arrow keys too — most users reach for arrows first.
+    // Arrow keys for nav/adjust. Vim-style j/k/h/l bindings were
+    // removed (they collided with password input and the user
+    // preferred a single canonical set: arrows + Tab/Shift+Tab).
     // Up/Down replace TerminalBuffer's widget-cursor handlers; the
     // pass-through `return true` in non-debug mode lets the underlying
     // widget receive the key as before.
@@ -1691,13 +1689,19 @@ fn uiErrorHandler(err: anyerror, ctx: *anyopaque) anyerror!void {
 fn disableInsertMode(ptr: *anyopaque) !bool {
     var state: *UiState = @ptrCast(@alignCast(ptr));
 
-    // Esc inside the debug menu only exits edit-mode (back to
-    // navigation). It explicitly does NOT close the whole menu,
-    // because under kmscon's pty Shift+Tab arrives as ESC followed
-    // by '[Z' — a "second Esc closes" rule made Shift+Tab accidentally
-    // dismiss the menu. To close, use Shift+F12 again.
+    // Esc inside the debug menu: first exits edit-mode (back to
+    // nav). If already in nav, closes the whole menu. The earlier
+    // Shift+Tab-eats-Esc bug is gone now that TERM=rxvt-256color is
+    // forced (kcbt=\E[Z parsed natively as TB_KEY_BACK_TAB rather
+    // than ESC + '[Z'), so Esc is exclusively the user's choice.
     if (state.debug_menu.visible) {
         if (state.debug_menu.exitEdit()) {
+            state.buffer.drawNextFrame(true);
+        } else {
+            // In nav already → close the menu and clear the
+            // bottom-left mod hint (mirrors toggleDebugMenu).
+            state.debug_menu.toggle();
+            state.mod_hint_label.setTextBuf(&state.mod_hint_buf, "", .{}) catch {};
             state.buffer.drawNextFrame(true);
         }
         return false;
@@ -1768,15 +1772,6 @@ fn quit(ptr: *anyopaque) !bool {
 fn toggleDebugMenu(ptr: *anyopaque) !bool {
     var state: *UiState = @ptrCast(@alignCast(ptr));
     state.debug_menu.toggle();
-    // Show / hide the bottom-left modifier hint in lockstep with
-    // the menu's visibility. positionWidgets only runs at startup
-    // and on resize, so without an explicit setTextBuf here the
-    // label stays empty.
-    if (state.debug_menu.visible) {
-        state.mod_hint_label.setTextBuf(&state.mod_hint_buf, "Shift = x5  Ctrl = fine", .{}) catch {};
-    } else {
-        state.mod_hint_label.setTextBuf(&state.mod_hint_buf, "", .{}) catch {};
-    }
     state.buffer.drawNextFrame(true);
     return false;
 }
@@ -2704,20 +2699,12 @@ fn positionWidgets(ptr: *anyopaque) !void {
         .add(TerminalBuffer.START_POSITION)
         .invertY(state.buffer.height - 1));
 
-    // Bottom-left modifier hint, one row above the version line.
-    // Empty text when the debug menu is hidden so it's invisible
-    // during normal login. Only the "Shift = ×5  Ctrl = fine"
-    // explanation lives here; the in-panel help line covers nav
-    // keys (Tab / Enter / Sh+F12).
-    if (state.debug_menu.visible) {
-        state.mod_hint_label.setTextBuf(
-            &state.mod_hint_buf,
-            "Shift = x5  Ctrl = fine",
-            .{},
-        ) catch {};
-    } else {
-        state.mod_hint_label.setTextBuf(&state.mod_hint_buf, "", .{}) catch {};
-    }
+    // mod_hint_label is kept on UiState for ABI but is now ALWAYS
+    // empty — the Shift/Ctrl hint moved INTO the debug panel (see
+    // DebugMenu.drawWidget) at user request. Position is set
+    // anyway so layout doesn't shift if the label is later
+    // repurposed.
+    state.mod_hint_label.setTextBuf(&state.mod_hint_buf, "", .{}) catch {};
     state.mod_hint_label.positionXY(state.edge_margin
         .add(TerminalBuffer.START_POSITION)
         .invertY(state.buffer.height - 2));

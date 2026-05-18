@@ -551,7 +551,9 @@ fn drawWidget(self: *DebugMenu) void {
     var val_buf: [32]u8 = undefined;
     for (items, 0..) |item, idx| {
         const row_y = py + 4 + idx;
-        if (row_y >= py + panel_h - 2) break;
+        // -3 instead of -2: reserve TWO inner rows above the border —
+        // one for the Shift/Ctrl modifier hint, one for the nav hint.
+        if (row_y >= py + panel_h - 3) break;
         const selected = idx == self.item_idx;
         const row_bg: u32 = if (selected) COL_SELECTED_BG else COL_BG;
         // Fill the row background so selection highlight is visible.
@@ -571,19 +573,26 @@ fn drawWidget(self: *DebugMenu) void {
         putStr(px + 4 + item.label().len + 1, row_y, val, COL_VALUE, row_bg);
     }
 
-    // Help line at bottom
-    // In-panel help focuses on navigation only. Modifier-key
-    // explanation (Shift/Ctrl) lives in the bottom-left corner so
-    // the panel stays tidy and the slider modifiers are always
-    // legible regardless of mode.
+    // Two-line footer inside the panel:
+    //   * panel_h - 3 (top): Shift/Ctrl step-modifier hint. Always
+    //     shown — modifiers are useful in both nav (Shift+Tab) and
+    //     edit (Shift = x5, Ctrl = fine) modes, so dedicating a
+    //     stable row to them keeps the user's mental map intact.
+    //   * panel_h - 2 (bottom): nav/edit help line, mode-aware.
+    // The previous external bottom-left "Shift = x5 Ctrl = fine"
+    // label was moved here at user request — everything debug-menu-
+    // related now lives inside the panel.
+    const mod_hint = "Sh = x5     Ctrl = fine";
+    putStr(px + 2, py + panel_h - 3, mod_hint, COL_HELP, COL_BG);
+
     const help = if (self.mode == .edit)
-        "EDITING: \xe2\x86\x91/\xe2\x86\x93 adjust  Enter done"
+        "EDIT: \xe2\x86\x91/\xe2\x86\x93 adjust  Enter done  Esc cancel"
     else
-        "\xe2\x86\x91/\xe2\x86\x93 item  Tab tab  Enter info/edit  Sh+F12 close";
+        "\xe2\x86\x91/\xe2\x86\x93 item  Tab tab  Enter edit  Esc close";
     if (help.len < panel_w - 2) {
-        putStr(px + 1, py + panel_h - 2, help, COL_HELP, COL_BG);
+        putStr(px + 2, py + panel_h - 2, help, COL_HELP, COL_BG);
     } else {
-        putStr(px + 1, py + panel_h - 2, "j/k h/l Tab nav", COL_HELP, COL_BG);
+        putStr(px + 2, py + panel_h - 2, "arrows / Tab / Enter / Esc", COL_HELP, COL_BG);
     }
 
     // Description side panel — sits to the right of the main

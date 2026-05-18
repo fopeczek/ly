@@ -521,52 +521,68 @@ fn stepColumns(self: *Matrix) void {
         const h_gap_eff: usize = @as(usize, self.drop_h_margin);
         const spawn_gate_open: bool = spawnGateOpen(self, x, v_gap_eff, h_gap_eff);
 
-        if (self.dots[x].value == null and self.dots[buf_width + x].value == ' ') {
-            // rain_density == 0 disables spawning entirely — the user
-            // explicitly asked for "0 = nothing spawns" semantics
-            // separate from "1 = very sparse". Existing trails finish
-            // out naturally and the screen drains.
-            if (self.rain_density == 0) {
-                // No new spawn. Don't decrement line.space either —
-                // when the user later raises rain_density above 0,
-                // the re-roll in draw() will assign a fresh wait.
-            } else if (spawn_gate_open) {
-                // Per-advance Poisson spawn: probability =
-                // rain_density / 1000. Each column rolls an
-                // independent random number every advance, so
-                // spawns are statistically independent (no
-                // synchronized wave) AND the slider is perceptually
-                // linear — a 100-unit slider move changes the
-                // spawn rate by the same fraction-of-max no matter
-                // where on the scale it lands. Replaces the prior
-                // line.space=1001-rd countdown which exaggerated
-                // the high end (1000→900 was a 100x change).
-                const prob_base: f32 = @as(f32, @floatFromInt(self.rain_density)) / 1000.0;
-                const spawn_prob: f32 = if (self.locked)
-                    prob_base / @as(f32, @floatFromInt(LOCKED_SPACE_MULT))
-                else
-                    prob_base;
-                if (self.terminal_buffer.random.float(f32) < spawn_prob) {
-                    const randint = self.terminal_buffer.random.int(u16);
-                    const h = buf_height;
-                    // line.length / line.speed are SHARED across all
-                    // trails alive in a column (single Line struct).
-                    // Only roll new values when the column was
-                    // empty before this spawn; subsequent spawns
-                    // inherit the existing length/speed so existing
-                    // trails' colors don't shift mid-fall.
-                    if (!column_has_content) {
-                        const max_eff_raw: usize = @min(@as(usize, self.max_drop_len), if (h > 1) h - 1 else 1);
-                        const max_eff: usize = if (max_eff_raw < self.min_drop_len) self.min_drop_len else max_eff_raw;
-                        const len_span: usize = max_eff - self.min_drop_len + 1;
-                        line.length = (@as(usize, randint) % len_span) + self.min_drop_len;
-                    }
-                    const pool: []const u32 = if (self.locked) &LOCKED_GLYPH_POOL else &GLYPH_POOL;
-                    self.dots[x].value = pool[@mod(randint, pool.len)];
-                    if (!column_has_content) {
-                        line.speed = self.speed_min +
-                            self.terminal_buffer.random.float(f32) * (self.speed_max - self.speed_min);
-                    }
+        // Two spawn paths share the probability formula and the
+        // length/speed roll. The DIFFERENCE is where the new head
+        // lands and what the gates look like:
+        //   * v_margin > 0  → legacy row-0 buffer path. Spawn writes
+        //     to dots[x] (row 0, off-screen). Walking pumps it down
+        //     to row 1 next advance. Gated by dots[x]==null AND
+        //     dots[row1]==' ' AND spawnGateOpen (which checks rows
+        //     1..v_margin).
+        //   * v_margin == 0 → true-flood path. dots[x] never used;
+        //     spawn writes the new head directly into row 1, may
+        //     overwrite whatever's there. No row-buffer gate, only
+        //     the probability roll. Lets the column be visually
+        //     saturated with back-to-back heads — the benchmark mode
+        //     the user explicitly asked for.
+        const flood_mode = self.drop_v_margin == 0;
+        const can_attempt_spawn: bool = self.rain_density != 0 and spawn_gate_open and
+            (flood_mode or (self.dots[x].value == null and self.dots[buf_width + x].value == ' '));
+
+        if (can_attempt_spawn) {
+            // Per-advance Poisson spawn: probability =
+            // rain_density / 1000. Each column rolls an
+            // independent random number every advance, so spawns
+            // are statistically independent (no synchronized
+            // wave) AND the slider is perceptually linear — a
+            // 100-unit slider move changes the spawn rate by the
+            // same fraction-of-max no matter where on the scale
+            // it lands.
+            const prob_base: f32 = @as(f32, @floatFromInt(self.rain_density)) / 1000.0;
+            const spawn_prob: f32 = if (self.locked)
+                prob_base / @as(f32, @floatFromInt(LOCKED_SPACE_MULT))
+            else
+                prob_base;
+            if (self.terminal_buffer.random.float(f32) < spawn_prob) {
+                const randint = self.terminal_buffer.random.int(u16);
+                const h = buf_height;
+                // line.length / line.speed are SHARED across all
+                // trails alive in a column (single Line struct).
+                // Only roll new values when the column was empty
+                // before this spawn; subsequent spawns inherit the
+                // existing length/speed so existing trails' colors
+                // don't shift mid-fall.
+                if (!column_has_content) {
+                    const max_eff_raw: usize = @min(@as(usize, self.max_drop_len), if (h > 1) h - 1 else 1);
+                    const max_eff: usize = if (max_eff_raw < self.min_drop_len) self.min_drop_len else max_eff_raw;
+                    const len_span: usize = max_eff - self.min_drop_len + 1;
+                    line.length = (@as(usize, randint) % len_span) + self.min_drop_len;
+                }
+                const pool: []const u32 = if (self.locked) &LOCKED_GLYPH_POOL else &GLYPH_POOL;
+                const new_glyph: u32 = pool[@mod(randint, pool.len)];
+                if (flood_mode) {
+                    // Place head at row 1, mark is_head so the
+                    // render layer paints it bright. Walking will
+                    // turn it into a body cell next advance.
+                    const idx = buf_width + x;
+                    self.dots[idx].value = new_glyph;
+                    self.dots[idx].is_head = true;
+                } else {
+                    self.dots[x].value = new_glyph;
+                }
+                if (!column_has_content) {
+                    line.speed = self.speed_min +
+                        self.terminal_buffer.random.float(f32) * (self.speed_max - self.speed_min);
                 }
             }
         }
@@ -1070,11 +1086,23 @@ fn draw(self: *Matrix) void {
                 //     the bottom; trail keeps falling as virtual_head_y
                 //     advances each tick).
                 //   - If neither, trail is fully off — render as default_cell.
-                const head_y_for_fade: usize = blk: {
-                    if (head_idx < heads.len) break :blk heads[head_idx];
+                // Sub-step interpolation: walking moves heads ONLY when
+                // advance_accum crosses 1.0 (every 1/line.speed render
+                // frames). Without sub-step the fade colour for any
+                // given cell stays constant for ~10 frames then
+                // jumps a full step on the next walk — perceived as
+                // stepwise fading, especially obvious as a trail
+                // walks past the bottom edge ("last row doesn't
+                // respect gradient"). Adding the column's current
+                // accumulator to the integer head y produces a
+                // continuous fractional distance, so the fade
+                // smoothly transitions across every render frame.
+                const sub_step: f32 = self.lines[x].advance_accum;
+                const head_y_f: f32 = blk: {
+                    if (head_idx < heads.len) break :blk @as(f32, @floatFromInt(heads[head_idx])) + sub_step;
                     const vhy = self.lines[x].virtual_head_y;
                     if (vhy == 0 or vhy <= y) break :cell_blk self.default_cell;
-                    break :blk vhy;
+                    break :blk @as(f32, @floatFromInt(vhy)) + sub_step;
                 };
 
                 const fg_color: u32 = inner: {
@@ -1095,12 +1123,12 @@ fn draw(self: *Matrix) void {
                     // a normal session.
                     const trail_fg: u32 = if (self.locked) LOCKED_FG else self.fg;
                     if (!self.tail_fade) break :inner trail_fg;
-                    const distance = head_y_for_fade - y;
+                    const distance_f: f32 = head_y_f - @as(f32, @floatFromInt(y));
                     const tail_len = self.lines[x].length;
                     const denom: f32 = if (tail_len == 0) 1 else @floatFromInt(tail_len);
-                    const t_linear = @as(f32, @floatFromInt(distance)) / denom;
+                    const t_linear = distance_f / denom;
                     if (t_linear >= 1.0) break :cell_blk self.default_cell;
-                    const t = perceptualT(t_linear);
+                    const t = perceptualT(if (t_linear < 0) 0 else t_linear);
                     const faded = lerpColor(trail_fg, self.terminal_buffer.bg, t);
                     // Pango/kmscon renders a non-space glyph with a default
                     // (often white) foreground when the requested fg matches
