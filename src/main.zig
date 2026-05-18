@@ -1974,8 +1974,33 @@ fn customCommand(ptr: *anyopaque) !bool {
     return false;
 }
 
+// True when the user has already used their configured auth_fails
+// budget (or pam_faillock has them locked, since we mirror its limit).
+// Used to gate password submission and key input while the system
+// itself is refusing new attempts — without this gate the user can
+// still type and press Enter, every press wastes the visual flow and
+// hits pam_faillock for nothing.
+fn isLocked(state: *const UiState) bool {
+    return state.config.auth_fails > 0 and state.auth_fails >= state.config.auth_fails;
+}
+
 fn authenticate(ptr: *anyopaque) !bool {
     var state: *UiState = @ptrCast(@alignCast(ptr));
+
+    // Hard gate: if the lockout threshold has been reached, refuse
+    // to even fork the PAM check. pam_faillock would reject anyway,
+    // but this avoids the visible 1-2 s freeze for every keystroke
+    // press during the 10 min lockout window.
+    if (isLocked(state)) {
+        try state.info_line.addMessage(
+            state.lang.err_pam_maxtries,
+            state.config.error_bg,
+            state.config.error_fg,
+        );
+        state.info_line.draw();
+        TerminalBuffer.presentBuffer();
+        return false;
+    }
 
     // Mark auth busy so FprintdWatcher.update tears down its bg subprocess
     // (otherwise it'd race the in-PAM pam_fprintd module for the sensor).
@@ -2186,6 +2211,13 @@ fn authenticate(ptr: *anyopaque) !bool {
             m.pushErrorBurst();
             if (state.config.auth_fails > 0 and state.auth_fails >= state.config.auth_fails) {
                 m.setLocked(true);
+                // Disable password text input. The Text widget's
+                // should_insert gate blocks character insert and
+                // delete/backspace edits, so the password buffer is
+                // frozen until lockout clears. Symbol left for the
+                // future "scramble lockout" animation to also wipe
+                // the visible password buffer if desired.
+                state.password.should_insert = false;
             }
         }
         // Update "N attempts left" badge. Hidden (empty text) when
