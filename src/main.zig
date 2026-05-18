@@ -650,44 +650,44 @@ pub fn main(init: std.process.Init) !void {
     if (!state.config.hide_key_hints) {
         try state.shutdown_label.setTextAlloc(
             state.allocator,
-            "{s} {s}",
+            "{s} {s} ",
             .{ state.config.shutdown_key, state.lang.shutdown },
         );
         try state.restart_label.setTextAlloc(
             state.allocator,
-            "{s} {s}",
+            "{s} {s} ",
             .{ state.config.restart_key, state.lang.restart },
         );
         try state.toggle_password_label.setTextAlloc(
             state.allocator,
-            "{s} {s}",
+            "{s} {s} ",
             .{ state.config.show_password_key, state.lang.toggle_password },
         );
         if (state.config.sleep_cmd != null) {
             try state.sleep_label.setTextAlloc(
                 state.allocator,
-                "{s} {s}",
+                "{s} {s} ",
                 .{ state.config.sleep_key, state.lang.sleep },
             );
         }
         if (state.config.hibernate_cmd != null) {
             try state.hibernate_label.setTextAlloc(
                 state.allocator,
-                "{s} {s}",
+                "{s} {s} ",
                 .{ state.config.hibernate_key, state.lang.hibernate },
             );
         }
         if (state.config.brightness_down_key) |key| {
             try state.brightness_down_label.setTextAlloc(
                 state.allocator,
-                "{s} {s}",
+                "{s} {s} ",
                 .{ key, state.lang.brightness_down },
             );
         }
         if (state.config.brightness_up_key) |key| {
             try state.brightness_up_label.setTextAlloc(
                 state.allocator,
-                "{s} {s}",
+                "{s} {s} ",
                 .{ key, state.lang.brightness_up },
             );
         }
@@ -2595,33 +2595,33 @@ fn positionWidgets(ptr: *anyopaque) !void {
         var last_label = state.shutdown_label;
         state.restart_label.positionX(last_label
             .childrenPosition()
-            .addX(1));
+            .addX(0));
         last_label = state.restart_label;
         state.sleep_label.positionX(last_label
             .childrenPosition()
-            .addX(1));
+            .addX(0));
         if (state.config.sleep_cmd != null) {
             last_label = state.sleep_label;
         }
         state.hibernate_label.positionX(last_label
             .childrenPosition()
-            .addX(1));
+            .addX(0));
         if (state.config.hibernate_cmd != null) {
             last_label = state.hibernate_label;
         }
         state.toggle_password_label.positionX(last_label
             .childrenPosition()
-            .addX(1));
+            .addX(0));
         last_label = state.toggle_password_label;
         state.brightness_down_label.positionX(last_label
             .childrenPosition()
-            .addX(1));
+            .addX(0));
         if (state.config.brightness_down_key != null) {
             last_label = state.brightness_down_label;
         }
         state.brightness_up_label.positionXY(last_label
             .childrenPosition()
-            .addX(1));
+            .addX(0));
         if (state.config.brightness_up_key != null) {
             last_label = state.brightness_up_label;
         }

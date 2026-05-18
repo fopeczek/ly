@@ -156,27 +156,38 @@ fn draw(self: *Box) void {
         }
     }
 
+    // Titles render centered in the top/bottom border with a single
+    // space of padding on each side, so they read as `── title ──`
+    // rather than the legacy left-flush `┌title────` which collided
+    // visually with the corner glyph. Fallback to left-flush when
+    // the border is too narrow to center cleanly (title + 4 padding
+    // chars must fit inside `width`).
     if (self.top_title) |title| {
-        TerminalBuffer.drawConfinedText(
-            title,
-            self.left_pos.x,
-            self.left_pos.y - 1,
-            self.width,
-            self.title_fg,
-            self.bg,
-        );
+        drawCenteredTitle(self, title, self.left_pos.y - 1);
     }
-
     if (self.bottom_title) |title| {
-        TerminalBuffer.drawConfinedText(
-            title,
-            self.left_pos.x,
-            self.left_pos.y + self.height,
-            self.width,
-            self.title_fg,
-            self.bg,
-        );
+        drawCenteredTitle(self, title, self.left_pos.y + self.height);
     }
+}
+
+fn drawCenteredTitle(self: *Box, title: []const u8, y: usize) void {
+    const title_w = TerminalBuffer.strWidth(title);
+    const has_room = self.width >= title_w + 4;
+    const x_off: usize = if (has_room) (self.width - title_w) / 2 else 0;
+    if (has_room) {
+        // 1-cell space pad on each side — overwrites the dashes that
+        // would otherwise touch the title's first/last char.
+        TerminalBuffer.drawCharMultiple(' ', self.left_pos.x + x_off - 1, y, 1, self.title_fg, self.bg);
+        TerminalBuffer.drawCharMultiple(' ', self.left_pos.x + x_off + title_w, y, 1, self.title_fg, self.bg);
+    }
+    TerminalBuffer.drawConfinedText(
+        title,
+        self.left_pos.x + x_off,
+        y,
+        self.width,
+        self.title_fg,
+        self.bg,
+    );
 }
 
 fn update(self: *Box, ctx: *anyopaque) !void {
