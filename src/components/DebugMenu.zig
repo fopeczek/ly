@@ -14,6 +14,7 @@ const Cell = ly_ui.Cell;
 const Widget = ly_ui.Widget;
 const TerminalBuffer = ly_ui.TerminalBuffer;
 const Matrix = @import("../animations/Matrix.zig");
+const Lockdown = @import("../animations/Lockdown.zig");
 
 const DebugMenu = @This();
 
@@ -62,6 +63,9 @@ pub const Item = enum {
     action_reset_fails,
     readout_locked,
     readout_auth_fails,
+    // Animations tab
+    lockout_animation,
+    action_preview_lockout,
 
     pub fn label(self: Item) []const u8 {
         // Labels are padded to 16 chars so the value column lines
@@ -98,12 +102,15 @@ pub const Item = enum {
             .action_reset_fails => "[ reset attempts]",
             .readout_locked => "locked          ",
             .readout_auth_fails => "fail count      ",
+            // Animations
+            .lockout_animation => "lockout anim    ",
+            .action_preview_lockout => "[ preview lock  ]",
         };
     }
 
     pub fn isAction(self: Item) bool {
         return switch (self) {
-            .action_error_burst, .action_clear_errors, .action_toggle_locked, .action_reset_fails => true,
+            .action_error_burst, .action_clear_errors, .action_toggle_locked, .action_reset_fails, .action_preview_lockout => true,
             else => false,
         };
     }
@@ -141,6 +148,8 @@ pub const Item = enum {
             .action_reset_fails => "Reset the failed-login\ncounter to zero and\nclear lockout.",
             .readout_locked => "Whether the screen is\nin lockout mode\n(YES / no).",
             .readout_auth_fails => "Current count of\nconsecutive failed\nlogins.",
+            .lockout_animation => "Animation played when\nthe lockout fires.\nUse \xe2\x86\x90/\xe2\x86\x92 to cycle types.\nlegacy: sparse gray\nrain forever.\nscramble: full sequence\nwith clock countdown.",
+            .action_preview_lockout => "Play the selected\nlockout animation now,\nwith a 5 second clock.\nReal auth state stays\nunchanged.",
         };
     }
 
@@ -157,6 +166,7 @@ pub const Tab = enum {
     glitches,
     errors,
     lockout,
+    animations,
 
     pub fn name(self: Tab) []const u8 {
         return switch (self) {
@@ -164,6 +174,7 @@ pub const Tab = enum {
             .glitches => "Glitches",
             .errors => "Errors",
             .lockout => "Lockout",
+            .animations => "Anim",
         };
     }
 
@@ -190,11 +201,14 @@ pub const Tab = enum {
                 .action_toggle_locked, .action_reset_fails,
                 .readout_locked, .readout_auth_fails,
             },
+            .animations => &[_]Item{
+                .lockout_animation, .action_preview_lockout,
+            },
         };
     }
 };
 
-const TABS = [_]Tab{ .rain, .glitches, .errors, .lockout };
+const TABS = [_]Tab{ .rain, .glitches, .errors, .lockout, .animations };
 
 // Two-mode navigation. In .nav, arrow keys cycle items / tabs and
 // Enter "opens" the selected item for editing. In .edit, up/down
@@ -212,6 +226,7 @@ mode: Mode = .nav,
 matrix_ptr: ?*Matrix = null,
 auth_fails_ptr: ?*u64 = null,
 buffer_ptr: ?*TerminalBuffer = null,
+lockdown_ptr: ?*Lockdown = null,
 instance: ?Widget = null,
 
 pub fn init() DebugMenu {
@@ -223,10 +238,12 @@ pub fn attach(
     matrix_ptr: *Matrix,
     auth_fails_ptr: *u64,
     buffer_ptr: *TerminalBuffer,
+    lockdown_ptr: *Lockdown,
 ) void {
     self.matrix_ptr = matrix_ptr;
     self.auth_fails_ptr = auth_fails_ptr;
     self.buffer_ptr = buffer_ptr;
+    self.lockdown_ptr = lockdown_ptr;
 }
 
 pub fn widget(self: *DebugMenu) *Widget {
@@ -272,6 +289,7 @@ pub fn activate(self: *DebugMenu, _: *Matrix) ActionResult {
             .action_clear_errors => r.clear_errors = true,
             .action_toggle_locked => r.toggle_locked = true,
             .action_reset_fails => r.reset_fails = true,
+            .action_preview_lockout => r.preview_lockout = true,
             else => {},
         }
         return r;
@@ -329,6 +347,7 @@ pub const ActionResult = struct {
     toggle_locked: bool = false,
     reset_fails: bool = false,
     clear_errors: bool = false,
+    preview_lockout: bool = false,
 };
 
 pub fn adjust(self: *DebugMenu, m: *Matrix, delta: i8) ActionResult {
@@ -380,6 +399,15 @@ pub fn adjustScaled(self: *DebugMenu, m: *Matrix, delta: i8, step_scale: f32) Ac
             r.reset_fails = true;
         },
         .readout_locked, .readout_auth_fails => {},
+        .lockout_animation => {
+            // Cycle through animation types regardless of delta sign.
+            // Two types currently (legacy_sparse, scramble_shrink) so
+            // forward and back land on the same place anyway.
+            if (self.lockdown_ptr) |ld| ld.selected_anim = ld.selected_anim.cycle();
+        },
+        .action_preview_lockout => if (delta > 0) {
+            r.preview_lockout = true;
+        },
     }
     return r;
 }
@@ -440,7 +468,13 @@ fn adjustDecayFrames(cur: u16, delta: i8) u16 {
 // Format an item's current value into the given buffer. Returns the
 // portion of buf actually written. The caller embeds this in a
 // rendered line like "  speed_min      0.06".
-pub fn formatValue(item: Item, m: *const Matrix, auth_fails: u64, buf: []u8) ![]const u8 {
+pub fn formatValue(
+    item: Item,
+    m: *const Matrix,
+    auth_fails: u64,
+    lockdown_anim_name: []const u8,
+    buf: []u8,
+) ![]const u8 {
     return switch (item) {
         .speed_min => try std.fmt.bufPrint(buf, "{d:.2}", .{m.speed_min}),
         .speed_max => try std.fmt.bufPrint(buf, "{d:.2}", .{m.speed_max}),
@@ -462,9 +496,10 @@ pub fn formatValue(item: Item, m: *const Matrix, auth_fails: u64, buf: []u8) ![]
         .overlay_drop_peak_prob => try std.fmt.bufPrint(buf, "{d:.3}", .{m.overlay_drop_peak_prob}),
         .overlay_scramble_prob => try std.fmt.bufPrint(buf, "{d:.3}", .{m.overlay_scramble_prob}),
         .overlay_fall_step => try std.fmt.bufPrint(buf, "{d}", .{m.overlay_fall_step}),
-        .action_error_burst, .action_clear_errors, .action_toggle_locked, .action_reset_fails => try std.fmt.bufPrint(buf, "<press Enter>", .{}),
+        .action_error_burst, .action_clear_errors, .action_toggle_locked, .action_reset_fails, .action_preview_lockout => try std.fmt.bufPrint(buf, "<press Enter>", .{}),
         .readout_locked => try std.fmt.bufPrint(buf, "{s}", .{if (m.locked) "YES" else "no"}),
         .readout_auth_fails => try std.fmt.bufPrint(buf, "{d}", .{auth_fails}),
+        .lockout_animation => try std.fmt.bufPrint(buf, "{s}", .{lockdown_anim_name}),
     };
 }
 
@@ -525,7 +560,7 @@ fn drawWidget(self: *DebugMenu) void {
     }
 
     // Title strip
-    putStr(px + 2, py, " DEBUG MENU ", COL_TAB_ACTIVE, COL_BG);
+    putStr(px + 2, py, " SETTINGS ", COL_TAB_ACTIVE, COL_BG);
 
     // Tabs row at y = py + 2
     var tx: usize = px + 2;
@@ -569,7 +604,8 @@ fn drawWidget(self: *DebugMenu) void {
         const label_fg: u32 = if (item.isAction()) COL_ACTION else COL_LABEL;
         putStr(px + 4, row_y, item.label(), label_fg, row_bg);
         // Value
-        const val = formatValue(item, m, auth_fails, &val_buf) catch "<err>";
+        const anim_label: []const u8 = if (self.lockdown_ptr) |ld| ld.selected_anim.label() else "scramble→clock ";
+        const val = formatValue(item, m, auth_fails, anim_label, &val_buf) catch "<err>";
         putStr(px + 4 + item.label().len + 1, row_y, val, COL_VALUE, row_bg);
     }
 

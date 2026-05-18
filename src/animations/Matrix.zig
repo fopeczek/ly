@@ -217,6 +217,13 @@ glitch_count: usize,
 // stays on until the ly process restarts, since the user can't
 // authenticate to make sway log out.
 locked: bool,
+// Suppression flag set by Lockdown during scramble/shrink/blank/
+// grow_clock/tick phases so the rain animation stops drawing
+// (Lockdown takes over the screen). Flipped back to false on
+// end_unlock. Separate from locked so legacy_sparse can still
+// drive the sparse-rain look via locked=true while Lockdown stays
+// off.
+suppressed: bool,
 // Runtime-tunable parameters exposed to the debug menu. Default to
 // the DEFAULT_* constants at construction; the debug-menu input
 // handlers may mutate them at any time and the next draw frame sees
@@ -316,6 +323,7 @@ pub fn init(
         .glitches = undefined,
         .glitch_count = 0,
         .locked = false,
+        .suppressed = false,
         .speed_min = DEFAULT_SPEED_MIN,
         .speed_max = DEFAULT_SPEED_MAX,
         .tail_churn_prob = DEFAULT_TAIL_CHURN_PROB,
@@ -1038,6 +1046,10 @@ fn glitchAt(self: *const Matrix, x: usize, y: usize) bool {
 
 fn draw(self: *Matrix) void {
     if (!self.animate.*) return;
+    // Lockdown overlay owns the screen during scramble→tick. Skip
+    // the entire rain step so its scramble snapshot stays stable
+    // and its blank/clock paints aren't dirtied by fresh heads.
+    if (self.suppressed) return;
 
     const buf_height = self.terminal_buffer.height;
     const buf_width = self.terminal_buffer.width;

@@ -29,6 +29,7 @@ const Doom = @import("animations/Doom.zig");
 const DurFile = @import("animations/DurFile.zig");
 const GameOfLife = @import("animations/GameOfLife.zig");
 const Matrix = @import("animations/Matrix.zig");
+const Lockdown = @import("animations/Lockdown.zig");
 const auth = @import("auth.zig");
 const DebugMenu = @import("components/DebugMenu.zig");
 const InfoLine = @import("components/InfoLine.zig");
@@ -76,6 +77,16 @@ fn ttyControlTransferSignalHandler(_: std.posix.SIG) callconv(.c) void {
 // event loop, where it can call into termbox/std safely.
 fn snapshotRequestHandler(_: std.posix.SIG) callconv(.c) void {
     TerminalBuffer.requestSnapshot();
+}
+
+// SIGUSR2: trigger the lockdown preview animation. Async-signal-safe
+// — only flips Lockdown.preview_request. Lockdown.updateWidget polls
+// the flag once per frame and fires state.lockdown.start() with
+// preview=true. Used by /tmp/ly-headless.sh so the scramble→clock
+// sequence can be exercised from `kill -USR2 <pid>` without typing
+// 3 wrong passwords through a pty with no keyboard.
+fn lockdownPreviewHandler(_: std.posix.SIG) callconv(.c) void {
+    Lockdown.preview_request.store(true, .seq_cst);
 }
 
 const CustomBindLabel = struct {
@@ -126,6 +137,18 @@ const UiState = struct {
     matrix_ref: ?*Matrix,
     // Live-tunable debug overlay (toggled with Ctrl+Shift+Alt+Esc).
     debug_menu: DebugMenu,
+    // Lockdown animation engine — drives scramble→shrink→clock when
+    // auth_fails reaches config.auth_fails. Always present (also for
+    // legacy_sparse animation type which mostly delegates to Matrix
+    // setLocked).
+    lockdown: Lockdown,
+    // Saved Box.top_title — restored when end_unlock fires. null
+    // before lockdown ever ran; set on first lockdown start so we
+    // can put it back exactly.
+    saved_top_title: ?[]const u8,
+    // Saved password text — restored on end_unlock so the user is
+    // not surprised by missing input. Cleared during lockdown.
+    saved_should_insert: bool,
     // Auth-only knobs (--auth-only / --state CLI flags). When
     // auth_only_mode is true and PAM succeeds, ly writes session info
     // to auth_only_state_path and exits 0 instead of forking the
@@ -530,6 +553,16 @@ pub fn main(init: std.process.Init) !void {
     };
     std.posix.sigaction(std.posix.SIG.USR1, &snapshot_act, null);
 
+    // SIGUSR2 → fire a lockdown preview (animation only, no auth
+    // side-effects). Used by /tmp/ly-headless.sh to exercise the
+    // scramble→clock sequence without typing passwords.
+    const lockdown_act = std.posix.Sigaction{
+        .handler = .{ .handler = &lockdownPreviewHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.USR2, &lockdown_act, null);
+
     // Ignore SIGINT — keystroke Ctrl+C would otherwise drop the user out of
     // the greeter onto a bare console with no way back in. ly@tty1 has
     // TTYVHangup=yes so a fresh start would need a service restart.
@@ -763,6 +796,9 @@ pub fn main(init: std.process.Init) !void {
     defer state.attempts_label.deinit();
     state.matrix_ref = null;
     state.debug_menu = DebugMenu.init();
+    state.lockdown = Lockdown.init(state.allocator, &state.buffer);
+    state.saved_top_title = null;
+    state.saved_should_insert = true;
 
     state.bigclock_label = BigLabel.init(
         &state.buffer,
@@ -1248,7 +1284,16 @@ pub fn main(init: std.process.Init) !void {
             // Load persisted tunables (if any). Best-effort — missing
             // /var/lib/ly/matrix-prefs just means defaults apply.
             matrix_storage.?.loadPrefs(state.io);
-            state.debug_menu.attach(&matrix_storage.?, &state.auth_fails, &state.buffer);
+            state.lockdown.loadPrefs(state.io);
+            state.debug_menu.attach(&matrix_storage.?, &state.auth_fails, &state.buffer, &state.lockdown);
+            state.lockdown.attachHooks(
+                &state.password.should_insert,
+                &state.box.top_title,
+                &state.auth_fails,
+                &matrix_storage.?.locked,
+                &matrix_storage.?.suppressed,
+                &state.password_label,
+            );
             animation = matrix_storage.?.widget();
         },
         .colormix => {
@@ -1474,10 +1519,18 @@ pub fn main(init: std.process.Init) !void {
         try widgets.append(state.allocator, &layer3);
     }
 
-    // Layer 4: debug menu overlay. Drawn last so it sits on top of
-    // everything else. Its draw is a no-op when state.debug_menu is
-    // hidden, so this widget is harmless when the user isn't toggled
-    // into debug mode.
+    // Layer 4: lockdown overlay. Drawn between regular widgets and
+    // the settings panel — it should cover the rain + most widgets
+    // during scramble/shrink/blank/grow_clock phases but be itself
+    // covered by the settings panel when the user opens it for
+    // tuning. drawWidget is no-op when state.lockdown is inactive.
+    var lockdown_layer = [_]*Widget{state.lockdown.widget()};
+    try widgets.append(state.allocator, &lockdown_layer);
+
+    // Layer 5: debug/settings menu overlay. Drawn last so it sits on
+    // top of everything else, including the lockdown screen. Its
+    // draw is a no-op when state.debug_menu is hidden, so this
+    // widget is harmless when the user isn't toggled into settings.
     var debug_layer = [_]*Widget{state.debug_menu.widget()};
     try widgets.append(state.allocator, &debug_layer);
 
@@ -1956,9 +2009,26 @@ fn applyActionResult(state: *UiState, m: *Matrix, r: DebugMenu.ActionResult) voi
         m.setLocked(false);
         state.attempts_label.setTextBuf(&state.attempts_buf, "", .{}) catch {};
     }
+    if (r.preview_lockout) {
+        // Run a preview of the selected lockout animation. Skips
+        // real side-effects (password.should_insert + box.top_title
+        // are NOT touched). Auto-exits after PREVIEW_TICK_SEC.
+        const now_t = interop.getTimeOfDay() catch interop.TimeOfDay{ .seconds = 0, .microseconds = 0 };
+        const now_f = Lockdown.todToF64(now_t);
+        state.lockdown.start(
+            state.lockdown.selected_anim,
+            now_f + Lockdown.DEFAULT_UNLOCK_SEC,
+            true,
+            now_f,
+            state.login.getCurrentUsername(),
+        ) catch |e| {
+            state.log_file.err(state.io, "lockdown", "preview start failed: {s}", .{@errorName(e)}) catch {};
+        };
+    }
     // Persist tunables after every adjust / action — debug menu
     // changes survive ly restarts. Best-effort write.
     m.savePrefs(state.io);
+    state.lockdown.savePrefs(state.io);
 }
 
 fn customCommand(ptr: *anyopaque) !bool {
@@ -2210,14 +2280,35 @@ fn authenticate(ptr: *anyopaque) !bool {
         if (state.matrix_ref) |m| {
             m.pushErrorBurst();
             if (state.config.auth_fails > 0 and state.auth_fails >= state.config.auth_fails) {
-                m.setLocked(true);
-                // Disable password text input. The Text widget's
-                // should_insert gate blocks character insert and
-                // delete/backspace edits, so the password buffer is
-                // frozen until lockout clears. Symbol left for the
-                // future "scramble lockout" animation to also wipe
-                // the visible password buffer if desired.
-                state.password.should_insert = false;
+                // Two lockout styles selectable via the settings
+                // menu (Animations tab): legacy_sparse keeps the
+                // current behaviour (Matrix.locked = sparse gray
+                // rain), scramble_shrink runs the full animation
+                // sequence with countdown clock.
+                switch (state.lockdown.selected_anim) {
+                    .legacy_sparse => {
+                        m.setLocked(true);
+                        // should_insert handled by isLocked() in
+                        // authenticate() — see hard gate at top.
+                        state.password.should_insert = false;
+                    },
+                    .scramble_shrink => {
+                        const now_t = interop.getTimeOfDay() catch interop.TimeOfDay{ .seconds = 0, .microseconds = 0 };
+                        const now_f = Lockdown.todToF64(now_t);
+                        state.lockdown.start(
+                            state.lockdown.selected_anim,
+                            now_f + Lockdown.DEFAULT_UNLOCK_SEC,
+                            false,
+                            now_f,
+                            state.login.getCurrentUsername(),
+                        ) catch |e| {
+                            try state.log_file.err(state.io, "lockdown", "start failed: {s}", .{@errorName(e)});
+                            // Fall back to legacy on alloc failure.
+                            m.setLocked(true);
+                            state.password.should_insert = false;
+                        };
+                    },
+                }
             }
         }
         // Update "N attempts left" badge. Hidden (empty text) when

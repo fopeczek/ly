@@ -1,0 +1,987 @@
+// Scramble→shrink→clock lockout animation. Triggered when the user
+// hits config.auth_fails. Renders a multi-phase sequence on the top
+// widget layer so it overdraws the rain animation and the regular
+// login widgets beneath it:
+//
+//   scramble    Existing rain cells cycle to random katakana glyphs
+//               in place — no falling, no spawning.
+//   shrink_fade Per-cell shrink table progressively replaces each
+//               glyph with a smaller small-Unicode glyph (◌ → ◦ →
+//               · → ⋅ → blank) and lerps fg from original →
+//               mid-gray → dark-gray → background. Each cell has a
+//               per-cell offset so they don't all blank together.
+//   blank       Empty dark screen.
+//   grow_clock  MM:SS clock characters un-shrink at screen center —
+//               start as ⋅, transition through · → ◦ → dim digit →
+//               bright digit using the shrink palette in reverse.
+//   tick        Clock counts down second-by-second. After
+//               GROW_UI_DELAY_SEC the other widgets (info_line,
+//               attempts, version, mod_hint) become visible too,
+//               but password widget + box top_title stay hidden.
+//   end_unlock  Unlock moment — caller restores password input,
+//               restores top_title, resets state.auth_fails. Phase
+//               returns to .idle.
+//
+// External-reset sync: every 2s during tick we stat /run/faillock/
+// <user>. If the file no longer exists the user ran `faillock
+// --reset` from elsewhere and we end the lockdown immediately.
+//
+// Glyph palette choice: the user explicitly rejected shaded blocks
+// (▒░▓) for shrink. Real shrinking is impossible in a fixed-cell
+// monospace renderer, so we substitute progressively smaller-bodied
+// Unicode glyphs that visually read as "the character got smaller"
+// rather than "the same character got dimmer". Combined with a
+// color lerp this approximates a true shrink.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const ly_ui = @import("ly-ui");
+const Cell = ly_ui.Cell;
+const TerminalBuffer = ly_ui.TerminalBuffer;
+const Widget = ly_ui.Widget;
+const Label = ly_ui.Label;
+const ly_core = ly_ui.ly_core;
+const interop = ly_core.interop;
+const TimeOfDay = interop.TimeOfDay;
+
+const Lockdown = @This();
+
+// ─── Public types ─────────────────────────────────────────────────
+
+pub const LockdownAnim = enum(u8) {
+    // Original behaviour — Matrix.locked sparse-gray rain stays on
+    // forever. Kept as an option so anyone who liked the older look
+    // can opt in.
+    legacy_sparse = 0,
+    // New scramble→shrink→clock sequence (this module).
+    scramble_shrink = 1,
+
+    pub fn label(self: LockdownAnim) []const u8 {
+        return switch (self) {
+            .legacy_sparse => "legacy sparse  ",
+            .scramble_shrink => "scramble→clock ",
+        };
+    }
+
+    pub fn cycle(self: LockdownAnim) LockdownAnim {
+        return switch (self) {
+            .legacy_sparse => .scramble_shrink,
+            .scramble_shrink => .legacy_sparse,
+        };
+    }
+
+    pub fn fromInt(n: u8) LockdownAnim {
+        return switch (n) {
+            0 => .legacy_sparse,
+            1 => .scramble_shrink,
+            else => .scramble_shrink,
+        };
+    }
+};
+
+pub const Phase = enum {
+    idle,
+    scramble,
+    shrink_fade,
+    blank,
+    grow_clock,
+    tick,
+    end_unlock,
+};
+
+// ─── Tunables ─────────────────────────────────────────────────────
+
+pub const SCRAMBLE_SEC: f64 = 1.5;
+pub const SHRINK_SEC: f64 = 2.5;
+pub const BLANK_SEC: f64 = 0.8;
+pub const GROW_CLOCK_SEC: f64 = 1.2;
+pub const GROW_UI_DELAY_SEC: f64 = 0.7;
+pub const PREVIEW_TICK_SEC: f64 = 5.0;
+pub const FAILLOCK_POLL_SEC: f64 = 2.0;
+pub const DEFAULT_UNLOCK_SEC: f64 = 600.0; // pam_faillock default
+
+// Color targets.
+pub const MID_GRAY: u32 = 0x01808080;
+pub const DARK_GRAY: u32 = 0x01404040;
+pub const VERY_DARK_GRAY: u32 = 0x01202020;
+pub const CLOCK_BRIGHT: u32 = 0x01FFFFFF;
+pub const CLOCK_DIM: u32 = 0x01666666;
+pub const BG: u32 = 0x00000000;
+
+// Small-glyph shrink palette. Index 0..6 ranges from "fullest" to
+// "blank". Each step is a visibly smaller-bodied Unicode glyph.
+//   0: original glyph (color may still fade)
+//   1: original glyph (color fades further)
+//   2: ◌  U+25CC dotted circle    (about same area as letter but hollow)
+//   3: ◦  U+25E6 white bullet      (small open circle, mid-row)
+//   4: ·  U+00B7 middle dot        (small filled dot, mid-row)
+//   5: ⋅  U+22C5 dot operator      (tinier dot, often baseline-raised)
+//   6: ' ' space                   (blank)
+pub const SHRINK_GLYPHS = [_]u21{
+    0, // sentinel — "keep original"
+    0,
+    0x25CC,
+    0x25E6,
+    0x00B7,
+    0x22C5,
+    ' ',
+};
+
+pub const SHRINK_STEPS: u8 = SHRINK_GLYPHS.len; // 7
+
+// Async-signal-safe flag set by main()'s SIGUSR2 handler. Polled
+// once per frame in Lockdown.updateWidget. When set: fire a preview
+// run of the selected animation. Used by /tmp/ly-headless.sh so the
+// scramble→clock sequence can be exercised from a `kill -USR2 <pid>`
+// without typing 3 wrong passwords through a pty with no keyboard.
+pub var preview_request = std.atomic.Value(bool).init(false);
+
+// Halfwidth Katakana scramble pool — matches the Matrix rain so the
+// scramble phase reads as the existing characters going haywire.
+const SCRAMBLE_POOL = [_]u21{
+    0xFF66, 0xFF67, 0xFF68, 0xFF69, 0xFF6A, 0xFF6B, 0xFF6C, 0xFF6D,
+    0xFF6E, 0xFF6F, 0xFF70, 0xFF71, 0xFF72, 0xFF73, 0xFF74, 0xFF75,
+    0xFF76, 0xFF77, 0xFF78, 0xFF79, 0xFF7A, 0xFF7B, 0xFF7C, 0xFF7D,
+    0xFF7E, 0xFF7F, 0xFF80, 0xFF81, 0xFF82, 0xFF83, 0xFF84, 0xFF85,
+    0xFF86, 0xFF87, 0xFF88, 0xFF89, 0xFF8A, 0xFF8B, 0xFF8C, 0xFF8D,
+    0xFF8E, 0xFF8F, 0xFF90, 0xFF91, 0xFF92, 0xFF93, 0xFF94, 0xFF95,
+    0xFF96, 0xFF97, 0xFF98, 0xFF99, 0xFF9A, 0xFF9B, 0xFF9C, 0xFF9D,
+};
+
+// ─── State ───────────────────────────────────────────────────────
+
+allocator: Allocator,
+buffer: *TerminalBuffer,
+
+active: bool = false,
+anim: LockdownAnim = .scramble_shrink,
+preview_mode: bool = false,
+// Persisted selection — read by the debug menu, used by start() as
+// the default when triggered from authenticate(). The debug menu's
+// "preview" action also uses this so the user can see what they
+// picked.
+selected_anim: LockdownAnim = .scramble_shrink,
+
+phase: Phase = .idle,
+phase_started: f64 = 0,
+lockdown_started: f64 = 0,
+unlock_epoch: f64 = 0,
+last_external_check: f64 = 0,
+
+// Per-cell shrink offset (in 0..SHRINK_OFFSET_MAX). Adds to
+// elapsed-frame shrink index so cells reach blank at slightly
+// different times.
+shrink_offset: ?[]u8 = null,
+// Per-cell scrambled codepoint for the scramble phase. Re-rolled
+// every SCRAMBLE_REROLL_FRAMES. Index 0 means "use snapshot".
+scramble_glyph: ?[]u21 = null,
+// Saved rain snapshot — cells captured at start. Used as the
+// "original" for shrink color fade.
+snapshot: ?[]Cell = null,
+// Frame-counter for scramble re-roll cadence.
+scramble_frame: u32 = 0,
+
+buf_width: usize = 0,
+buf_height: usize = 0,
+
+// Faillock probe path: built once at start, reused per poll.
+faillock_path_buf: [128]u8 = undefined,
+faillock_path_len: usize = 0,
+
+// Side-effect hooks set by main via attachHooks(). These let us
+// perform end_unlock side-effects from inside updateWidget without
+// circular-importing main's UiState. All are optional — if absent,
+// the corresponding side-effect is skipped (preview mode uses this
+// to avoid touching real auth state).
+hook_password_should_insert: ?*bool = null,
+hook_box_top_title: ?*?[]const u8 = null,
+hook_auth_fails: ?*u64 = null,
+hook_matrix_locked: ?*bool = null,
+hook_matrix_suppressed: ?*bool = null,
+hook_password_label: ?*Label = null,
+// Saved values for restore at end_unlock. Captured at start().
+saved_top_title: ?[]const u8 = null,
+saved_password_label_text: []const u8 = "",
+
+// Last-tick wall-clock time, captured by the widget update fn and
+// consumed by drawWidget (draw can't return errors so it can't call
+// getTimeOfDay itself).
+last_now: f64 = 0,
+
+// Cached username for faillock probe. Set by start() and (when we
+// auto-fire preview from SIGUSR2) by cacheUsername.
+cached_username_buf: [64]u8 = undefined,
+cached_username_len: usize = 0,
+
+// Widget instance for layer registration.
+instance: ?Widget = null,
+
+// ─── Constructor / destructor ─────────────────────────────────────
+
+pub fn init(allocator: Allocator, buffer: *TerminalBuffer) Lockdown {
+    return .{ .allocator = allocator, .buffer = buffer };
+}
+
+// Wire side-effect hooks. Called from main after UiState fields are
+// stable. All four hooks are optional but the typical wiring sets
+// all of them.
+pub fn attachHooks(
+    self: *Lockdown,
+    password_should_insert: *bool,
+    box_top_title: *?[]const u8,
+    auth_fails: *u64,
+    matrix_locked: ?*bool,
+    matrix_suppressed: ?*bool,
+    password_label: *Label,
+) void {
+    self.hook_password_should_insert = password_should_insert;
+    self.hook_box_top_title = box_top_title;
+    self.hook_auth_fails = auth_fails;
+    self.hook_matrix_locked = matrix_locked;
+    self.hook_matrix_suppressed = matrix_suppressed;
+    self.hook_password_label = password_label;
+}
+
+pub fn deinit(self: *Lockdown) void {
+    if (self.shrink_offset) |s| self.allocator.free(s);
+    if (self.scramble_glyph) |s| self.allocator.free(s);
+    if (self.snapshot) |s| self.allocator.free(s);
+    self.shrink_offset = null;
+    self.scramble_glyph = null;
+    self.snapshot = null;
+}
+
+// ─── Widget surface (top-layer overlay) ───────────────────────────
+
+pub fn widget(self: *Lockdown) *Widget {
+    if (self.instance) |*w| return w;
+    self.instance = Widget.init(
+        "Lockdown",
+        null,
+        self,
+        null,
+        reallocImpl,
+        drawWidget,
+        updateWidget,
+        null,
+        null,
+    );
+    return &self.instance.?;
+}
+
+fn reallocImpl(self: *Lockdown) !void {
+    // On terminal-size change while a lockdown is active, reallocate
+    // per-cell state. On inactive, drop everything — fresh alloc at
+    // next start().
+    self.deinit();
+    if (self.active) try self.allocatePerCell(self.buffer.width, self.buffer.height);
+}
+
+fn updateWidget(self: *Lockdown, _: *anyopaque) !void {
+    // Consume preview-request flag even when inactive — that's the
+    // SIGUSR2 trigger for headless test sessions.
+    if (preview_request.swap(false, .seq_cst) and !self.active) {
+        const t = interop.getTimeOfDay() catch return;
+        const now_f = todToF64(t);
+        const uname = if (self.cached_username_len > 0)
+            self.cached_username_buf[0..self.cached_username_len]
+        else
+            "preview";
+        self.start(
+            self.selected_anim,
+            now_f + DEFAULT_UNLOCK_SEC,
+            true,
+            now_f,
+            uname,
+        ) catch return;
+    }
+    if (!self.active or self.phase == .idle) return;
+    const t = try interop.getTimeOfDay();
+    self.last_now = todToF64(t);
+    const reached_end = self.update(self.last_now);
+    if (reached_end) {
+        self.runEndUnlockHooks();
+        self.finish();
+    }
+}
+
+// Cache the username for later use (SIGUSR2 preview that fires
+// outside of an auth attempt). Caller can re-invoke whenever the
+// active login changes.
+pub fn cacheUsername(self: *Lockdown, username: []const u8) void {
+    const n = @min(username.len, self.cached_username_buf.len);
+    @memcpy(self.cached_username_buf[0..n], username[0..n]);
+    self.cached_username_len = n;
+}
+
+fn runEndUnlockHooks(self: *Lockdown) void {
+    // Restore the side-effects start() captured. preview_mode means
+    // we didn't touch them, so skip the restore path.
+    if (!self.preview_mode) {
+        if (self.hook_box_top_title) |t| {
+            t.* = self.saved_top_title;
+        }
+        if (self.hook_password_should_insert) |p| {
+            p.* = true;
+        }
+        if (self.hook_auth_fails) |a| {
+            a.* = 0;
+        }
+        if (self.hook_matrix_locked) |m| {
+            m.* = false;
+        }
+        if (self.hook_password_label) |lbl| {
+            lbl.setText(self.saved_password_label_text);
+        }
+    }
+    if (self.hook_matrix_suppressed) |s| s.* = false;
+    self.saved_top_title = null;
+    self.saved_password_label_text = "";
+}
+
+fn drawWidget(self: *Lockdown) void {
+    if (!self.active or self.phase == .idle) return;
+    self.draw(self.buffer);
+}
+
+// ─── Public state queries (caller uses these to gate UI) ──────────
+
+pub fn isActive(self: *const Lockdown) bool {
+    return self.active and self.phase != .idle and self.phase != .end_unlock;
+}
+
+// Password input + box top_title hide during all non-idle phases
+// (including end_unlock briefly — caller restores when handling
+// end_unlock).
+pub fn shouldHidePasswordAndTitle(self: *const Lockdown) bool {
+    if (!self.active) return false;
+    return switch (self.phase) {
+        .idle, .end_unlock => false,
+        else => true,
+    };
+}
+
+// Animation widget (rain) is suppressed by overdraw — see
+// drawWidget. Returning true here lets the caller short-circuit
+// Matrix's draw() too, saving CPU on the heavy column scan during
+// lockdown. (Optional optimisation.)
+pub fn shouldSuppressAnimation(self: *const Lockdown) bool {
+    return self.isActive();
+}
+
+// Other widgets (info_line, attempts, version, mod_hint, clock,
+// battery, etc.) — visible after grow_clock completes and a short
+// delay into tick, OR when inactive.
+pub fn shouldShowOtherWidgets(self: *const Lockdown, now: f64) bool {
+    if (!self.active) return true;
+    return switch (self.phase) {
+        .idle, .end_unlock => true,
+        .scramble, .shrink_fade, .blank, .grow_clock => false,
+        .tick => (now - self.phase_started) >= GROW_UI_DELAY_SEC,
+    };
+}
+
+// ─── Public lifecycle ─────────────────────────────────────────────
+
+pub fn start(
+    self: *Lockdown,
+    anim: LockdownAnim,
+    unlock_epoch: f64,
+    preview: bool,
+    now: f64,
+    username: []const u8,
+) !void {
+    // Idempotent — re-entering start while already active resets the
+    // sequence (used by preview action when user mashes Enter).
+    self.active = true;
+    self.anim = anim;
+    self.preview_mode = preview;
+    self.phase = .scramble;
+    self.phase_started = now;
+    self.lockdown_started = now;
+    self.last_external_check = now;
+    self.scramble_frame = 0;
+
+    // Save side-effect state for restore. Skip in preview mode so
+    // real password.should_insert, box.top_title, and password_label
+    // remain untouched — preview must be visually identical but
+    // auth-stack invisible.
+    if (!preview) {
+        if (self.hook_box_top_title) |t| {
+            self.saved_top_title = t.*;
+            t.* = null;
+        }
+        if (self.hook_password_should_insert) |p| {
+            p.* = false;
+        }
+        if (self.hook_password_label) |lbl| {
+            self.saved_password_label_text = lbl.text;
+            lbl.setText("");
+        }
+    }
+
+    // Preview overrides unlock to a short window so the user sees
+    // the full cycle quickly in the debug menu.
+    self.unlock_epoch = if (preview)
+        now + SCRAMBLE_SEC + SHRINK_SEC + BLANK_SEC + GROW_CLOCK_SEC + PREVIEW_TICK_SEC
+    else
+        unlock_epoch;
+
+    // Build the faillock probe path once.
+    const written = std.fmt.bufPrint(
+        &self.faillock_path_buf,
+        "/run/faillock/{s}",
+        .{username},
+    ) catch self.faillock_path_buf[0..0];
+    self.faillock_path_len = written.len;
+
+    try self.allocatePerCell(self.buffer.width, self.buffer.height);
+    self.snapshotBuffer();
+
+    // Tell Matrix to skip its draw step while we're active.
+    if (self.hook_matrix_suppressed) |s| s.* = true;
+}
+
+fn allocatePerCell(self: *Lockdown, w: usize, h: usize) !void {
+    self.buf_width = w;
+    self.buf_height = h;
+    const n = w * h;
+
+    if (self.shrink_offset) |s| self.allocator.free(s);
+    if (self.scramble_glyph) |s| self.allocator.free(s);
+    if (self.snapshot) |s| self.allocator.free(s);
+
+    self.shrink_offset = try self.allocator.alloc(u8, n);
+    self.scramble_glyph = try self.allocator.alloc(u21, n);
+    self.snapshot = try self.allocator.alloc(Cell, n);
+
+    // Per-cell offset spreads shrink-out times. Range [0..6] gives
+    // each cell up to ~SHRINK_SEC × 6/SHRINK_STEPS extra time.
+    for (self.shrink_offset.?) |*off| {
+        off.* = @intCast(self.buffer.random.uintLessThan(u32, 6));
+    }
+    // Initialise scramble_glyph to 0 = "use snapshot".
+    for (self.scramble_glyph.?) |*g| g.* = 0;
+}
+
+fn snapshotBuffer(self: *Lockdown) void {
+    var y: usize = 0;
+    const snap = self.snapshot orelse return;
+    while (y < self.buf_height) : (y += 1) {
+        var x: usize = 0;
+        while (x < self.buf_width) : (x += 1) {
+            const idx = y * self.buf_width + x;
+            snap[idx] = TerminalBuffer.getCell(x, y) orelse
+                Cell.init(' ', BG, BG);
+        }
+    }
+}
+
+// Per-frame phase advance. Caller invokes once per frame BEFORE
+// widget draws. Returns true if state has just reached end_unlock
+// — caller should clear lockout state at that moment.
+pub fn update(self: *Lockdown, now: f64) bool {
+    if (!self.active or self.phase == .idle) return false;
+
+    const elapsed = now - self.phase_started;
+    var new_phase: ?Phase = null;
+    switch (self.phase) {
+        .idle => {},
+        .scramble => if (elapsed >= SCRAMBLE_SEC) {
+            new_phase = .shrink_fade;
+        },
+        .shrink_fade => if (elapsed >= SHRINK_SEC) {
+            new_phase = .blank;
+        },
+        .blank => if (elapsed >= BLANK_SEC) {
+            new_phase = .grow_clock;
+        },
+        .grow_clock => if (elapsed >= GROW_CLOCK_SEC) {
+            new_phase = .tick;
+        },
+        .tick => {
+            // External-reset poll.
+            if (now - self.last_external_check >= FAILLOCK_POLL_SEC) {
+                self.last_external_check = now;
+                if (!self.preview_mode and !systemStillLocked(self)) {
+                    new_phase = .end_unlock;
+                }
+            }
+            // Internal countdown.
+            if (new_phase == null and now >= self.unlock_epoch) {
+                new_phase = .end_unlock;
+            }
+        },
+        .end_unlock => {
+            // Caller handles the transition out — see main.zig.
+            // We do NOT auto-reset to idle; main flips us via finish().
+        },
+    }
+    if (new_phase) |p| {
+        self.phase = p;
+        self.phase_started = now;
+        if (p == .end_unlock) return true;
+    }
+    return false;
+}
+
+// Caller invokes after handling .end_unlock side-effects (restore
+// password input, clear top_title saved value, reset auth_fails).
+pub fn finish(self: *Lockdown) void {
+    self.active = false;
+    self.phase = .idle;
+}
+
+// Returns seconds remaining until unlock. Clamps at 0.
+pub fn remainingSeconds(self: *const Lockdown, now: f64) i64 {
+    if (now >= self.unlock_epoch) return 0;
+    const diff = self.unlock_epoch - now;
+    return @intFromFloat(@ceil(diff));
+}
+
+// ─── Pure helpers (tested) ────────────────────────────────────────
+
+// Convert clock seconds-remaining to MM:SS. Caller-owned buffer
+// must be at least 6 bytes for "MM:SS" + NUL. Returns slice into
+// buf with the result.
+pub fn formatClock(secs_remaining: i64, buf: []u8) []const u8 {
+    const s = if (secs_remaining < 0) 0 else secs_remaining;
+    const mm: i64 = @divFloor(s, 60);
+    const ss: i64 = @mod(s, 60);
+    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{ mm, ss }) catch buf[0..0];
+}
+
+// Phase math at time `now` given a start epoch — returns which
+// phase the lockdown would be in if started at start_epoch. Used
+// purely for tests so phase transitions are deterministic.
+pub fn phaseAtTime(start_epoch: f64, now: f64, tick_unlock_at: f64) Phase {
+    if (now < start_epoch) return .idle;
+    const t = now - start_epoch;
+    var acc: f64 = 0;
+    acc += SCRAMBLE_SEC;
+    if (t < acc) return .scramble;
+    acc += SHRINK_SEC;
+    if (t < acc) return .shrink_fade;
+    acc += BLANK_SEC;
+    if (t < acc) return .blank;
+    acc += GROW_CLOCK_SEC;
+    if (t < acc) return .grow_clock;
+    if (now < tick_unlock_at) return .tick;
+    return .end_unlock;
+}
+
+// Shrink index from elapsed seconds + per-cell offset. Returns a
+// value in 0..SHRINK_STEPS (inclusive of last = blank). Clamps to
+// SHRINK_STEPS-1 once past the shrink duration.
+pub fn shrinkIndex(elapsed: f64, total: f64, per_cell_offset: u8) u8 {
+    // Effective progress with per-cell offset baked in. The offset
+    // shifts the start of shrink for this cell by up to ~total/2;
+    // SCALE compresses so offset never overshoots SHRINK_STEPS-1.
+    const max_off = SHRINK_STEPS - 1;
+    const off_clamped: u8 = if (per_cell_offset > max_off) max_off else per_cell_offset;
+    const frac = if (total <= 0) 1.0 else elapsed / total;
+    // Map frac 0..1 → SHRINK_STEPS. Offset adds extra "lag" by
+    // subtracting from frac (cells with high offset shrink later).
+    const eff_frac = frac - (@as(f64, @floatFromInt(off_clamped)) / @as(f64, SHRINK_STEPS));
+    if (eff_frac <= 0) return 0;
+    const idx_f = eff_frac * @as(f64, SHRINK_STEPS);
+    var idx: u8 = @intFromFloat(@floor(idx_f));
+    if (idx >= SHRINK_STEPS) idx = SHRINK_STEPS - 1;
+    return idx;
+}
+
+// Pick the shrunk glyph for the given index + original codepoint.
+// Idx 0/1 → original; later → progressively smaller substitute;
+// last → blank.
+pub fn shrinkGlyph(original: u21, idx: u8) u21 {
+    if (idx >= SHRINK_STEPS) return ' ';
+    const palette_cp = SHRINK_GLYPHS[idx];
+    if (palette_cp == 0) return original;
+    return palette_cp;
+}
+
+// Grow glyph for clock — symmetric inverse of shrink. Frame 0 is
+// smallest (⋅), final frame is the target digit. Steps: ⋅ → · →
+// ◦ → ◌ → dim target → bright target.
+pub fn growGlyph(target: u21, frame: u8, total_frames: u8) u21 {
+    // total_frames effectively spans 0..total. We pick a glyph
+    // based on which "stage" we're in.
+    if (total_frames == 0) return target;
+    const stage = @as(u32, frame) * 6 / @as(u32, total_frames);
+    return switch (stage) {
+        0 => 0x22C5, // ⋅
+        1 => 0x00B7, // ·
+        2 => 0x25E6, // ◦
+        3 => 0x25CC, // ◌
+        4 => target, // dim
+        else => target, // bright
+    };
+}
+
+// Lerp two RGB colors with alpha-byte preserved from `from`.
+pub fn lerpColor(from: u32, to: u32, t: f64) u32 {
+    var tc = t;
+    if (tc < 0) tc = 0;
+    if (tc > 1) tc = 1;
+    const a: u32 = from & 0xFF000000;
+    const fr: i32 = @intCast((from >> 16) & 0xFF);
+    const fg: i32 = @intCast((from >> 8) & 0xFF);
+    const fb: i32 = @intCast(from & 0xFF);
+    const tr: i32 = @intCast((to >> 16) & 0xFF);
+    const tg: i32 = @intCast((to >> 8) & 0xFF);
+    const tb: i32 = @intCast(to & 0xFF);
+    const r: u32 = @intCast(fr + @as(i32, @intFromFloat((@as(f64, @floatFromInt(tr - fr))) * tc)));
+    const g: u32 = @intCast(fg + @as(i32, @intFromFloat((@as(f64, @floatFromInt(tg - fg))) * tc)));
+    const b: u32 = @intCast(fb + @as(i32, @intFromFloat((@as(f64, @floatFromInt(tb - fb))) * tc)));
+    return a | (r << 16) | (g << 8) | b;
+}
+
+// Compute the color for a shrinking cell at shrink_idx (0..STEPS).
+// Fades from `original` → MID_GRAY at idx ~3 → DARK_GRAY at idx
+// ~5 → BG at the blank step.
+pub fn colorForShrink(original: u32, idx: u8) u32 {
+    if (idx <= 1) {
+        // Slight cool fade so the user senses the color shift early.
+        return lerpColor(original, MID_GRAY, @as(f64, @floatFromInt(idx)) * 0.25);
+    }
+    if (idx <= 3) {
+        const t = (@as(f64, @floatFromInt(idx)) - 1.0) / 2.0; // 0..1
+        return lerpColor(original, MID_GRAY, 0.25 + 0.5 * t);
+    }
+    if (idx <= 5) {
+        const t = (@as(f64, @floatFromInt(idx)) - 3.0) / 2.0; // 0..1
+        return lerpColor(MID_GRAY, DARK_GRAY, t);
+    }
+    return BG;
+}
+
+// Color for clock grow stage. Frame 0..total-2 use dim gray; the
+// final stage uses CLOCK_BRIGHT for a "snap into focus" feel.
+pub fn colorForGrow(frame: u8, total_frames: u8) u32 {
+    if (total_frames == 0) return CLOCK_BRIGHT;
+    const stage = @as(u32, frame) * 6 / @as(u32, total_frames);
+    return switch (stage) {
+        0, 1 => DARK_GRAY,
+        2, 3 => MID_GRAY,
+        4 => CLOCK_DIM,
+        else => CLOCK_BRIGHT,
+    };
+}
+
+// ─── Persistence ─────────────────────────────────────────────────
+
+const PREFS_PATH: []const u8 = "/var/lib/ly/lockdown-prefs";
+
+pub fn savePrefs(self: *const Lockdown, io: std.Io) void {
+    saveImpl(self, io) catch {};
+}
+
+fn saveImpl(self: *const Lockdown, io: std.Io) !void {
+    std.Io.Dir.cwd().createDirPath(io, "/var/lib/ly") catch {};
+    var file = try std.Io.Dir.cwd().createFile(
+        io,
+        PREFS_PATH,
+        .{ .permissions = .fromMode(0o600) },
+    );
+    defer file.close(io);
+    var buf: [128]u8 = undefined;
+    var w = file.writer(io, &buf);
+    try w.interface.print("lockout_animation={d}\n", .{@intFromEnum(self.selected_anim)});
+    try w.interface.flush();
+}
+
+pub fn loadPrefs(self: *Lockdown, io: std.Io) void {
+    loadImpl(self, io) catch {};
+}
+
+fn loadImpl(self: *Lockdown, io: std.Io) !void {
+    var file = try std.Io.Dir.cwd().openFile(io, PREFS_PATH, .{ .mode = .read_only });
+    defer file.close(io);
+    var read_buf: [256]u8 = undefined;
+    var fr = file.reader(io, &read_buf);
+    var r = &fr.interface;
+    while (true) {
+        const line = r.takeDelimiterInclusive('\n') catch break;
+        const trimmed = std.mem.trimEnd(u8, line, "\n\r ");
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        const key = trimmed[0..eq];
+        const val = trimmed[eq + 1 ..];
+        if (std.mem.eql(u8, key, "lockout_animation")) {
+            const v = std.fmt.parseInt(u8, val, 10) catch continue;
+            self.selected_anim = LockdownAnim.fromInt(v);
+        }
+    }
+}
+
+// ─── External-reset probe ────────────────────────────────────────
+
+fn systemStillLocked(self: *Lockdown) bool {
+    // The pam_faillock tally file lives at /run/faillock/<user>.
+    // `faillock --reset` removes the file outright, so existence
+    // check is sufficient. `faillock --user X` reads the file
+    // straight from there; matching its contract keeps us in lockstep
+    // with `--reset`.
+    if (self.faillock_path_len == 0) return true;
+    // Ensure null-terminated for the C syscall.
+    if (self.faillock_path_len >= self.faillock_path_buf.len) return true;
+    self.faillock_path_buf[self.faillock_path_len] = 0;
+    const cpath: [*:0]const u8 = @ptrCast(&self.faillock_path_buf[0]);
+    const rc = std.posix.system.access(cpath, std.posix.F_OK);
+    return rc == 0;
+}
+
+// ─── Drawing ─────────────────────────────────────────────────────
+
+// Convert ly's TimeOfDay (seconds + microseconds split) to a single
+// f64 for phase math.
+pub fn todToF64(t: TimeOfDay) f64 {
+    return @as(f64, @floatFromInt(t.seconds)) +
+        @as(f64, @floatFromInt(t.microseconds)) / 1_000_000.0;
+}
+
+fn draw(self: *Lockdown, buf: *TerminalBuffer) void {
+    const now = self.last_now;
+    switch (self.phase) {
+        .idle, .end_unlock => {},
+        .scramble => self.drawScramble(buf),
+        .shrink_fade => self.drawShrinkFade(buf, now),
+        .blank => self.drawBlank(buf),
+        .grow_clock => {
+            self.drawBlank(buf);
+            self.drawClock(buf, now, true);
+        },
+        .tick => {
+            // During the first GROW_UI_DELAY_SEC of tick we still
+            // full-blank — only the clock should be visible. After
+            // that delay the lower-layer widgets (info_line,
+            // attempts label, box etc.) become visible behind us
+            // because we shrink to just the clock band.
+            const tick_elapsed = now - self.phase_started;
+            if (tick_elapsed < GROW_UI_DELAY_SEC) {
+                self.drawBlank(buf);
+            } else {
+                const cy = buf.height / 2;
+                const y0 = if (cy >= 2) cy - 2 else 0;
+                const y1 = if (y0 + 4 < buf.height) y0 + 4 else buf.height;
+                self.drawBlankBand(buf, y0, y1);
+            }
+            self.drawClock(buf, now, false);
+        },
+    }
+}
+
+fn drawBlank(self: *Lockdown, buf: *TerminalBuffer) void {
+    _ = self;
+    var y: usize = 0;
+    while (y < buf.height) : (y += 1) {
+        TerminalBuffer.drawCharMultiple(' ', 0, y, buf.width, BG, BG);
+    }
+}
+
+fn drawBlankBand(self: *Lockdown, buf: *TerminalBuffer, y0: usize, y1: usize) void {
+    _ = self;
+    var y: usize = y0;
+    while (y < y1 and y < buf.height) : (y += 1) {
+        TerminalBuffer.drawCharMultiple(' ', 0, y, buf.width, BG, BG);
+    }
+}
+
+fn drawScramble(self: *Lockdown, buf: *TerminalBuffer) void {
+    const snap = self.snapshot orelse return;
+    const scram = self.scramble_glyph orelse return;
+    // Re-roll a fraction of cells every frame so the scramble
+    // visibly churns rather than flashing all at once.
+    self.scramble_frame +%= 1;
+    const reroll_count = @divFloor(self.buf_width * self.buf_height, 12); // ~8% per frame
+    var i: usize = 0;
+    while (i < reroll_count) : (i += 1) {
+        const idx = buf.random.uintLessThan(usize, self.buf_width * self.buf_height);
+        if (snap[idx].ch == ' ' or snap[idx].ch == 0) continue;
+        scram[idx] = SCRAMBLE_POOL[buf.random.uintLessThan(usize, SCRAMBLE_POOL.len)];
+    }
+    // Paint: original cells preserved (positions kept), but glyph
+    // swapped to scrambled value where one is set.
+    var y: usize = 0;
+    while (y < self.buf_height) : (y += 1) {
+        var x: usize = 0;
+        while (x < self.buf_width) : (x += 1) {
+            const idx = y * self.buf_width + x;
+            const orig = snap[idx];
+            if (orig.ch == 0 or orig.ch == ' ') continue;
+            const cp = if (scram[idx] != 0) scram[idx] else @as(u21, @intCast(orig.ch));
+            Cell.init(@intCast(cp), orig.fg, orig.bg).put(x, y);
+        }
+    }
+}
+
+fn drawShrinkFade(self: *Lockdown, buf: *TerminalBuffer, now: f64) void {
+    const snap = self.snapshot orelse return;
+    const offs = self.shrink_offset orelse return;
+    const elapsed = now - self.phase_started;
+    var y: usize = 0;
+    while (y < self.buf_height) : (y += 1) {
+        var x: usize = 0;
+        while (x < self.buf_width) : (x += 1) {
+            const idx = y * self.buf_width + x;
+            const orig = snap[idx];
+            if (orig.ch == 0 or orig.ch == ' ') {
+                Cell.init(' ', BG, BG).put(x, y);
+                continue;
+            }
+            const si = shrinkIndex(elapsed, SHRINK_SEC, offs[idx]);
+            const glyph = shrinkGlyph(@intCast(orig.ch), si);
+            const fg = colorForShrink(orig.fg, si);
+            Cell.init(@intCast(glyph), fg, BG).put(x, y);
+        }
+        _ = buf;
+    }
+}
+
+fn drawClock(self: *Lockdown, buf: *TerminalBuffer, now: f64, growing: bool) void {
+    var buf6: [16]u8 = undefined;
+    const secs = self.remainingSeconds(now);
+    const text = formatClock(secs, &buf6);
+
+    // Center horizontally + vertically. Render with high padding
+    // on each side so it reads as "the only thing on screen".
+    const tw = text.len;
+    if (buf.width < tw + 4 or buf.height < 4) return;
+    const cx = (buf.width - tw) / 2;
+    const cy = buf.height / 2;
+
+    if (growing) {
+        const elapsed = now - self.phase_started;
+        const frac = if (GROW_CLOCK_SEC <= 0) 1.0 else elapsed / GROW_CLOCK_SEC;
+        const frame: u8 = @intFromFloat(@min(5.0, @max(0.0, frac * 5.0)));
+        var i: usize = 0;
+        while (i < text.len) : (i += 1) {
+            const target: u21 = @intCast(text[i]);
+            const cp = growGlyph(target, frame, 5);
+            const fg = colorForGrow(frame, 5);
+            Cell.init(@intCast(cp), fg, BG).put(cx + i, cy);
+        }
+    } else {
+        var i: usize = 0;
+        while (i < text.len) : (i += 1) {
+            const ch: u21 = @intCast(text[i]);
+            Cell.init(@intCast(ch), CLOCK_BRIGHT, BG).put(cx + i, cy);
+        }
+        // Underline / overline accent so it reads as "this is the
+        // time you're waiting for, not just stray text". 1-row
+        // bracket above and below.
+        const dash_fg: u32 = CLOCK_DIM;
+        var j: usize = 0;
+        while (j < tw) : (j += 1) {
+            Cell.init(0x2500, dash_fg, BG).put(cx + j, cy - 1);
+            Cell.init(0x2500, dash_fg, BG).put(cx + j, cy + 1);
+        }
+    }
+}
+
+// ─── Tests (pure helpers only — rendering is visual-diffed) ───────
+
+const testing = std.testing;
+
+test "formatClock pads MM:SS" {
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("00:00", formatClock(0, &buf));
+    try testing.expectEqualStrings("00:01", formatClock(1, &buf));
+    try testing.expectEqualStrings("00:59", formatClock(59, &buf));
+    try testing.expectEqualStrings("01:00", formatClock(60, &buf));
+    try testing.expectEqualStrings("09:59", formatClock(599, &buf));
+    try testing.expectEqualStrings("10:00", formatClock(600, &buf));
+    try testing.expectEqualStrings("99:59", formatClock(5999, &buf));
+}
+
+test "formatClock clamps negatives to 00:00" {
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("00:00", formatClock(-1, &buf));
+    try testing.expectEqualStrings("00:00", formatClock(-9999, &buf));
+}
+
+test "phaseAtTime walks every phase in order" {
+    const t0: f64 = 1000.0;
+    const tick_until: f64 = t0 + 100.0; // arbitrary far future
+    try testing.expectEqual(Phase.idle, phaseAtTime(t0, 999.0, tick_until));
+    try testing.expectEqual(Phase.scramble, phaseAtTime(t0, t0 + 0.1, tick_until));
+    try testing.expectEqual(Phase.scramble, phaseAtTime(t0, t0 + SCRAMBLE_SEC - 0.01, tick_until));
+    try testing.expectEqual(Phase.shrink_fade, phaseAtTime(t0, t0 + SCRAMBLE_SEC + 0.01, tick_until));
+    try testing.expectEqual(Phase.blank, phaseAtTime(t0, t0 + SCRAMBLE_SEC + SHRINK_SEC + 0.01, tick_until));
+    try testing.expectEqual(Phase.grow_clock, phaseAtTime(t0, t0 + SCRAMBLE_SEC + SHRINK_SEC + BLANK_SEC + 0.01, tick_until));
+    try testing.expectEqual(Phase.tick, phaseAtTime(t0, t0 + SCRAMBLE_SEC + SHRINK_SEC + BLANK_SEC + GROW_CLOCK_SEC + 0.01, tick_until));
+    try testing.expectEqual(Phase.end_unlock, phaseAtTime(t0, tick_until + 0.01, tick_until));
+}
+
+test "shrinkIndex ramps 0..STEPS-1" {
+    // No offset: at t=0 idx=0, at t=total idx≈STEPS-1.
+    try testing.expectEqual(@as(u8, 0), shrinkIndex(0.0, 2.0, 0));
+    try testing.expectEqual(@as(u8, 0), shrinkIndex(0.0001, 2.0, 0));
+    try testing.expect(shrinkIndex(2.0, 2.0, 0) == SHRINK_STEPS - 1);
+    // Linear mid: t=total/2 → ~STEPS/2.
+    const mid = shrinkIndex(1.0, 2.0, 0);
+    try testing.expect(mid >= 2 and mid <= 4);
+}
+
+test "shrinkIndex respects per-cell offset (later start)" {
+    // Cell with offset stays at 0 longer than cell without offset.
+    const no_off = shrinkIndex(0.5, 2.0, 0);
+    const with_off = shrinkIndex(0.5, 2.0, 3);
+    try testing.expect(with_off <= no_off);
+}
+
+test "shrinkGlyph maps idx to palette" {
+    try testing.expectEqual(@as(u21, 'A'), shrinkGlyph('A', 0));
+    try testing.expectEqual(@as(u21, 'A'), shrinkGlyph('A', 1));
+    try testing.expectEqual(@as(u21, 0x25CC), shrinkGlyph('A', 2));
+    try testing.expectEqual(@as(u21, 0x25E6), shrinkGlyph('A', 3));
+    try testing.expectEqual(@as(u21, 0x00B7), shrinkGlyph('A', 4));
+    try testing.expectEqual(@as(u21, 0x22C5), shrinkGlyph('A', 5));
+    try testing.expectEqual(@as(u21, ' '), shrinkGlyph('A', 6));
+    // Past end clamps to space.
+    try testing.expectEqual(@as(u21, ' '), shrinkGlyph('A', 99));
+}
+
+test "growGlyph reverses to target by final stage" {
+    try testing.expectEqual(@as(u21, 0x22C5), growGlyph('5', 0, 5));
+    try testing.expectEqual(@as(u21, '5'), growGlyph('5', 5, 5));
+    // Mid-frame goes through small-circle stages.
+    const mid = growGlyph('5', 2, 5);
+    try testing.expect(mid == 0x25E6 or mid == 0x00B7);
+}
+
+test "lerpColor endpoints + midpoint" {
+    try testing.expectEqual(@as(u32, 0xFF000000), lerpColor(0xFF000000, 0xFFFFFFFF, 0.0));
+    try testing.expectEqual(@as(u32, 0xFFFFFFFF), lerpColor(0xFF000000, 0xFFFFFFFF, 1.0));
+    const mid = lerpColor(0xFF000000, 0xFF808080, 0.5);
+    // ~0x40 each channel, alpha preserved.
+    try testing.expectEqual(@as(u32, 0xFF000000), mid & 0xFF000000);
+    const r = (mid >> 16) & 0xFF;
+    try testing.expect(r >= 0x3F and r <= 0x41);
+}
+
+test "colorForShrink hits gray midway and BG at end" {
+    const orig: u32 = 0x0000FF66; // ly's matrix green
+    const c0 = colorForShrink(orig, 0);
+    try testing.expectEqual(orig, c0);
+    const c3 = colorForShrink(orig, 3);
+    // ~mid_gray.
+    const r3 = (c3 >> 16) & 0xFF;
+    try testing.expect(r3 >= 0x40 and r3 <= 0x90);
+    const c6 = colorForShrink(orig, 6);
+    try testing.expectEqual(@as(u32, BG), c6);
+}
+
+test "LockdownAnim cycle round-trips" {
+    try testing.expectEqual(LockdownAnim.scramble_shrink, LockdownAnim.legacy_sparse.cycle());
+    try testing.expectEqual(LockdownAnim.legacy_sparse, LockdownAnim.scramble_shrink.cycle());
+}
+
+test "remainingSeconds clamps + rounds up" {
+    var ld: Lockdown = .{ .allocator = testing.allocator, .buffer = undefined };
+    ld.unlock_epoch = 100.0;
+    try testing.expectEqual(@as(i64, 0), ld.remainingSeconds(100.0));
+    try testing.expectEqual(@as(i64, 0), ld.remainingSeconds(150.0));
+    try testing.expectEqual(@as(i64, 1), ld.remainingSeconds(99.5));
+    try testing.expectEqual(@as(i64, 10), ld.remainingSeconds(90.0));
+    try testing.expectEqual(@as(i64, 600), ld.remainingSeconds(-500.0));
+}
