@@ -182,6 +182,12 @@ shrink_t0: ?[]u8 = null,
 // palette index at unique times; the visual effect is alive +
 // asynchronous instead of in lockstep.
 shrink_dur: ?[]u8 = null,
+// Per-cell scramble onset (0..255 → maps to [0, 0.7*SCRAMBLE_SEC]).
+// Frame 0 of scramble shows the pristine snapshot; cells start
+// flickering to random glyphs at unique times spread across most
+// of the scramble phase. Avoids the "instantly half-scrambled"
+// look the user reported as "running backwards".
+scramble_t0: ?[]u8 = null,
 // Per-cell scrambled codepoint for the scramble phase. Re-rolled
 // every SCRAMBLE_REROLL_FRAMES. Index 0 means "use snapshot".
 scramble_glyph: ?[]u21 = null,
@@ -268,10 +274,12 @@ pub fn attachHooks(
 pub fn deinit(self: *Lockdown) void {
     if (self.shrink_t0) |s| self.allocator.free(s);
     if (self.shrink_dur) |s| self.allocator.free(s);
+    if (self.scramble_t0) |s| self.allocator.free(s);
     if (self.scramble_glyph) |s| self.allocator.free(s);
     if (self.snapshot) |s| self.allocator.free(s);
     self.shrink_t0 = null;
     self.shrink_dur = null;
+    self.scramble_t0 = null;
     self.scramble_glyph = null;
     self.snapshot = null;
 }
@@ -471,11 +479,13 @@ fn allocatePerCell(self: *Lockdown, w: usize, h: usize) !void {
 
     if (self.shrink_t0) |s| self.allocator.free(s);
     if (self.shrink_dur) |s| self.allocator.free(s);
+    if (self.scramble_t0) |s| self.allocator.free(s);
     if (self.scramble_glyph) |s| self.allocator.free(s);
     if (self.snapshot) |s| self.allocator.free(s);
 
     self.shrink_t0 = try self.allocator.alloc(u8, n);
     self.shrink_dur = try self.allocator.alloc(u8, n);
+    self.scramble_t0 = try self.allocator.alloc(u8, n);
     self.scramble_glyph = try self.allocator.alloc(u21, n);
     self.snapshot = try self.allocator.alloc(Cell, n);
 
@@ -484,6 +494,7 @@ fn allocatePerCell(self: *Lockdown, w: usize, h: usize) !void {
     // hits a palette transition at a unique frame — no heartbeat.
     for (self.shrink_t0.?) |*v| v.* = self.buffer.random.int(u8);
     for (self.shrink_dur.?) |*v| v.* = self.buffer.random.int(u8);
+    for (self.scramble_t0.?) |*v| v.* = self.buffer.random.int(u8);
     // Initialise scramble_glyph to 0 = "use snapshot".
     for (self.scramble_glyph.?) |*g| g.* = 0;
 }
@@ -809,15 +820,20 @@ fn draw(self: *Lockdown, buf: *TerminalBuffer) void {
         .tick => {
             // During the first GROW_UI_DELAY_SEC of tick we still
             // full-blank — only the clock should be visible. After
-            // that delay the lower-layer widgets (info_line,
-            // attempts label, box etc.) become visible behind us
-            // because we shrink to just the clock band.
+            // that delay we shrink the blanked area to a tight
+            // RECTANGLE around the clock so the locked-mode rain
+            // (Matrix sparse-gray) can fall across the rest of
+            // those rows uninterrupted.
             const tick_elapsed = now - self.phase_started;
             if (tick_elapsed < GROW_UI_DELAY_SEC) {
                 self.drawBlank(buf);
             } else {
                 const band = self.clockBand(buf);
-                self.drawBlankBand(buf, band.y0, band.y1);
+                const text_w: usize = 5; // "MM:SS"
+                const pad: usize = 2;    // padding inside the rect
+                const rx0 = if (band.cx >= pad) band.cx - pad else 0;
+                const rx1 = @min(band.cx + text_w + pad, buf.width);
+                self.drawBlankRect(buf, rx0, band.y0, rx1, band.y1);
             }
             self.drawClock(buf, now, false);
         },
@@ -864,21 +880,22 @@ fn drawBlankBand(self: *Lockdown, buf: *TerminalBuffer, y0: usize, y1: usize) vo
     }
 }
 
+fn drawBlankRect(self: *Lockdown, buf: *TerminalBuffer, x0: usize, y0: usize, x1: usize, y1: usize) void {
+    _ = self;
+    var y: usize = y0;
+    while (y < y1 and y < buf.height) : (y += 1) {
+        const w = if (x1 > x0) x1 - x0 else 0;
+        if (w > 0) TerminalBuffer.drawCharMultiple(' ', x0, y, w, BG, BG);
+    }
+}
+
 fn drawScramble(self: *Lockdown, buf: *TerminalBuffer) void {
     const snap = self.snapshot orelse return;
     const scram = self.scramble_glyph orelse return;
-    // Re-roll a fraction of cells every frame so the scramble
-    // visibly churns rather than flashing all at once.
+    const t0s = self.scramble_t0 orelse return;
+    const elapsed = self.last_now - self.phase_started;
     self.scramble_frame +%= 1;
-    const reroll_count = @divFloor(self.buf_width * self.buf_height, 12); // ~8% per frame
-    var i: usize = 0;
-    while (i < reroll_count) : (i += 1) {
-        const idx = buf.random.uintLessThan(usize, self.buf_width * self.buf_height);
-        if (snap[idx].ch == ' ' or snap[idx].ch == 0) continue;
-        scram[idx] = SCRAMBLE_POOL[buf.random.uintLessThan(usize, SCRAMBLE_POOL.len)];
-    }
-    // Paint: original cells preserved (positions kept), but glyph
-    // swapped to scrambled value where one is set.
+
     var y: usize = 0;
     while (y < self.buf_height) : (y += 1) {
         var x: usize = 0;
@@ -886,8 +903,26 @@ fn drawScramble(self: *Lockdown, buf: *TerminalBuffer) void {
             const idx = y * self.buf_width + x;
             const orig = snap[idx];
             if (orig.ch == 0 or orig.ch == ' ') continue;
-            const cp = if (scram[idx] != 0) scram[idx] else @as(u21, @intCast(orig.ch));
-            Cell.init(@intCast(cp), orig.fg, orig.bg).put(x, y);
+            // Per-cell onset spread across [0, 0.7*SCRAMBLE_SEC].
+            // Until elapsed crosses the cell's t0 we keep the
+            // pristine snapshot glyph so the user perceives the
+            // ORIGINAL characters at frame 0 and the scramble
+            // building up cell-by-cell rather than appearing as
+            // a flicker-everywhere block.
+            const t0_sec = (@as(f64, @floatFromInt(t0s[idx])) / 255.0) * 0.7 * SCRAMBLE_SEC;
+            if (elapsed < t0_sec) {
+                Cell.init(orig.ch, orig.fg, orig.bg).put(x, y);
+                continue;
+            }
+            // Cycle the glyph every ~4 frames after onset so the
+            // scrambled cells feel alive rather than freezing on
+            // their first random pick. XOR with idx-low-bits stags
+            // the cycle phase across cells.
+            const cycle_phase: u32 = @as(u32, @truncate(idx)) & 0x7;
+            if (scram[idx] == 0 or (self.scramble_frame +% cycle_phase) % 4 == 0) {
+                scram[idx] = SCRAMBLE_POOL[buf.random.uintLessThan(usize, SCRAMBLE_POOL.len)];
+            }
+            Cell.init(@intCast(scram[idx]), orig.fg, orig.bg).put(x, y);
         }
     }
 }

@@ -820,8 +820,12 @@ pub fn main(init: std.process.Init) !void {
         try state.log_file.info(state.io, "input", "evdev L+R gate unavailable: {s}", .{@errorName(e)});
     };
     if (state.input_state.fds.items.len > 0) state.input_state_available = true;
-    defer state.input_state.stop();
+    // Defers fire LIFO, so register deinit FIRST and stop SECOND.
+    // That way stop() (which joins the polling thread) runs before
+    // deinit() (which closes the fds the thread is reading from);
+    // otherwise the thread races against freed fds and may segfault.
     defer state.input_state.deinit();
+    defer state.input_state.stop();
 
     state.bigclock_label = BigLabel.init(
         &state.buffer,
