@@ -172,7 +172,16 @@ last_external_check: f64 = 0,
 // Per-cell shrink offset (in 0..SHRINK_OFFSET_MAX). Adds to
 // elapsed-frame shrink index so cells reach blank at slightly
 // different times.
-shrink_offset: ?[]u8 = null,
+// Per-cell START delay (0..255 → maps to [0, 0.5*SHRINK_SEC]). High
+// values delay this cell's shrink onset; spreads transitions across
+// the first half of the phase rather than firing on a single
+// heartbeat.
+shrink_t0: ?[]u8 = null,
+// Per-cell DURATION (0..255 → maps to [0.5*SHRINK_SEC, 1.5*SHRINK_SEC]).
+// Cells with longer durations shrink slower so they hit each
+// palette index at unique times; the visual effect is alive +
+// asynchronous instead of in lockstep.
+shrink_dur: ?[]u8 = null,
 // Per-cell scrambled codepoint for the scramble phase. Re-rolled
 // every SCRAMBLE_REROLL_FRAMES. Index 0 means "use snapshot".
 scramble_glyph: ?[]u21 = null,
@@ -257,10 +266,12 @@ pub fn attachHooks(
 }
 
 pub fn deinit(self: *Lockdown) void {
-    if (self.shrink_offset) |s| self.allocator.free(s);
+    if (self.shrink_t0) |s| self.allocator.free(s);
+    if (self.shrink_dur) |s| self.allocator.free(s);
     if (self.scramble_glyph) |s| self.allocator.free(s);
     if (self.snapshot) |s| self.allocator.free(s);
-    self.shrink_offset = null;
+    self.shrink_t0 = null;
+    self.shrink_dur = null;
     self.scramble_glyph = null;
     self.snapshot = null;
 }
@@ -458,19 +469,21 @@ fn allocatePerCell(self: *Lockdown, w: usize, h: usize) !void {
     self.buf_height = h;
     const n = w * h;
 
-    if (self.shrink_offset) |s| self.allocator.free(s);
+    if (self.shrink_t0) |s| self.allocator.free(s);
+    if (self.shrink_dur) |s| self.allocator.free(s);
     if (self.scramble_glyph) |s| self.allocator.free(s);
     if (self.snapshot) |s| self.allocator.free(s);
 
-    self.shrink_offset = try self.allocator.alloc(u8, n);
+    self.shrink_t0 = try self.allocator.alloc(u8, n);
+    self.shrink_dur = try self.allocator.alloc(u8, n);
     self.scramble_glyph = try self.allocator.alloc(u21, n);
     self.snapshot = try self.allocator.alloc(Cell, n);
 
-    // Per-cell offset spreads shrink-out times. Range [0..6] gives
-    // each cell up to ~SHRINK_SEC × 6/SHRINK_STEPS extra time.
-    for (self.shrink_offset.?) |*off| {
-        off.* = @intCast(self.buffer.random.uintLessThan(u32, 6));
-    }
+    // Per-cell randomised onset + duration. Full u8 range = 256
+    // distinct buckets, so for a 256×72 buffer roughly every cell
+    // hits a palette transition at a unique frame — no heartbeat.
+    for (self.shrink_t0.?) |*v| v.* = self.buffer.random.int(u8);
+    for (self.shrink_dur.?) |*v| v.* = self.buffer.random.int(u8);
     // Initialise scramble_glyph to 0 = "use snapshot".
     for (self.scramble_glyph.?) |*g| g.* = 0;
 }
@@ -612,22 +625,23 @@ pub fn phaseAtTime(start_epoch: f64, now: f64, tick_unlock_at: f64) Phase {
     return .end_unlock;
 }
 
-// Shrink index from elapsed seconds + per-cell offset. Returns a
-// value in 0..SHRINK_STEPS (inclusive of last = blank). Clamps to
-// SHRINK_STEPS-1 once past the shrink duration.
-pub fn shrinkIndex(elapsed: f64, total: f64, per_cell_offset: u8) u8 {
-    // Effective progress with per-cell offset baked in. The offset
-    // shifts the start of shrink for this cell by up to ~total/2;
-    // SCALE compresses so offset never overshoots SHRINK_STEPS-1.
-    const max_off = SHRINK_STEPS - 1;
-    const off_clamped: u8 = if (per_cell_offset > max_off) max_off else per_cell_offset;
-    const frac = if (total <= 0) 1.0 else elapsed / total;
-    // Map frac 0..1 → SHRINK_STEPS. Offset adds extra "lag" by
-    // subtracting from frac (cells with high offset shrink later).
-    const eff_frac = frac - (@as(f64, @floatFromInt(off_clamped)) / @as(f64, SHRINK_STEPS));
-    if (eff_frac <= 0) return 0;
-    const idx_f = eff_frac * @as(f64, SHRINK_STEPS);
-    var idx: u8 = @intFromFloat(@floor(idx_f));
+// Per-cell shrink index. Each cell has a random `t0` (start delay,
+// 0..255 maps to [0, 0.5*total]) and `dur` (duration, 0..255 maps
+// to [0.5*total, 1.5*total]). A cell stays at idx 0 until elapsed
+// passes its t0, then progresses through SHRINK_STEPS over its own
+// duration. The u8 spread means ~256 distinct schedules within the
+// shrink phase — at any frame, each cell is at a unique progress
+// point, so the dissolve reads as a live churn instead of all
+// cells flipping palette stages in lockstep.
+pub fn shrinkIndex(elapsed: f64, total: f64, t0: u8, dur: u8) u8 {
+    if (total <= 0) return SHRINK_STEPS - 1;
+    const t0_sec = (@as(f64, @floatFromInt(t0)) / 255.0) * 0.5 * total;
+    const dur_sec = (0.5 + @as(f64, @floatFromInt(dur)) / 255.0) * total;
+    const cell_elapsed = elapsed - t0_sec;
+    if (cell_elapsed <= 0) return 0;
+    if (cell_elapsed >= dur_sec) return SHRINK_STEPS - 1;
+    const frac = cell_elapsed / dur_sec;
+    var idx: u8 = @intFromFloat(@floor(frac * @as(f64, SHRINK_STEPS)));
     if (idx >= SHRINK_STEPS) idx = SHRINK_STEPS - 1;
     return idx;
 }
@@ -880,7 +894,8 @@ fn drawScramble(self: *Lockdown, buf: *TerminalBuffer) void {
 
 fn drawShrinkFade(self: *Lockdown, buf: *TerminalBuffer, now: f64) void {
     const snap = self.snapshot orelse return;
-    const offs = self.shrink_offset orelse return;
+    const t0s = self.shrink_t0 orelse return;
+    const durs = self.shrink_dur orelse return;
     const elapsed = now - self.phase_started;
     var y: usize = 0;
     while (y < self.buf_height) : (y += 1) {
@@ -892,7 +907,7 @@ fn drawShrinkFade(self: *Lockdown, buf: *TerminalBuffer, now: f64) void {
                 Cell.init(' ', BG, BG).put(x, y);
                 continue;
             }
-            const si = shrinkIndex(elapsed, SHRINK_SEC, offs[idx]);
+            const si = shrinkIndex(elapsed, SHRINK_SEC, t0s[idx], durs[idx]);
             const glyph = shrinkGlyph(@intCast(orig.ch), si);
             const fg = colorForShrink(orig.fg, si);
             Cell.init(@intCast(glyph), fg, BG).put(x, y);
@@ -975,21 +990,33 @@ test "phaseAtTime walks every phase in order" {
     try testing.expectEqual(Phase.end_unlock, phaseAtTime(t0, tick_until + 0.01, tick_until));
 }
 
-test "shrinkIndex ramps 0..STEPS-1" {
-    // No offset: at t=0 idx=0, at t=total idx≈STEPS-1.
-    try testing.expectEqual(@as(u8, 0), shrinkIndex(0.0, 2.0, 0));
-    try testing.expectEqual(@as(u8, 0), shrinkIndex(0.0001, 2.0, 0));
-    try testing.expect(shrinkIndex(2.0, 2.0, 0) == SHRINK_STEPS - 1);
-    // Linear mid: t=total/2 → ~STEPS/2.
-    const mid = shrinkIndex(1.0, 2.0, 0);
+test "shrinkIndex with t0=0,dur=128 ramps 0..STEPS-1" {
+    // dur=128 → dur_sec = (0.5 + 128/255) * 2.0 = ~2.0s
+    // t0=0 → no delay
+    try testing.expectEqual(@as(u8, 0), shrinkIndex(0.0, 2.0, 0, 128));
+    try testing.expectEqual(@as(u8, 0), shrinkIndex(0.0001, 2.0, 0, 128));
+    // At end of dur, should hit STEPS-1.
+    try testing.expectEqual(SHRINK_STEPS - 1, shrinkIndex(3.0, 2.0, 0, 128));
+    // Midpoint hits middle of palette.
+    const mid = shrinkIndex(1.0, 2.0, 0, 128);
     try testing.expect(mid >= 2 and mid <= 4);
 }
 
-test "shrinkIndex respects per-cell offset (later start)" {
-    // Cell with offset stays at 0 longer than cell without offset.
-    const no_off = shrinkIndex(0.5, 2.0, 0);
-    const with_off = shrinkIndex(0.5, 2.0, 3);
-    try testing.expect(with_off <= no_off);
+test "shrinkIndex t0 delays start" {
+    // Cell with t0=255 waits longer to start shrinking than t0=0.
+    const no_t0 = shrinkIndex(0.5, 2.0, 0, 128);
+    const with_t0 = shrinkIndex(0.5, 2.0, 255, 128);
+    try testing.expect(with_t0 <= no_t0);
+    // t0=255 → t0_sec = 1.0s, so at elapsed=0.5 cell hasn't started.
+    try testing.expectEqual(@as(u8, 0), with_t0);
+}
+
+test "shrinkIndex dur affects rate" {
+    // Cell with dur=0 (fastest, 0.5*total) reaches blank earlier
+    // than cell with dur=255 (slowest, 1.5*total).
+    const fast = shrinkIndex(1.0, 2.0, 0, 0);
+    const slow = shrinkIndex(1.0, 2.0, 0, 255);
+    try testing.expect(fast >= slow);
 }
 
 test "shrinkGlyph maps idx to palette" {
