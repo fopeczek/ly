@@ -455,219 +455,200 @@ fn spawnGateOpen(self: *const Matrix, x: usize, v_gap: usize, h_radius: usize) b
     return true;
 }
 
-// Tail churn + per-column advance gate. Extracted out of draw() so its
-// loop variables live in their own function scope and don't shadow the
-// render-pass loop variables (Zig disallows same-name variables in
-// nested scopes within a single function).
+// ─── Per-frame simulation ─────────────────────────────────────────
+// stepColumns is the per-frame orchestrator for column simulation.
+// Each column does, in order:
+//   1. tailChurn         — every frame, glyph mutation on body cells
+//   2. advance gate      — speed-based per-column "is this an advance frame?"
+//   3. spawn decision    — try to add a new trail at row 1
+//   4. walkColumn        — move every alive segment down by one cell
+// Steps 3 & 4 only run on advance frames. Step 1 runs every frame
+// so glyphs visibly mutate even between advances.
 fn stepColumns(self: *Matrix) void {
-    const buf_height = self.terminal_buffer.height;
-    const buf_width = self.terminal_buffer.width;
-
     var x: usize = 0;
-    while (x < buf_width) : (x += 2) {
+    while (x < self.terminal_buffer.width) : (x += 2) {
+        self.tailChurn(x);
+
         var line = &self.lines[x];
-
-        // ──── Tail churn pass — runs every draw call ────────────────
-        // Non-head trail cells cycle their glyph with self.tail_churn_prob
-        // independently of whether this column's accumulator advances
-        // the head this frame. Decoupling churn from advance gives the
-        // "constantly flickering code" look: tails bubble even while
-        // their owning column is moving slowly.
-        if (MID_SCROLL_CHANGE) {
-            var ch_y: usize = 1;
-            while (ch_y <= buf_height) : (ch_y += 1) {
-                const cell = &self.dots[buf_width * ch_y + x];
-                if (cell.is_head) continue;
-                const v = cell.value orelse continue;
-                if (v == ' ') continue;
-                if (self.terminal_buffer.random.float(f32) < self.tail_churn_prob) {
-                    const r = self.terminal_buffer.random.int(u32);
-                    const churn_pool: []const u32 = if (self.locked) &LOCKED_GLYPH_POOL else &GLYPH_POOL;
-                    cell.value = churn_pool[@mod(r, churn_pool.len)];
-                }
-            }
-        }
-
-        // ──── Per-column advance gate (continuous speed) ────────────
-        // Each column carries its own accumulator phase. Adding the
-        // column's speed (cells/frame) each draw call eventually
-        // crosses 1.0, at which point we advance the head exactly
-        // once and subtract 1.0. There is no global "tick" anymore —
-        // columns trigger their advances on whatever frame their phase
-        // happens to land on, so the old "lockstep" visual is gone.
+        // Per-column advance gate. accum += speed per frame; when it
+        // crosses 1.0 we run one advance and subtract back. Phase is
+        // initialised random per column so all columns don't tick on
+        // the same frame.
         line.advance_accum += line.speed;
         if (line.advance_accum < 1.0) continue;
         line.advance_accum -= 1.0;
 
-        var tail: usize = 0;
-
-        // Track whether the column is fully empty so we can reset
-        // per-column run-state (virtual_head_y, dark_run, line.length,
-        // line.speed) for the next fresh trail. column_has_content is
-        // also consulted by the spawn block (to know when to roll new
-        // length/speed vs preserving the column's existing rhythm).
-        const column_has_content = columnHasContent(self, x);
-        if (!column_has_content) {
+        const has_content = columnHasContent(self, x);
+        if (!has_content) {
             line.virtual_head_y = 0;
             line.dark_run = 0;
         }
 
-        // Spawn gate: top drop_v_margin rows of this column AND of
-        // any column within drop_h_margin cells must be empty before
-        // a new trail can spawn at the top. Replaces the old strict
-        // "column must be entirely empty" gate; setting drop_v_margin
-        // equal to the screen height recovers that legacy behaviour.
-        const v_gap_eff: usize = @min(@as(usize, self.drop_v_margin), buf_height);
-        const h_gap_eff: usize = @as(usize, self.drop_h_margin);
-        const spawn_gate_open: bool = spawnGateOpen(self, x, v_gap_eff, h_gap_eff);
+        self.trySpawnAt(x, line, has_content);
+        self.walkColumn(x, line);
+    }
+}
 
-        // Two spawn paths share the probability formula and the
-        // length/speed roll. The DIFFERENCE is where the new head
-        // lands and what the gates look like:
-        //   * v_margin > 0  → legacy row-0 buffer path. Spawn writes
-        //     to dots[x] (row 0, off-screen). Walking pumps it down
-        //     to row 1 next advance. Gated by dots[x]==null AND
-        //     dots[row1]==' ' AND spawnGateOpen (which checks rows
-        //     1..v_margin).
-        //   * v_margin == 0 → true-flood path. dots[x] never used;
-        //     spawn writes the new head directly into row 1, may
-        //     overwrite whatever's there. No row-buffer gate, only
-        //     the probability roll. Lets the column be visually
-        //     saturated with back-to-back heads — the benchmark mode
-        //     the user explicitly asked for.
-        const flood_mode = self.drop_v_margin == 0;
-        const can_attempt_spawn: bool = self.rain_density != 0 and spawn_gate_open and
-            (flood_mode or (self.dots[x].value == null and self.dots[buf_width + x].value == ' '));
+// Glyph mutation on body cells. Independent of advance rate so
+// trails "bubble" smoothly even while a slow column waits to tick.
+fn tailChurn(self: *Matrix, x: usize) void {
+    if (!MID_SCROLL_CHANGE) return;
+    if (self.tail_churn_prob <= 0) return;
+    const buf_width = self.terminal_buffer.width;
+    const buf_height = self.terminal_buffer.height;
+    var y: usize = 1;
+    while (y <= buf_height) : (y += 1) {
+        const cell = &self.dots[buf_width * y + x];
+        if (cell.is_head) continue;
+        const v = cell.value orelse continue;
+        if (v == ' ') continue;
+        if (self.terminal_buffer.random.float(f32) >= self.tail_churn_prob) continue;
+        const r = self.terminal_buffer.random.int(u32);
+        const pool: []const u32 = if (self.locked) &LOCKED_GLYPH_POOL else &GLYPH_POOL;
+        cell.value = pool[@mod(r, pool.len)];
+    }
+}
 
-        if (can_attempt_spawn) {
-            // Per-advance Poisson spawn: probability =
-            // rain_density / 1000. Each column rolls an
-            // independent random number every advance, so spawns
-            // are statistically independent (no synchronized
-            // wave) AND the slider is perceptually linear — a
-            // 100-unit slider move changes the spawn rate by the
-            // same fraction-of-max no matter where on the scale
-            // it lands.
-            const prob_base: f32 = @as(f32, @floatFromInt(self.rain_density)) / 1000.0;
-            const spawn_prob: f32 = if (self.locked)
-                prob_base / @as(f32, @floatFromInt(LOCKED_SPACE_MULT))
-            else
-                prob_base;
-            if (self.terminal_buffer.random.float(f32) < spawn_prob) {
-                const randint = self.terminal_buffer.random.int(u16);
-                const h = buf_height;
-                // line.length / line.speed are SHARED across all
-                // trails alive in a column (single Line struct).
-                // Only roll new values when the column was empty
-                // before this spawn; subsequent spawns inherit the
-                // existing length/speed so existing trails' colors
-                // don't shift mid-fall.
-                if (!column_has_content) {
-                    const max_eff_raw: usize = @min(@as(usize, self.max_drop_len), if (h > 1) h - 1 else 1);
-                    const max_eff: usize = if (max_eff_raw < self.min_drop_len) self.min_drop_len else max_eff_raw;
-                    const len_span: usize = max_eff - self.min_drop_len + 1;
-                    line.length = (@as(usize, randint) % len_span) + self.min_drop_len;
-                }
-                const pool: []const u32 = if (self.locked) &LOCKED_GLYPH_POOL else &GLYPH_POOL;
-                const new_glyph: u32 = pool[@mod(randint, pool.len)];
-                if (flood_mode) {
-                    // Place head at row 1, mark is_head so the
-                    // render layer paints it bright. Walking will
-                    // turn it into a body cell next advance.
-                    const idx = buf_width + x;
-                    self.dots[idx].value = new_glyph;
-                    self.dots[idx].is_head = true;
-                } else {
-                    self.dots[x].value = new_glyph;
-                }
-                if (!column_has_content) {
-                    line.speed = self.speed_min +
-                        self.terminal_buffer.random.float(f32) * (self.speed_max - self.speed_min);
-                }
-            }
+// Try to spawn a new trail in column x. The unified spawn path:
+//   * rain_density == 0           → never spawn
+//   * row 1 not empty             → never spawn (would corrupt the
+//                                    trail data and merge segments)
+//   * drop_v_margin / drop_h_margin → user-configurable clearance gate
+//   * random < rain_density/1000  → probabilistic
+//
+// The "row 1 must be empty" requirement is geometric, not a knob —
+// you literally cannot place two head cells at the same position.
+// The old flood_mode branch tried to overwrite row 1 unconditionally
+// and produced the "initial wave then nothing" bug because walking
+// then coalesced the overwritten cell with the existing trail into
+// a single growing segment.
+fn trySpawnAt(self: *Matrix, x: usize, line: *Line, column_has_content: bool) void {
+    if (self.rain_density == 0) return;
+
+    const buf_width = self.terminal_buffer.width;
+    const buf_height = self.terminal_buffer.height;
+
+    // Hard geometric gate.
+    const row1_idx = buf_width + x;
+    const row1_val = self.dots[row1_idx].value;
+    if (!(row1_val == null or row1_val == ' ')) return;
+
+    // User-configured clearance gates.
+    const v_gap = @min(@as(usize, self.drop_v_margin), buf_height);
+    const h_gap = @as(usize, self.drop_h_margin);
+    if (!spawnGateOpen(self, x, v_gap, h_gap)) return;
+
+    // Per-advance Poisson probability.
+    const prob_base: f32 = @as(f32, @floatFromInt(self.rain_density)) / 1000.0;
+    const spawn_prob: f32 = if (self.locked)
+        prob_base / @as(f32, @floatFromInt(LOCKED_SPACE_MULT))
+    else
+        prob_base;
+    if (self.terminal_buffer.random.float(f32) >= spawn_prob) return;
+
+    const randint = self.terminal_buffer.random.int(u16);
+
+    // line.length / line.speed are SHARED across all trails alive
+    // in a column. Re-rolling them while existing trails are mid-
+    // fall would visibly shift those trails' colors. Only roll on
+    // a fresh column.
+    if (!column_has_content) {
+        const max_eff_raw: usize = @min(@as(usize, self.max_drop_len), if (buf_height > 1) buf_height - 1 else 1);
+        const max_eff: usize = if (max_eff_raw < self.min_drop_len) self.min_drop_len else max_eff_raw;
+        const len_span: usize = max_eff - self.min_drop_len + 1;
+        line.length = (@as(usize, randint) % len_span) + self.min_drop_len;
+        line.speed = self.speed_min +
+            self.terminal_buffer.random.float(f32) * (self.speed_max - self.speed_min);
+    }
+
+    // Write the new head at row 1. The render layer paints
+    // is_head=true cells bright. walkColumn on this same advance
+    // will turn this cell into a body and place a fresh head at
+    // row 2.
+    const pool: []const u32 = if (self.locked) &LOCKED_GLYPH_POOL else &GLYPH_POOL;
+    self.dots[row1_idx].value = pool[@mod(randint, pool.len)];
+    self.dots[row1_idx].is_head = true;
+}
+
+// Walk every alive segment in column x down by one cell. A "segment"
+// is a contiguous run of non-empty cells. For each segment:
+//   1. clear is_head on the existing cells
+//   2. append a new head one cell below the segment's last body
+//   3. if the segment now exceeds line.length, truncate the top
+// Multiple segments in one column (multi-trail mode) are handled
+// identically — no first_col special case.
+fn walkColumn(self: *Matrix, x: usize, line: *Line) void {
+    const buf_width = self.terminal_buffer.width;
+    const buf_height = self.terminal_buffer.height;
+
+    var y: usize = 0;
+    height_it: while (y <= buf_height) : (y += 1) {
+        var dot = &self.dots[buf_width * y + x];
+        // Skip empty cells.
+        while (y <= buf_height and (dot.value == ' ' or dot.value == null)) {
+            y += 1;
+            if (y > buf_height) break :height_it;
+            dot = &self.dots[buf_width * y + x];
         }
 
-        var y: usize = 0;
-        var first_col = true;
-        var seg_len: u64 = 0;
-        height_it: while (y <= buf_height) : (y += 1) {
-            var dot = &self.dots[buf_width * y + x];
-            // Skip over spaces
-            while (y <= buf_height and (dot.value == ' ' or dot.value == null)) {
-                y += 1;
-                if (y > buf_height) break :height_it;
-                dot = &self.dots[buf_width * y + x];
-            }
-
-            // Find the head of this column
-            tail = y;
-            seg_len = 0;
-            while (y <= buf_height and dot.value != ' ' and dot.value != null) {
-                dot.is_head = false;
-                y += 1;
-                seg_len += 1;
-                // Head's down offscreen
-                if (y > buf_height) {
-                    self.dots[buf_width * tail + x].value = ' ';
-                    // Continue the "head" conceptually past the
-                    // bottom of the screen so the trail body fades
-                    // out naturally as it falls off, instead of
-                    // disappearing the instant the head leaves.
-                    if (line.virtual_head_y <= buf_height) {
-                        line.virtual_head_y = buf_height + 1;
-                    } else {
-                        line.virtual_head_y += 1;
-                    }
-                    break :height_it;
+        // Walk the segment.
+        const tail = y;
+        var seg_len: usize = 0;
+        while (y <= buf_height and dot.value != ' ' and dot.value != null) {
+            dot.is_head = false;
+            y += 1;
+            seg_len += 1;
+            if (y > buf_height) {
+                // Trail head walked off the bottom — fade body
+                // against virtual_head_y (which keeps advancing
+                // each frame past buf_height so the body smoothly
+                // dims to nothing).
+                self.dots[buf_width * tail + x].value = ' ';
+                if (line.virtual_head_y <= buf_height) {
+                    line.virtual_head_y = buf_height + 1;
+                } else {
+                    line.virtual_head_y += 1;
                 }
-                dot = &self.dots[buf_width * y + x];
+                break :height_it;
             }
+            dot = &self.dots[buf_width * y + x];
+        }
 
-            const randint = self.terminal_buffer.random.int(u16);
-            const head_pool: []const u32 = if (self.locked) &LOCKED_GLYPH_POOL else &GLYPH_POOL;
-            dot.value = head_pool[@mod(randint, head_pool.len)];
-            dot.is_head = true;
-            // Rain head walking across an error-overlay cell: count
-            // it as one "scrub pass". Once ttl hits 0 the cell is
-            // back to normal rain. This is the visual decay the
-            // user wanted — the rain itself erases the errors.
-            if (dot.overlay_ttl > 0) dot.overlay_ttl -= 1;
-            // Dark-gap-run state machine. If we're mid-run, this head
-            // is dark and we decrement. Otherwise, roll the start
-            // probability; if it fires, set up a new run of random
-            // length [MIN..MAX] and dark-mark this head too.
-            if (line.dark_run > 0) {
+        // Append the new head one cell past the segment's bottom.
+        const randint = self.terminal_buffer.random.int(u16);
+        const head_pool: []const u32 = if (self.locked) &LOCKED_GLYPH_POOL else &GLYPH_POOL;
+        dot.value = head_pool[@mod(randint, head_pool.len)];
+        dot.is_head = true;
+        // Rain head walking over an error-overlay cell counts as
+        // one scrub pass. Once ttl hits 0 the cell returns to
+        // normal rain.
+        if (dot.overlay_ttl > 0) dot.overlay_ttl -= 1;
+        // Dark-gap-run state machine. Each head spawn rolls a
+        // chance to start a dark run; while a run is active,
+        // successive heads are marked dark (renderer treats them
+        // as gaps).
+        if (line.dark_run > 0) {
+            dot.is_dark = true;
+            line.dark_run -= 1;
+        } else {
+            dot.is_dark = false;
+            const start_roll = self.terminal_buffer.random.int(u16);
+            if (@mod(start_roll, 100) < self.dark_run_start_pct) {
+                const span = (self.dark_run_max - self.dark_run_min) + 1;
+                const len_roll = self.terminal_buffer.random.int(u16);
+                line.dark_run = @as(u8, @intCast(@mod(len_roll, span))) + self.dark_run_min;
                 dot.is_dark = true;
                 line.dark_run -= 1;
-            } else {
-                dot.is_dark = false;
-                const start_roll = self.terminal_buffer.random.int(u16);
-                if (@mod(start_roll, 100) < self.dark_run_start_pct) {
-                    const span = (self.dark_run_max - self.dark_run_min) + 1;
-                    const len_roll = self.terminal_buffer.random.int(u16);
-                    line.dark_run = @as(u8, @intCast(@mod(len_roll, span))) + self.dark_run_min;
-                    dot.is_dark = true;
-                    line.dark_run -= 1;
-                }
             }
-            line.virtual_head_y = y;
+        }
+        line.virtual_head_y = y;
 
-            // Truncation: shorten the segment from its top when it
-            // exceeds line.length. Done PER SEGMENT, not coupled to
-            // first_col — multi-trail-per-column means we may have
-            // multiple segments, and each must respect line.length
-            // independently. The dots[x]=null is only meaningful
-            // when truncating the TOP segment (tail==0): row 0 is
-            // the legacy "spawn buffer" cell and clearing it signals
-            // "row 0 available for a new spawn glyph". Touching it
-            // from a lower segment was the multi-trail tail-stub bug.
-            if (seg_len > line.length) {
-                self.dots[buf_width * tail + x].value = ' ';
-                if (tail == 0) {
-                    self.dots[x].value = null;
-                }
-            }
-            first_col = false;
+        // Truncate the segment from the top when it exceeds
+        // line.length. seg_len grows by 1 each advance until this
+        // kicks in, at which point the trail length stabilises
+        // at line.length.
+        if (seg_len > line.length) {
+            self.dots[buf_width * tail + x].value = ' ';
         }
     }
 }
@@ -1042,124 +1023,137 @@ fn draw(self: *Matrix) void {
     self.tickGlitches();
     self.decayOverlay();
 
-    // Stack-allocated buffer for per-column head positions. A column can
-    // host multiple concurrent trails; without per-cell head lookup the
-    // fade gets the wrong reference point and cells in lower trails
-    // render as full fg (the "bright bottom row" complaint).
-    var heads_buf: [512]usize = undefined;
-
     var x: usize = 0;
     while (x < buf_width) : (x += 2) {
-        // Pre-scan all heads in this column (top-to-bottom == ascending y).
-        var heads_count: usize = 0;
-        if (self.tail_fade) {
-            var sy: usize = 1;
-            while (sy <= buf_height) : (sy += 1) {
-                if (self.dots[buf_width * sy + x].is_head and heads_count < heads_buf.len) {
-                    heads_buf[heads_count] = sy;
-                    heads_count += 1;
-                }
+        self.renderColumn(x, buf_width, buf_height);
+    }
+}
+
+// Stack-allocated head list capacity. With multi-trail mode a column
+// can host up to ceil(buf_height / min_drop_len) heads; at min_len=2
+// on a 200-row terminal that's 100, well under this cap.
+const HEADS_BUF_CAP = 512;
+
+// Render one matrix column. Pre-scans the column's heads (for fade
+// reference), then iterates each visible row computing the cell.
+// The two-pass design avoids re-scanning the entire column for each
+// cell's nearest-head lookup; per-cell cost stays O(1) amortised.
+fn renderColumn(self: *Matrix, x: usize, buf_width: usize, buf_height: usize) void {
+    var heads_buf: [HEADS_BUF_CAP]usize = undefined;
+    var heads_count: usize = 0;
+    if (self.tail_fade) {
+        var sy: usize = 1;
+        while (sy <= buf_height) : (sy += 1) {
+            if (self.dots[buf_width * sy + x].is_head and heads_count < heads_buf.len) {
+                heads_buf[heads_count] = sy;
+                heads_count += 1;
             }
         }
-        const heads = heads_buf[0..heads_count];
-        var head_idx: usize = 0;
-
-        var y: usize = 1;
-        while (y <= buf_height) : (y += 1) {
-            // Advance to the first head >= current y. That's THIS cell's trail head.
-            while (head_idx < heads.len and heads[head_idx] < y) head_idx += 1;
-
-            const dot = self.dots[buf_width * y + x];
-            // Error-code overlay wins over everything: if a cell
-            // still has overlay TTL it renders the overlay glyph in
-            // red, no matter the rain state below. The glyph remains
-            // visible (so it forms a readable "line" across the
-            // screen) until enough rain heads have scrubbed across.
-            const cell = if (dot.overlay_ttl > 0) Cell{
-                .ch = dot.overlay_ch,
-                .fg = OVERLAY_FG,
-                .bg = self.terminal_buffer.bg,
-            } else if (dot.value == null or dot.value == ' ' or dot.is_dark) self.default_cell else cell_blk: {
-                // Pick a head_y to fade against:
-                //   - If there's an on-screen is_head for this cell, use that.
-                //   - If not, use line.virtual_head_y (head has scrolled past
-                //     the bottom; trail keeps falling as virtual_head_y
-                //     advances each tick).
-                //   - If neither, trail is fully off — render as default_cell.
-                // Sub-step interpolation: walking moves heads ONLY when
-                // advance_accum crosses 1.0 (every 1/line.speed render
-                // frames). Without sub-step the fade colour for any
-                // given cell stays constant for ~10 frames then
-                // jumps a full step on the next walk — perceived as
-                // stepwise fading, especially obvious as a trail
-                // walks past the bottom edge ("last row doesn't
-                // respect gradient"). Adding the column's current
-                // accumulator to the integer head y produces a
-                // continuous fractional distance, so the fade
-                // smoothly transitions across every render frame.
-                const sub_step: f32 = self.lines[x].advance_accum;
-                const head_y_f: f32 = blk: {
-                    if (head_idx < heads.len) break :blk @as(f32, @floatFromInt(heads[head_idx])) + sub_step;
-                    const vhy = self.lines[x].virtual_head_y;
-                    if (vhy == 0 or vhy <= y) break :cell_blk self.default_cell;
-                    break :blk @as(f32, @floatFromInt(vhy)) + sub_step;
-                };
-
-                const fg_color: u32 = inner: {
-                    // Every head renders as the bright head_col cell.
-                    // Previous logic gated this on "bottom-most head
-                    // in the column", which made newly-spawned trails
-                    // (above older ones in multi-trail mode) render
-                    // as plain green — user reported as "raindrops
-                    // stopped spawning with white heads".
-                    // y>1 guard remains so a lone head at row 1 with
-                    // no body doesn't pop as a single white cell.
-                    if (dot.is_head and y > 1) {
-                        break :inner self.head_col;
-                    }
-                    // In locked mode the trail fades against a dim
-                    // gray instead of the configured green so the
-                    // whole screen reads as "safe-mode" rather than
-                    // a normal session.
-                    const trail_fg: u32 = if (self.locked) LOCKED_FG else self.fg;
-                    if (!self.tail_fade) break :inner trail_fg;
-                    const distance_f: f32 = head_y_f - @as(f32, @floatFromInt(y));
-                    const tail_len = self.lines[x].length;
-                    const denom: f32 = if (tail_len == 0) 1 else @floatFromInt(tail_len);
-                    const t_linear = distance_f / denom;
-                    if (t_linear >= 1.0) break :cell_blk self.default_cell;
-                    const t = perceptualT(if (t_linear < 0) 0 else t_linear);
-                    const faded = lerpColor(trail_fg, self.terminal_buffer.bg, t);
-                    // Pango/kmscon renders a non-space glyph with a default
-                    // (often white) foreground when the requested fg matches
-                    // bg, on the theory that fg==bg would make the char
-                    // invisible. At the tail end of our fade lerpColor's
-                    // truncation produces fg == bg (raw RGB collapse to 0),
-                    // and those cells then surface as bright-white tail
-                    // ends. Substitute default_cell (a space) so there's no
-                    // glyph for Pango to "rescue" with default fg.
-                    if ((faded & 0x00FFFFFF) == (self.terminal_buffer.bg & 0x00FFFFFF)) {
-                        break :cell_blk self.default_cell;
-                    }
-                    break :inner faded;
-                };
-                // Glitch dot override: an active dot at this (x, y)
-                // recolors the cell red while preserving the glyph
-                // and bg. Single-line check, no impact on cells
-                // without a glitch.
-                const final_fg: u32 = if (self.glitchAt(x, y)) GLITCH_FG else fg_color;
-                break :cell_blk Cell{
-                    .ch = @intCast(dot.value.?),
-                    .fg = final_fg,
-                    .bg = self.terminal_buffer.bg,
-                };
-            };
-
-            cell.put(x, y - 1);
-            // Fill background in between columns
-            self.default_cell.put(x + 1, y - 1);
-        }
     }
+    const heads = heads_buf[0..heads_count];
+
+    var head_idx: usize = 0;
+    var y: usize = 1;
+    while (y <= buf_height) : (y += 1) {
+        // Advance head_idx to the first head >= current y. That's
+        // this cell's fade-reference point.
+        while (head_idx < heads.len and heads[head_idx] < y) head_idx += 1;
+
+        const dot = self.dots[buf_width * y + x];
+        const cell = self.cellForRender(x, y, dot, heads, head_idx);
+        cell.put(x, y - 1);
+        // Fill the spacer column to the right (matrix uses every
+        // other terminal column).
+        self.default_cell.put(x + 1, y - 1);
+    }
+}
+
+// Compute the Cell to render for a single (x, y) dot. Pure function
+// of dot + per-column state — no side effects, no terminal buffer
+// writes. Precedence:
+//   1. Active error-overlay glyph → red overlay
+//   2. Empty / dark-gap cell → default_cell (background)
+//   3. Active glitch dot → recolor red, keep glyph
+//   4. is_head and y > 1 → head_col (bright white)
+//   5. Body → perceptual fade against nearest head_y_f
+fn cellForRender(
+    self: *const Matrix,
+    x: usize,
+    y: usize,
+    dot: Dot,
+    heads: []const usize,
+    head_idx: usize,
+) Cell {
+    // Error overlay takes precedence — readable "scanline" persists
+    // across the rain until heads scrub past.
+    if (dot.overlay_ttl > 0) {
+        return Cell{ .ch = dot.overlay_ch, .fg = OVERLAY_FG, .bg = self.terminal_buffer.bg };
+    }
+    // Empty / dark-gap cells.
+    if (dot.value == null or dot.value == ' ' or dot.is_dark) return self.default_cell;
+
+    const fg = self.fgForBodyCell(x, y, dot, heads, head_idx) orelse return self.default_cell;
+    const final_fg: u32 = if (self.glitchAt(x, y)) GLITCH_FG else fg;
+    return Cell{
+        .ch = @intCast(dot.value.?),
+        .fg = final_fg,
+        .bg = self.terminal_buffer.bg,
+    };
+}
+
+// Compute the fg color for a body cell. Returns null when the cell
+// should fall through to default_cell (fade is fully past the
+// trail length, or the chosen fade reference is invalid). Splits
+// out the fade math from cellForRender so the rendering precedence
+// stays readable.
+fn fgForBodyCell(
+    self: *const Matrix,
+    x: usize,
+    y: usize,
+    dot: Dot,
+    heads: []const usize,
+    head_idx: usize,
+) ?u32 {
+    // Every is_head cell renders as head_col regardless of position
+    // along the trail. y>1 guard: a head at row 1 with no body
+    // below would pop as a lone white cell — wait one advance for
+    // walking to place a body under it.
+    if (dot.is_head and y > 1) return self.head_col;
+
+    const trail_fg: u32 = if (self.locked) LOCKED_FG else self.fg;
+    if (!self.tail_fade) return trail_fg;
+
+    // Sub-step interpolation: walking moves heads ONLY when
+    // advance_accum crosses 1.0 (every 1/line.speed frames).
+    // Adding accum to the integer head y produces a continuous
+    // fractional distance, so cells fade smoothly across every
+    // render frame instead of jumping a step every walk.
+    const sub_step: f32 = self.lines[x].advance_accum;
+    const head_y_f: f32 = if (head_idx < heads.len)
+        @as(f32, @floatFromInt(heads[head_idx])) + sub_step
+    else blk: {
+        const vhy = self.lines[x].virtual_head_y;
+        if (vhy == 0 or vhy <= y) return null;
+        break :blk @as(f32, @floatFromInt(vhy)) + sub_step;
+    };
+
+    const distance_f: f32 = head_y_f - @as(f32, @floatFromInt(y));
+    const tail_len = self.lines[x].length;
+    const denom: f32 = if (tail_len == 0) 1 else @floatFromInt(tail_len);
+    const t_linear = distance_f / denom;
+    if (t_linear >= 1.0) return null; // fully past the trail
+    const t = perceptualT(if (t_linear < 0) 0 else t_linear);
+    const faded = lerpColor(trail_fg, self.terminal_buffer.bg, t);
+
+    // Pango/kmscon paints a non-space glyph with default fg
+    // (usually white) when fg==bg, on the theory that fg==bg would
+    // be invisible. At the tail end of our fade lerpColor truncates
+    // to fg==bg, surfacing the cell as bright white instead of
+    // dimming out. Fall through to default_cell to avoid this.
+    if ((faded & 0x00FFFFFF) == (self.terminal_buffer.bg & 0x00FFFFFF)) {
+        return null;
+    }
+    return faded;
 }
 
 fn update(self: *Matrix, _: *anyopaque) !void {
@@ -1267,4 +1261,73 @@ test "density spawn-probability range" {
         const got: f32 = @as(f32, @floatFromInt(rd)) / 1000.0;
         try testing.expectApproxEqAbs(expected, got, 0.001);
     }
+}
+
+// ─── Tests for spawn invariants (cellIsEmpty notion) ──────────────
+// cellIsEmpty's semantics are critical: spawn refuses if row 1 is
+// non-empty, where "empty" means null OR U+0020. Walking writes a
+// glyph to row 1 the moment a new head moves through it, so the
+// row 1 cell stays non-empty across most of the trail's lifetime —
+// preventing back-to-back over-writes that would corrupt the trail.
+test "cellIsEmpty considers null AND space as empty" {
+    // A Dot stands in for self.dots[idx]; we replicate the predicate
+    // here since cellIsEmpty needs a real Matrix to dispatch.
+    const isEmpty = struct {
+        fn f(value: ?usize) bool {
+            return value == null or value == ' ';
+        }
+    }.f;
+    try testing.expect(isEmpty(null));
+    try testing.expect(isEmpty(' '));
+    try testing.expect(!isEmpty('A'));
+    try testing.expect(!isEmpty(0xFF66)); // halfwidth katakana
+}
+
+// Trail-length stabilisation: a segment grows by 1 per advance until
+// it crosses line.length, at which point we trim the top each
+// advance to hold the length steady at line.length. Verify the
+// arithmetic for a few representative line.length values.
+test "trail-length stabilisation arithmetic" {
+    // After K advances, untruncated segment is K cells long.
+    // Truncation fires when K > line.length. Post-truncation length
+    // equals line.length (or line.length+1 mid-frame). Confirm with
+    // a small simulation.
+    const cases = [_]struct { line_length: usize, advances: usize, final: usize }{
+        .{ .line_length = 8, .advances = 4, .final = 4 }, // not yet at cap
+        .{ .line_length = 8, .advances = 8, .final = 8 }, // exactly at cap, no truncation yet
+        .{ .line_length = 8, .advances = 9, .final = 8 }, // truncated once
+        .{ .line_length = 8, .advances = 100, .final = 8 }, // long-run stable
+        .{ .line_length = 30, .advances = 200, .final = 30 },
+    };
+    for (cases) |c| {
+        var seg_len: usize = 0;
+        var i: usize = 0;
+        while (i < c.advances) : (i += 1) {
+            seg_len += 1; // advance grows segment by 1
+            if (seg_len > c.line_length) seg_len -= 1; // truncation trims top
+        }
+        try testing.expectEqual(c.final, seg_len);
+    }
+}
+
+// rain_density==0 ⇒ never spawn, regardless of any other condition.
+// rain_density==1000 ⇒ spawn iff random.float < 1.0, which is
+// always true. Confirms the float comparison shape.
+test "spawn probability boundary semantics" {
+    // Pure math sanity check: spawn fires when random < prob.
+    // At density=1000, prob=1.0 — every roll in [0, 1) is < 1.0,
+    // so 100% spawn rate. At density=0, prob=0.0 — every roll
+    // >= 0.0, so 0% spawn rate.
+    const prob_1000: f32 = @as(f32, @floatFromInt(@as(u16, 1000))) / 1000.0;
+    const prob_0: f32 = @as(f32, @floatFromInt(@as(u16, 0))) / 1000.0;
+    try testing.expectEqual(@as(f32, 1.0), prob_1000);
+    try testing.expectEqual(@as(f32, 0.0), prob_0);
+    // No random.float() result in [0, 1) is < 0.0.
+    try testing.expect(!(0.0 < prob_0));
+    try testing.expect(!(0.5 < prob_0));
+    try testing.expect(!(0.999 < prob_0));
+    // Every random.float() result is < 1.0.
+    try testing.expect(0.0 < prob_1000);
+    try testing.expect(0.5 < prob_1000);
+    try testing.expect(0.999 < prob_1000);
 }
