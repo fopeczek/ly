@@ -528,15 +528,25 @@ fn trySpawnAt(self: *Matrix, x: usize, line: *Line, column_has_content: bool) vo
     const buf_width = self.terminal_buffer.width;
     const buf_height = self.terminal_buffer.height;
 
-    // Hard geometric gate.
-    const row1_idx = buf_width + x;
-    const row1_val = self.dots[row1_idx].value;
-    if (!(row1_val == null or row1_val == ' ')) return;
-
-    // User-configured clearance gates.
-    const v_gap = @min(@as(usize, self.drop_v_margin), buf_height);
+    // Effective vertical gate: at least 2 rows must be empty above
+    // the spawn point. WHY: spawn writes a head at row 1, walking
+    // advances it to row 2 in the same frame (new trail occupies
+    // rows 1..2 post-walk). For the next walk pass to keep the new
+    // trail separate from any existing trail in the column, there
+    // has to be at least one EMPTY cell between them — which means
+    // row 3 must be empty at spawn time. Hence min effective gap
+    // of 2 (rows 1..2 = spawn target + walk step; user-visible
+    // drop_v_margin adds rows on top for visual spacing). Without
+    // this clamp the walking layer coalesces adjacent non-empty
+    // cells into ONE segment and we get a single shifting trail
+    // per column instead of multi-trail — the bug the user saw as
+    // "big wave then nothing".
+    const v_user = @min(@as(usize, self.drop_v_margin), buf_height);
+    const v_gap: usize = @max(v_user, 2);
     const h_gap = @as(usize, self.drop_h_margin);
     if (!spawnGateOpen(self, x, v_gap, h_gap)) return;
+
+    const row1_idx = buf_width + x;
 
     // Per-advance Poisson probability.
     const prob_base: f32 = @as(f32, @floatFromInt(self.rain_density)) / 1000.0;
