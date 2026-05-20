@@ -56,7 +56,6 @@ pub const Item = enum {
     overlay_decay_frames,
     overlay_drop_peak_prob,
     overlay_scramble_prob,
-    overlay_fall_step,
     action_error_burst,
     action_clear_errors,
     // Lockout tab
@@ -97,9 +96,8 @@ pub const Item = enum {
             .overlay_initial_ttl => "sticky passes   ",
             .overlay_lines_per_burst => "lines per fail  ",
             .overlay_decay_frames => "fade time       ",
-            .overlay_drop_peak_prob => "fall chance     ",
+            .overlay_drop_peak_prob => "fall rate       ",
             .overlay_scramble_prob => "char corrupt    ",
-            .overlay_fall_step => "fall step       ",
             .action_error_burst => "[ trigger fail  ]",
             .action_clear_errors => "[ clear errors  ]",
             // Lockout
@@ -148,9 +146,8 @@ pub const Item = enum {
             .overlay_initial_ttl => "How many rain heads\nmust pass before an\nerror char is wiped.\nHigher = stickier.",
             .overlay_lines_per_burst => "Number of fake error\nlines added per\nfailed login.",
             .overlay_decay_frames => "Total time before all\nerror text has fallen\naway (1500f ≈ 30s).",
-            .overlay_drop_peak_prob => "Peak per-frame chance\nan error char falls\nat the end of fade.",
+            .overlay_drop_peak_prob => "Peak rate at which\nerror chars fall away\nat the end of fade.\nHigher = faster cleanup.\n0 = chars never fall.",
             .overlay_scramble_prob => "Chance per frame each\nerror char garbles into\nanother glyph.",
-            .overlay_fall_step => "Rows an error char\ndrops on each fall\nevent. Higher = faster.",
             .action_error_burst => "Simulate one failed\nlogin (paints a fresh\nerror burst).",
             .action_clear_errors => "Wipe all error text\nfrom the screen now.",
             .action_toggle_locked => "Switch between normal\nand locked rain (sparse\ngray glyphs).",
@@ -208,7 +205,6 @@ pub const Tab = enum {
                 .overlay_initial_ttl, .overlay_lines_per_burst,
                 .overlay_decay_frames,
                 .overlay_drop_peak_prob, .overlay_scramble_prob,
-                .overlay_fall_step,
                 .action_error_burst, .action_clear_errors,
             },
             .lockout => &[_]Item{
@@ -412,7 +408,6 @@ pub fn adjustScaled(self: *DebugMenu, m: *Matrix, delta: i8, step_scale: f32) Ac
         .overlay_decay_frames => m.overlay_decay_frames = adjustDecayFrames(m.overlay_decay_frames, int_step),
         .overlay_drop_peak_prob => m.overlay_drop_peak_prob = std.math.clamp(m.overlay_drop_peak_prob + @as(f32, @floatFromInt(delta)) * 0.005 * step_scale, 0.0, 1.0),
         .overlay_scramble_prob => m.overlay_scramble_prob = std.math.clamp(m.overlay_scramble_prob + @as(f32, @floatFromInt(delta)) * 0.002 * step_scale, 0.0, 1.0),
-        .overlay_fall_step => m.overlay_fall_step = u8_adjust(m.overlay_fall_step, int_step, 1, 30),
         .action_error_burst => if (delta > 0) {
             r.fire_error_burst = true;
         },
@@ -535,7 +530,6 @@ pub fn formatValue(
         .overlay_decay_frames => try std.fmt.bufPrint(buf, "{d}f (~{d}s)", .{ m.overlay_decay_frames, m.overlay_decay_frames / 50 }),
         .overlay_drop_peak_prob => try std.fmt.bufPrint(buf, "{d:.3}", .{m.overlay_drop_peak_prob}),
         .overlay_scramble_prob => try std.fmt.bufPrint(buf, "{d:.3}", .{m.overlay_scramble_prob}),
-        .overlay_fall_step => try std.fmt.bufPrint(buf, "{d}", .{m.overlay_fall_step}),
         .action_error_burst, .action_clear_errors, .action_toggle_locked, .action_reset_fails, .action_preview_lockout, .action_test_jingle_sound, .action_test_full_intro => try std.fmt.bufPrint(buf, "<press Enter>", .{}),
         .readout_locked => try std.fmt.bufPrint(buf, "{s}", .{if (m.locked) "YES" else "no"}),
         .readout_auth_fails => try std.fmt.bufPrint(buf, "{d}", .{auth_fails}),

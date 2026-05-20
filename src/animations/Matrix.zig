@@ -282,10 +282,6 @@ overlay_drop_peak_prob: f32,
 // 0 = no scrambling; small values give a subtle "data corrupting"
 // flicker before the line falls away.
 overlay_scramble_prob: f32,
-// How many rows an overlay glyph descends when a drop event
-// fires. Larger = faster apparent fall. 1 = single-row hop
-// (default, smooth); 2+ feels like the glyph is accelerating.
-overlay_fall_step: u8,
 
 pub fn init(
     allocator: Allocator,
@@ -344,8 +340,10 @@ pub fn init(
         .overlay_decay_counter = std.math.maxInt(u32),
         .overlay_decay_frames = 1500,
         .overlay_drop_peak_prob = 0.04,
+        // (overlay_fall_step removed — step is hardcoded to 1 in
+        // decayOverlay for a smooth single-row drop. Multi-row jumps
+        // looked jerky and added a parameter users didn't need.)
         .overlay_scramble_prob = 0.005,
-        .overlay_fall_step = 1,
     };
 }
 
@@ -827,12 +825,10 @@ fn decayOverlay(self: *Matrix) void {
             }
 
             if (self.terminal_buffer.random.float(f32) >= drop_prob) continue;
-            // Move the overlay glyph N rows down where N is
-            // overlay_fall_step (clamped so we don't go past the
-            // last row). If the step would land past bottom, the
-            // glyph just disappears.
-            const step: usize = @max(1, self.overlay_fall_step);
-            const dest = y_iter + step;
+            // Move the overlay glyph one row down. Step hardcoded
+            // to 1 for a smooth single-row hop — earlier multi-row
+            // jumps looked jerky and the tunable confused users.
+            const dest = y_iter + 1;
             if (dest <= h) {
                 const tidx = w * dest + x;
                 if (tidx < self.dots.len) {
@@ -893,7 +889,6 @@ fn saveImpl(self: *Matrix, io: std.Io) !void {
     try w.interface.print("overlay_decay_frames={d}\n", .{self.overlay_decay_frames});
     try w.interface.print("overlay_drop_peak_prob={d:.4}\n", .{self.overlay_drop_peak_prob});
     try w.interface.print("overlay_scramble_prob={d:.4}\n", .{self.overlay_scramble_prob});
-    try w.interface.print("overlay_fall_step={d}\n", .{self.overlay_fall_step});
     try w.interface.flush();
 }
 
@@ -965,7 +960,10 @@ fn loadImpl(self: *Matrix, io: std.Io) !void {
         else if (std.mem.eql(u8, key, "overlay_decay_frames")) self.overlay_decay_frames = std.fmt.parseInt(u16, val, 10) catch self.overlay_decay_frames
         else if (std.mem.eql(u8, key, "overlay_drop_peak_prob")) self.overlay_drop_peak_prob = std.fmt.parseFloat(f32, val) catch self.overlay_drop_peak_prob
         else if (std.mem.eql(u8, key, "overlay_scramble_prob")) self.overlay_scramble_prob = std.fmt.parseFloat(f32, val) catch self.overlay_scramble_prob
-        else if (std.mem.eql(u8, key, "overlay_fall_step")) self.overlay_fall_step = std.fmt.parseInt(u8, val, 10) catch self.overlay_fall_step;
+        // overlay_fall_step removed in 2026-05 (hardcoded step=1).
+        // Silently ignore the key in old prefs files — no else-if so
+        // it falls into the unknown-key drop path above.
+        ;
     }
 }
 
