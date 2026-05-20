@@ -11,6 +11,8 @@ const ly_core = ly_ui.ly_core;
 const interop = ly_core.interop;
 const TimeOfDay = interop.TimeOfDay;
 
+const InputState = @import("../InputState.zig");
+
 // Characters change mid-scroll
 pub const MID_SCROLL_CHANGE = true;
 
@@ -321,6 +323,16 @@ overlay_scramble_prob: f32,
 // the user releasing both shifts smoothly returns to a quiet rain.
 warn_mode: bool = false,
 warn_particles: [WARN_CAP]WarnParticle = [_]WarnParticle{.{}} ** WARN_CAP,
+// Shift-watch hooks. Matrix.update is called every frame, so we use
+// it to poll bothShiftsHeld(). When true, flip warn_mode (drives the
+// ⚠ particle spawn) AND overwrite *shift_watch_box_border_fg with
+// the danger colour. False = restore to *shift_watch_border_normal.
+// positionWidgets (which we originally tried to use) is only called
+// on resize, not per frame — see TerminalBuffer.runEventLoop.
+shift_watch_input_state: ?*const InputState = null,
+shift_watch_box_border_fg: ?*u32 = null,
+shift_watch_border_normal: u32 = 0,
+shift_watch_border_danger: u32 = 0x01FF4040,
 
 pub fn init(
     allocator: Allocator,
@@ -1306,6 +1318,33 @@ fn update(self: *Matrix, _: *anyopaque) !void {
     if (self.timeout_sec > 0 and time.seconds - self.start_time.seconds > self.timeout_sec) {
         self.animate.* = false;
     }
+
+    // Per-frame shift-watch poll. When the user holds both shifts
+    // (priming the shutdown/reboot keybind), flip warn_mode on so
+    // ⚠ particles start spawning into the rain, and overwrite the
+    // login box's border colour with danger red. Released = warn_mode
+    // off (no new spawns; existing particles finish their fall) and
+    // border restored to its config-default colour.
+    if (self.shift_watch_input_state) |is| {
+        const both = is.bothShiftsHeld();
+        self.warn_mode = both;
+        if (self.shift_watch_box_border_fg) |p| {
+            p.* = if (both) self.shift_watch_border_danger else self.shift_watch_border_normal;
+        }
+    }
+}
+
+pub fn attachShiftWatch(
+    self: *Matrix,
+    input_state: *const InputState,
+    box_border_fg: *u32,
+    border_normal: u32,
+    border_danger: u32,
+) void {
+    self.shift_watch_input_state = input_state;
+    self.shift_watch_box_border_fg = box_border_fg;
+    self.shift_watch_border_normal = border_normal;
+    self.shift_watch_border_danger = border_danger;
 }
 
 fn calculateTimeout(self: *Matrix, _: *anyopaque) !?usize {

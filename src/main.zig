@@ -1345,6 +1345,16 @@ pub fn main(init: std.process.Init) !void {
                 &state.input_state,
                 &matrix_storage.?.suppressed,
             );
+            // Shift-watch: Matrix.update polls bothShiftsHeld() each
+            // frame and flips both warn_mode (drives ⚠ rain particles)
+            // and the login box's border_fg between the config default
+            // and danger red.
+            matrix_storage.?.attachShiftWatch(
+                &state.input_state,
+                &state.box.border_fg,
+                state.config.border_fg,
+                0x01FF4040,
+            );
             animation = matrix_storage.?.widget();
         },
         .colormix => {
@@ -2794,18 +2804,9 @@ fn updateSessionSpecifier(self: *Label, ptr: *anyopaque) !void {
 fn positionWidgets(ptr: *anyopaque) !void {
     var state: *UiState = @ptrCast(@alignCast(ptr));
 
-    // Live danger-state poll. While both shifts are held the user is
-    // priming the reboot/shutdown gate — flip the login-box border
-    // red and turn on warning-particle spawn in the matrix rain so
-    // the visual confirms the gate is armed. Released = back to
-    // config-default border colour; matrix stops spawning new
-    // warnings (existing ones finish their fall, see Matrix
-    // stepWarnParticles).
-    const both_shifts: bool =
-        if (state.input_state_available) state.input_state.bothShiftsHeld() else false;
-    const DANGER_BORDER: u32 = 0x01FF4040;
-    state.box.border_fg = if (both_shifts) DANGER_BORDER else state.config.border_fg;
-    if (state.matrix_ref) |m| m.warn_mode = both_shifts;
+    // (Live danger-state poll moved to Matrix.update — positionWidgets
+    // only fires on resize, not per frame. See Matrix.attachShiftWatch
+    // wired up alongside the Lockdown attachHooks call.)
 
     // Offsets for custom bind placement. Declared here instead of the
     // below if stmt as we need these for `battery_label` positioning.
