@@ -593,7 +593,7 @@ fn drawWidget(self: *DebugMenu) void {
     // (the longest at 10 chars). The five tabs render as
     // `[Rain][Glitches][Errors][Lockout][Animations]` which takes
     // 50 chars + the leading 2-char margin → 52 minimum.
-    const panel_w: usize = 54;
+    const panel_w: usize = 66;
     const panel_h: usize = 18;
     if (buf.width < panel_w + 2 or buf.height < panel_h + 2) return;
     const px = (buf.width - panel_w) / 2;

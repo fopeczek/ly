@@ -742,7 +742,7 @@ pub fn main(init: std.process.Init) !void {
         }
         try state.debug_label.setTextAlloc(
             state.allocator,
-            "{s} debug",
+            "{s} settings",
             .{"Shift+F12"},
         );
     }
