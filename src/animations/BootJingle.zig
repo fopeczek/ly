@@ -1,29 +1,30 @@
-// Boot-jingle opt-in-prompt overlay. Runs once at greeter init:
+// Boot-jingle silence-prompt overlay. Runs once at greeter init:
 //
 //   react_window  ~1.8s.  Centred prompt + shrinking countdown bar.
-//                 Default is SILENT BOOT — the jingle only plays if
-//                 the user actively holds EITHER LEFT or RIGHT shift
-//                 during this window. Shifts are pure modifier keys
-//                 so holding doesn't spam the password field. L and
-//                 R are detected independently — the prompt shows
+//                 User can hold EITHER LEFT or RIGHT shift during
+//                 this window to silence the jingle. Shifts are pure
+//                 modifier keys so holding doesn't spam the password
+//                 field (unlike SPACE, which used to). L and R are
+//                 detected independently — the prompt shows
 //                 distinctly which one(s) you're holding.
 //
 //   <decision>    At REACT_SEC, ioctl(EVIOCGKEY) on each non-keyd-
 //                 virtual evdev device returns the kernel's live
-//                 KEY_LEFTSHIFT / KEY_RIGHTSHIFT bitmap. Either set →
-//                 spawn jingle launcher (ack_play). Both unset →
-//                 silent boot (ack_mute), no audio at all.
+//                 KEY_LEFTSHIFT / KEY_RIGHTSHIFT bitmap. Either one
+//                 set → ack_mute; both unset → spawn jingle launcher
+//                 and enter ack_play.
 //
-//   ack_mute /    ~0.6s. Both ack phases show a brief confirmation
-//   ack_play      so the user knows their choice registered.
+//   ack_mute /    ~0.6s. ack_mute shows a brief "MUTED" confirmation
+//   ack_play      so the user knows their input registered. ack_play
+//                 is silent (audio is its own feedback).
 //
 //   done          Deactivate the widget and unsuppress matrix rain
 //                 so the normal greeter takes over.
 //
 // Live feedback: drawReactPrompt re-polls L and R state every frame
 // and switches the prompt's text + colour the moment a shift is
-// held — the user sees the arm-to-play indicator at their fingertip
-// without waiting for the probe at REACT_SEC.
+// held — the user sees the gate close at their fingertip without
+// waiting for the probe at REACT_SEC.
 //
 // The launcher script (alterra-jingle-play) is invoked via Child
 // .spawnAndWait. That sounds blocking — it isn't, because the script
@@ -147,12 +148,13 @@ pub fn update(self: *BootJingle, now: f64) bool {
 fn transitionTo(self: *BootJingle, target: Phase, now: f64) bool {
     var next = target;
     if (self.phase == .react_window) {
-        // Opt-in semantics: holding a shift = PLAY the jingle. No
-        // shift held = silent boot (default-quiet, the user can't
-        // accidentally cause noise by doing nothing).
-        const will_play = self.anyShiftHeld();
-        next = if (will_play) .ack_play else .ack_mute;
-        if (will_play) self.spawnJingle();
+        // Default-plays semantics: holding a shift MUTES the jingle.
+        // No shift held = audio plays. The held state is visualised
+        // in red (drawReactPrompt) so it reads as a warning/stop
+        // indicator — "you're preventing the default action".
+        const muted = self.anyShiftHeld();
+        next = if (muted) .ack_mute else .ack_play;
+        if (!muted) self.spawnJingle();
     }
     self.phase = next;
     self.phase_started = now;
@@ -304,8 +306,7 @@ fn draw(self: *BootJingle) void {
     switch (self.phase) {
         .react_window => self.drawReactPrompt(),
         .ack_mute => self.drawAckMute(),
-        .ack_play => self.drawAckPlay(),
-        .done, .idle => {},
+        .ack_play, .done, .idle => {},
     }
 }
 
@@ -321,10 +322,10 @@ fn drawReactPrompt(self: *BootJingle) void {
     const any_held = l_held or r_held;
 
     // Two visual modes:
-    //   not held → cyan bar drains, dim "HOLD … for jingle" framing
-    //   held     → red bar pinned full, "ARMED" + which shift(s)
+    //   not held → cyan bar drains, dim "HOLD … for silence" framing
+    //   held     → red bar pinned full, "HOLDING" + which shift(s)
     if (any_held) {
-        drawCentred("♪ ARMED ♪", cx, cy - 3, FG_HOLD_HI);
+        drawCentred("✓ HOLDING ✓", cx, cy - 3, FG_HOLD_HI);
         const key_label: []const u8 = if (l_held and r_held)
             "BOTH SHIFTS"
         else if (l_held)
@@ -336,11 +337,11 @@ fn drawReactPrompt(self: *BootJingle) void {
     } else {
         drawCentred("── HOLD ──", cx, cy - 3, FG_DIM);
         drawCentred("LEFT or RIGHT SHIFT", cx, cy - 1, FG_BRIGHT);
-        drawCentred("for boot jingle", cx, cy + 1, FG_DIM);
+        drawCentred("for silence", cx, cy + 1, FG_DIM);
     }
 
     // Countdown bar. Cyan-draining when not held; pinned solid red
-    // when held (you're armed — keep holding until the bar empties
+    // when held (gate is closed — keep holding until the bar empties
     // since the probe checks state at REACT_SEC).
     const elapsed = self.last_now - self.phase_started;
     const bar_w: usize = 24;
@@ -363,12 +364,7 @@ fn drawReactPrompt(self: *BootJingle) void {
 
 fn drawAckMute(self: *BootJingle) void {
     const buf = self.buffer;
-    drawCentred("── silent boot ──", buf.width / 2, buf.height / 2, FG_DIM);
-}
-
-fn drawAckPlay(self: *BootJingle) void {
-    const buf = self.buffer;
-    drawCentred("♪ playing ♪", buf.width / 2, buf.height / 2, FG_HOLD_HI);
+    drawCentred("── MUTED ──", buf.width / 2, buf.height / 2, FG_HOLD_HI);
 }
 
 fn drawCentred(text: []const u8, cx: usize, y: usize, fg: u32) void {
@@ -429,14 +425,15 @@ test "update before REACT_SEC does not transition" {
     try testing.expectEqual(@as(Phase, .react_window), bj.phase);
 }
 
-test "update past REACT_SEC transitions to ack_mute when no shift held (default)" {
+test "update past REACT_SEC transitions to ack_play when no shift held (default)" {
     var bj = init(testing.allocator, undefined);
     bj.start(100.0);
-    // No input_state attached → anyShiftHeld returns false → opt-in
-    // default of silent boot → ack_mute. No spawn attempted, so we
-    // don't need to pre-set spawned to suppress audio in tests.
+    // No input_state attached → anyShiftHeld returns false →
+    // default-plays semantics → ack_play. Pre-set spawned so the
+    // launcher isn't actually exec'd during `zig build test`.
+    bj.spawned = true;
     _ = bj.update(100.0 + REACT_SEC + 0.001);
-    try testing.expectEqual(@as(Phase, .ack_mute), bj.phase);
+    try testing.expectEqual(@as(Phase, .ack_play), bj.phase);
 }
 
 test "transitionTo .done clears active and unsuppresses matrix" {
@@ -445,9 +442,8 @@ test "transitionTo .done clears active and unsuppresses matrix" {
     bj.hook_matrix_suppressed = &suppressed;
     bj.start(0.0);
     try testing.expect(suppressed); // start() set it
-    // From ack_mute (the default not-held outcome) → done. No
-    // spawn ever triggered for this path, so no pre-state needed.
-    bj.phase = .ack_mute;
+    bj.phase = .ack_play;
+    bj.spawned = true; // skip real spawn (already past react_window anyway)
     _ = bj.update(ACK_SEC + 0.1);
     try testing.expectEqual(@as(Phase, .done), bj.phase);
     try testing.expect(!bj.active);
