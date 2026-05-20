@@ -15,6 +15,7 @@ const Widget = ly_ui.Widget;
 const TerminalBuffer = ly_ui.TerminalBuffer;
 const Matrix = @import("../animations/Matrix.zig");
 const Lockdown = @import("../animations/Lockdown.zig");
+const BootJingle = @import("../animations/BootJingle.zig");
 
 const DebugMenu = @This();
 
@@ -66,6 +67,10 @@ pub const Item = enum {
     // Animations tab
     lockout_animation,
     action_preview_lockout,
+    // Bootup tab
+    boot_jingle_enabled,
+    action_test_jingle_sound,
+    action_test_full_intro,
 
     pub fn label(self: Item) []const u8 {
         // Labels are padded to 16 chars so the value column lines
@@ -105,12 +110,16 @@ pub const Item = enum {
             // Animations
             .lockout_animation => "lockout anim    ",
             .action_preview_lockout => "[ preview lock  ]",
+            // Bootup
+            .boot_jingle_enabled => "boot jingle     ",
+            .action_test_jingle_sound => "[ test sound    ]",
+            .action_test_full_intro => "[ replay intro  ]",
         };
     }
 
     pub fn isAction(self: Item) bool {
         return switch (self) {
-            .action_error_burst, .action_clear_errors, .action_toggle_locked, .action_reset_fails, .action_preview_lockout => true,
+            .action_error_burst, .action_clear_errors, .action_toggle_locked, .action_reset_fails, .action_preview_lockout, .action_test_jingle_sound, .action_test_full_intro => true,
             else => false,
         };
     }
@@ -150,6 +159,9 @@ pub const Item = enum {
             .readout_auth_fails => "Current count of\nconsecutive failed\nlogins.",
             .lockout_animation => "Animation played when\nthe lockout fires.\nUse \xe2\x86\x90/\xe2\x86\x92 to cycle types.\nlegacy: sparse gray\nrain forever.\nscramble: full sequence\nwith clock countdown.",
             .action_preview_lockout => "Play the selected\nlockout animation now,\nwith a 5 second clock.\nReal auth state stays\nunchanged.",
+            .boot_jingle_enabled => "Play the boot jingle\n+ silence prompt at\ngreeter init?\nUse \xe2\x86\x90/\xe2\x86\x92 to toggle.\nPersists across reboots.",
+            .action_test_jingle_sound => "Play the jingle audio\nonce, right now. No\nvisual prompt.",
+            .action_test_full_intro => "Replay the full boot\nintro (prompt + audio\n+ ack). Behaves exactly\nas if you'd just booted.",
         };
     }
 
@@ -167,6 +179,7 @@ pub const Tab = enum {
     errors,
     lockout,
     animations,
+    bootup,
 
     pub fn name(self: Tab) []const u8 {
         return switch (self) {
@@ -175,6 +188,7 @@ pub const Tab = enum {
             .errors => "Errors",
             .lockout => "Lockout",
             .animations => "Animations",
+            .bootup => "Bootup",
         };
     }
 
@@ -204,11 +218,16 @@ pub const Tab = enum {
             .animations => &[_]Item{
                 .lockout_animation, .action_preview_lockout,
             },
+            .bootup => &[_]Item{
+                .boot_jingle_enabled,
+                .action_test_jingle_sound,
+                .action_test_full_intro,
+            },
         };
     }
 };
 
-const TABS = [_]Tab{ .rain, .glitches, .errors, .lockout, .animations };
+const TABS = [_]Tab{ .rain, .glitches, .errors, .lockout, .animations, .bootup };
 
 // Two-mode navigation. In .nav, arrow keys cycle items / tabs and
 // Enter "opens" the selected item for editing. In .edit, up/down
@@ -227,6 +246,7 @@ matrix_ptr: ?*Matrix = null,
 auth_fails_ptr: ?*u64 = null,
 buffer_ptr: ?*TerminalBuffer = null,
 lockdown_ptr: ?*Lockdown = null,
+boot_jingle_ptr: ?*BootJingle = null,
 instance: ?Widget = null,
 
 pub fn init() DebugMenu {
@@ -239,11 +259,13 @@ pub fn attach(
     auth_fails_ptr: *u64,
     buffer_ptr: *TerminalBuffer,
     lockdown_ptr: *Lockdown,
+    boot_jingle_ptr: *BootJingle,
 ) void {
     self.matrix_ptr = matrix_ptr;
     self.auth_fails_ptr = auth_fails_ptr;
     self.buffer_ptr = buffer_ptr;
     self.lockdown_ptr = lockdown_ptr;
+    self.boot_jingle_ptr = boot_jingle_ptr;
 }
 
 pub fn widget(self: *DebugMenu) *Widget {
@@ -290,6 +312,8 @@ pub fn activate(self: *DebugMenu, _: *Matrix) ActionResult {
             .action_toggle_locked => r.toggle_locked = true,
             .action_reset_fails => r.reset_fails = true,
             .action_preview_lockout => r.preview_lockout = true,
+            .action_test_jingle_sound => r.test_jingle_sound = true,
+            .action_test_full_intro => r.test_full_intro = true,
             else => {},
         }
         return r;
@@ -348,6 +372,9 @@ pub const ActionResult = struct {
     reset_fails: bool = false,
     clear_errors: bool = false,
     preview_lockout: bool = false,
+    test_jingle_sound: bool = false,
+    test_full_intro: bool = false,
+    boot_jingle_prefs_changed: bool = false,
 };
 
 pub fn adjust(self: *DebugMenu, m: *Matrix, delta: i8) ActionResult {
@@ -397,6 +424,19 @@ pub fn adjustScaled(self: *DebugMenu, m: *Matrix, delta: i8, step_scale: f32) Ac
         },
         .action_reset_fails => if (delta > 0) {
             r.reset_fails = true;
+        },
+        .action_test_jingle_sound => if (delta > 0) {
+            r.test_jingle_sound = true;
+        },
+        .action_test_full_intro => if (delta > 0) {
+            r.test_full_intro = true;
+        },
+        .boot_jingle_enabled => {
+            // Toggle on either arrow direction — single bool field.
+            if (self.boot_jingle_ptr) |bj| {
+                bj.enabled = !bj.enabled;
+                r.boot_jingle_prefs_changed = true;
+            }
         },
         .readout_locked, .readout_auth_fails => {},
         .lockout_animation => {
@@ -496,11 +536,30 @@ pub fn formatValue(
         .overlay_drop_peak_prob => try std.fmt.bufPrint(buf, "{d:.3}", .{m.overlay_drop_peak_prob}),
         .overlay_scramble_prob => try std.fmt.bufPrint(buf, "{d:.3}", .{m.overlay_scramble_prob}),
         .overlay_fall_step => try std.fmt.bufPrint(buf, "{d}", .{m.overlay_fall_step}),
-        .action_error_burst, .action_clear_errors, .action_toggle_locked, .action_reset_fails, .action_preview_lockout => try std.fmt.bufPrint(buf, "<press Enter>", .{}),
+        .action_error_burst, .action_clear_errors, .action_toggle_locked, .action_reset_fails, .action_preview_lockout, .action_test_jingle_sound, .action_test_full_intro => try std.fmt.bufPrint(buf, "<press Enter>", .{}),
         .readout_locked => try std.fmt.bufPrint(buf, "{s}", .{if (m.locked) "YES" else "no"}),
         .readout_auth_fails => try std.fmt.bufPrint(buf, "{d}", .{auth_fails}),
         .lockout_animation => try std.fmt.bufPrint(buf, "{s}", .{lockdown_anim_name}),
+        .boot_jingle_enabled => try std.fmt.bufPrint(buf, "<unavail>", .{}),
     };
+}
+
+// Variant of formatValue that has access to BootJingle for the
+// .boot_jingle_enabled field. Falls through to the regular
+// formatValue for everything else.
+pub fn formatValueWithJingle(
+    item: Item,
+    m: *const Matrix,
+    auth_fails: u64,
+    lockdown_anim_name: []const u8,
+    bj: ?*const BootJingle,
+    buf: []u8,
+) ![]const u8 {
+    if (item == .boot_jingle_enabled) {
+        const enabled = if (bj) |b| b.enabled else true;
+        return try std.fmt.bufPrint(buf, "{s}", .{if (enabled) "yes" else "no"});
+    }
+    return try formatValue(item, m, auth_fails, lockdown_anim_name, buf);
 }
 
 // ─── render ────────────────────────────────────────────────────────────
@@ -609,7 +668,7 @@ fn drawWidget(self: *DebugMenu) void {
         putStr(px + 4, row_y, item.label(), label_fg, row_bg);
         // Value
         const anim_label: []const u8 = if (self.lockdown_ptr) |ld| ld.selected_anim.label() else "scramble→clock ";
-        const val = formatValue(item, m, auth_fails, anim_label, &val_buf) catch "<err>";
+        const val = formatValueWithJingle(item, m, auth_fails, anim_label, self.boot_jingle_ptr, &val_buf) catch "<err>";
         putStr(px + 4 + item.label().len + 1, row_y, val, COL_VALUE, row_bg);
     }
 
@@ -704,6 +763,25 @@ test "computeIntStep handles scale and direction" {
     // sliders stay adjustable.
     try testing.expectEqual(@as(i8, 1), computeIntStep(1, 0.1));
     try testing.expectEqual(@as(i8, -1), computeIntStep(-1, 0.1));
+}
+
+test "Bootup tab exposes three items in expected order" {
+    const items = Tab.items(.bootup);
+    try testing.expectEqual(@as(usize, 3), items.len);
+    try testing.expectEqual(Item.boot_jingle_enabled, items[0]);
+    try testing.expectEqual(Item.action_test_jingle_sound, items[1]);
+    try testing.expectEqual(Item.action_test_full_intro, items[2]);
+}
+
+test "Bootup tab actions classified correctly" {
+    try testing.expect(!Item.boot_jingle_enabled.isAction());
+    try testing.expect(Item.action_test_jingle_sound.isAction());
+    try testing.expect(Item.action_test_full_intro.isAction());
+}
+
+test "TABS includes bootup as the last tab" {
+    try testing.expectEqual(@as(usize, 6), TABS.len);
+    try testing.expectEqual(Tab.bootup, TABS[5]);
 }
 
 test "u8_adjust clamps to bounds" {

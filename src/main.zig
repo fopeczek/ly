@@ -827,6 +827,7 @@ pub fn main(init: std.process.Init) !void {
     };
     if (state.input_state.fds.items.len > 0) state.input_state_available = true;
     state.boot_jingle = BootJingle.init(state.allocator, &state.buffer);
+    state.boot_jingle.loadPrefs(state.io);
     // Defers fire LIFO, so register deinit FIRST and stop SECOND.
     // That way stop() (which joins the polling thread) runs before
     // deinit() (which closes the fds the thread is reading from);
@@ -1319,7 +1320,7 @@ pub fn main(init: std.process.Init) !void {
             // /var/lib/ly/matrix-prefs just means defaults apply.
             matrix_storage.?.loadPrefs(state.io);
             state.lockdown.loadPrefs(state.io);
-            state.debug_menu.attach(&matrix_storage.?, &state.auth_fails, &state.buffer, &state.lockdown);
+            state.debug_menu.attach(&matrix_storage.?, &state.auth_fails, &state.buffer, &state.lockdown, &state.boot_jingle);
             state.lockdown.attachHooks(
                 &state.password.should_insert,
                 &state.box.top_title,
@@ -1657,9 +1658,11 @@ pub fn main(init: std.process.Init) !void {
     // Kick off the boot-jingle prompt right before we enter the
     // event loop. Skipped if autologin already authenticated above
     // (we'd be tearing the greeter down before the react window
-    // could finish). start() fires once per Ly process; the per-frame
-    // updateWidget drives the phase transitions thereafter.
-    if (!state.is_autologin) {
+    // could finish), or if the user disabled the jingle via the
+    // Bootup settings tab (boot_jingle.enabled persisted false).
+    // start() fires once per Ly process; the per-frame updateWidget
+    // drives the phase transitions thereafter.
+    if (!state.is_autologin and state.boot_jingle.enabled) {
         if (interop.getTimeOfDay()) |tt| {
             const now_f = @as(f64, @floatFromInt(tt.seconds)) +
                 @as(f64, @floatFromInt(tt.microseconds)) / 1_000_000.0;
@@ -2085,6 +2088,14 @@ fn applyActionResult(state: *UiState, m: *Matrix, r: DebugMenu.ActionResult) voi
             state.log_file.err(state.io, "lockdown", "preview start failed: {s}", .{@errorName(e)}) catch {};
         };
     }
+    if (r.test_jingle_sound) state.boot_jingle.playSoundOnly();
+    if (r.test_full_intro) {
+        const now_t = interop.getTimeOfDay() catch interop.TimeOfDay{ .seconds = 0, .microseconds = 0 };
+        const now_f = @as(f64, @floatFromInt(now_t.seconds)) +
+            @as(f64, @floatFromInt(now_t.microseconds)) / 1_000_000.0;
+        state.boot_jingle.start(now_f);
+    }
+    if (r.boot_jingle_prefs_changed) state.boot_jingle.savePrefs(state.io);
     // Persist tunables after every adjust / action — debug menu
     // changes survive ly restarts. Best-effort write.
     m.savePrefs(state.io);

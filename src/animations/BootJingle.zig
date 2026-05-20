@@ -73,6 +73,10 @@ phase_started: f64,
 last_now: f64,
 active: bool,
 spawned: bool,
+// User-toggleable kill-switch. When false, the boot-time start()
+// is skipped entirely (no prompt, no audio). Persisted via the
+// Lockdown-style /var/lib/ly/boot-jingle-prefs file.
+enabled: bool,
 hook_matrix_suppressed: ?*bool,
 instance: ?Widget,
 
@@ -87,6 +91,7 @@ pub fn init(allocator: std.mem.Allocator, buffer: *TerminalBuffer) BootJingle {
         .last_now = 0,
         .active = false,
         .spawned = false,
+        .enabled = true,
         .hook_matrix_suppressed = null,
         .instance = null,
     };
@@ -154,6 +159,16 @@ fn transitionTo(self: *BootJingle, target: Phase, now: f64) bool {
 fn spawnJingle(self: *BootJingle) void {
     if (self.spawned) return;
     self.spawned = true;
+    self.execLauncher();
+}
+
+// Public sound-only trigger for the Settings → Bootup test action.
+// Not gated by spawned flag — user can fire repeatedly to audition.
+pub fn playSoundOnly(self: *BootJingle) void {
+    self.execLauncher();
+}
+
+fn execLauncher(self: *BootJingle) void {
     const io = self.io orelse return;
     // spawn() + wait() is non-blocking in practice because the
     // launcher script daemonises mpv via nohup+disown and bash
@@ -166,6 +181,51 @@ fn spawnJingle(self: *BootJingle) void {
         .stderr = .ignore,
     }) catch return;
     _ = child.wait(io) catch return;
+}
+
+// ─── Persistence ──────────────────────────────────────────────────
+
+const PREFS_PATH: []const u8 = "/var/lib/ly/boot-jingle-prefs";
+
+pub fn savePrefs(self: *const BootJingle, io: std.Io) void {
+    saveImpl(self, io) catch {};
+}
+
+fn saveImpl(self: *const BootJingle, io: std.Io) !void {
+    std.Io.Dir.cwd().createDirPath(io, "/var/lib/ly") catch {};
+    var file = try std.Io.Dir.cwd().createFile(
+        io,
+        PREFS_PATH,
+        .{ .permissions = .fromMode(0o600) },
+    );
+    defer file.close(io);
+    var buf: [32]u8 = undefined;
+    var w = file.writer(io, &buf);
+    try w.interface.print("enabled={d}\n", .{@as(u8, if (self.enabled) 1 else 0)});
+    try w.interface.flush();
+}
+
+pub fn loadPrefs(self: *BootJingle, io: std.Io) void {
+    loadImpl(self, io) catch {};
+}
+
+fn loadImpl(self: *BootJingle, io: std.Io) !void {
+    var file = try std.Io.Dir.cwd().openFile(io, PREFS_PATH, .{ .mode = .read_only });
+    defer file.close(io);
+    var read_buf: [128]u8 = undefined;
+    var fr = file.reader(io, &read_buf);
+    var r = &fr.interface;
+    while (true) {
+        const line = r.takeDelimiterInclusive('\n') catch break;
+        const trimmed = std.mem.trimEnd(u8, line, "\n\r ");
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        const key = trimmed[0..eq];
+        const val = trimmed[eq + 1 ..];
+        if (std.mem.eql(u8, key, "enabled")) {
+            const v = std.fmt.parseInt(u8, val, 10) catch continue;
+            self.enabled = (v != 0);
+        }
+    }
 }
 
 // ─── Widget interface ─────────────────────────────────────────────
