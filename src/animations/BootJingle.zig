@@ -1,12 +1,17 @@
 // Boot-jingle silence-prompt overlay. Runs once at greeter init:
 //
 //   react_window  ~1.8s.  Centred prompt + shrinking countdown bar.
-//                 User can hold SPACE during this window to silence
-//                 the jingle.
+//                 User can hold EITHER LEFT or RIGHT shift during
+//                 this window to silence the jingle. Shifts are pure
+//                 modifier keys so holding them doesn't spam the
+//                 password field (unlike SPACE, which used to). L
+//                 and R are detected independently — the prompt
+//                 shows distinctly which one(s) you're holding.
 //
-//   <decision>    At REACT_SEC, ioctl(EVIOCGKEY) on every open evdev
-//                 device asks the kernel "is SPACE currently down?".
-//                 If yes → ack_mute; if no → spawn jingle launcher
+//   <decision>    At REACT_SEC, ioctl(EVIOCGKEY) on each non-keyd-
+//                 virtual evdev device returns the kernel's live
+//                 KEY_LEFTSHIFT / KEY_RIGHTSHIFT bitmap. Either one
+//                 set → ack_mute; both unset → spawn jingle launcher
 //                 and enter ack_play.
 //
 //   ack_mute /    ~0.6s. ack_mute shows a brief "MUTED" confirmation
@@ -16,11 +21,10 @@
 //   done          Deactivate the widget and unsuppress matrix rain
 //                 so the normal greeter takes over.
 //
-// EVIOCGKEY (not press-event tracking) is chosen because the probe
-// fires within the first 2s of greeter init — the event-stream
-// thread in InputState.zig may not have processed early presses yet.
-// EVIOCGKEY asks the kernel for the instantaneous held-state with no
-// latency.
+// Live feedback: drawReactPrompt re-polls L and R state every frame
+// and switches the prompt's text + colour the moment a shift is
+// held — the user sees the gate close at their fingertip without
+// waiting for the probe at REACT_SEC.
 //
 // The launcher script (alterra-jingle-play) is invoked via Child
 // .spawnAndWait. That sounds blocking — it isn't, because the script
@@ -59,7 +63,9 @@ pub const JINGLE_LAUNCHER: []const u8 = "/usr/local/bin/alterra-jingle-play";
 
 const FG_BRIGHT: u32 = 0x01FFFFFF;
 const FG_DIM: u32 = 0x01808080;
-const FG_ACCENT: u32 = 0x0140C0FF;
+const FG_ACCENT: u32 = 0x0140C0FF;     // cyan — neutral / not-held bar
+const FG_GATE_ON: u32 = 0x0140FF80;    // green — gate is closed (held)
+const FG_GATE_LBL: u32 = 0x01A0FFC0;   // dim green — "release to play"
 const BG: u32 = 0x00000000;
 
 // ─── State ────────────────────────────────────────────────────────
@@ -142,7 +148,7 @@ pub fn update(self: *BootJingle, now: f64) bool {
 fn transitionTo(self: *BootJingle, target: Phase, now: f64) bool {
     var next = target;
     if (self.phase == .react_window) {
-        const muted = if (self.input_state) |is| is.spaceHeldNow() else false;
+        const muted = self.anyShiftHeld();
         next = if (muted) .ack_mute else .ack_play;
         if (!muted) self.spawnJingle();
     }
@@ -154,6 +160,11 @@ fn transitionTo(self: *BootJingle, target: Phase, now: f64) bool {
         return true;
     }
     return false;
+}
+
+fn anyShiftHeld(self: *const BootJingle) bool {
+    const is = self.input_state orelse return false;
+    return is.lshiftHeldNow() or is.rshiftHeldNow();
 }
 
 fn spawnJingle(self: *BootJingle) void {
@@ -300,24 +311,49 @@ fn drawReactPrompt(self: *BootJingle) void {
     const cx = buf.width / 2;
     const cy = buf.height / 2;
 
-    // Three-line stacked prompt: the action verb in the middle is
-    // brightest, the framing words above and below dimmer so the
-    // eye lands on SPACE first.
-    drawCentred("── HOLD ──", cx, cy - 3, FG_DIM);
-    drawCentred("S P A C E", cx, cy - 1, FG_BRIGHT);
-    drawCentred("for silence", cx, cy + 1, FG_DIM);
+    // Live held-state poll. Re-queried every frame so the user sees
+    // the gate close the instant they touch a shift.
+    const l_held: bool = if (self.input_state) |is| is.lshiftHeldNow() else false;
+    const r_held: bool = if (self.input_state) |is| is.rshiftHeldNow() else false;
+    const any_held = l_held or r_held;
 
-    // Countdown bar drains left-to-right over REACT_SEC.
+    // Two visual modes:
+    //   not held → cyan bar drains, dim "HOLD" framing
+    //   held     → green bar pinned full, "HOLDING" with which side(s)
+    if (any_held) {
+        drawCentred("✓ HOLDING ✓", cx, cy - 3, FG_GATE_ON);
+        const key_label: []const u8 = if (l_held and r_held)
+            "BOTH SHIFTS"
+        else if (l_held)
+            "LEFT SHIFT"
+        else
+            "RIGHT SHIFT";
+        drawCentred(key_label, cx, cy - 1, FG_GATE_ON);
+        drawCentred("release to play", cx, cy + 1, FG_GATE_LBL);
+    } else {
+        drawCentred("── HOLD ──", cx, cy - 3, FG_DIM);
+        drawCentred("LEFT or RIGHT SHIFT", cx, cy - 1, FG_BRIGHT);
+        drawCentred("for silence", cx, cy + 1, FG_DIM);
+    }
+
+    // Countdown bar. Cyan-draining when not held; pinned solid green
+    // when held (gate is closed — releasing before the bar empties
+    // still works since the probe checks state at REACT_SEC).
     const elapsed = self.last_now - self.phase_started;
     const bar_w: usize = 24;
     const remain = @max(@as(f64, 0.0), @min(@as(f64, 1.0), 1.0 - elapsed / REACT_SEC));
-    const filled: usize = @intFromFloat(remain * @as(f64, @floatFromInt(bar_w)));
+    const filled: usize = if (any_held) bar_w else @intFromFloat(remain * @as(f64, @floatFromInt(bar_w)));
     const bar_x: usize = if (cx >= bar_w / 2) cx - bar_w / 2 else 0;
     const bar_y = cy + 3;
     var k: usize = 0;
     while (k < bar_w) : (k += 1) {
         const ch: u32 = if (k < filled) '█' else '░';
-        const fg: u32 = if (k < filled) FG_ACCENT else FG_DIM;
+        const fg: u32 = if (any_held)
+            FG_GATE_ON
+        else if (k < filled)
+            FG_ACCENT
+        else
+            FG_DIM;
         TerminalBuffer.drawCharMultiple(ch, bar_x + k, bar_y, 1, fg, BG);
     }
 }

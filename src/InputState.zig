@@ -41,7 +41,6 @@ const InputEvent = extern struct {
 const EV_KEY: u16 = 1;
 const KEY_LEFTSHIFT: u16 = 42;
 const KEY_RIGHTSHIFT: u16 = 54;
-const KEY_SPACE: u16 = 57;
 
 // Linux KEY_MAX = 0x2FF (767), so the held-keys bitmap from
 // EVIOCGKEY fits in 96 bytes ((767 >> 3) + 1).
@@ -52,6 +51,10 @@ const KEY_BIT_BYTES: usize = 96;
 //   = (dir<<30) | (size<<16) | (type<<8) | nr
 const EVIOCGKEY_96: u32 =
     (@as(u32, 2) << 30) | (@as(u32, KEY_BIT_BYTES) << 16) | (@as(u32, 'E') << 8) | 0x18;
+
+// EVIOCGNAME(len) = _IOR('E', 0x06, char[len]) — device name string.
+const EVIOCGNAME_256: u32 =
+    (@as(u32, 2) << 30) | (@as(u32, 256) << 16) | (@as(u32, 'E') << 8) | 0x06;
 
 
 allocator: Allocator,
@@ -101,31 +104,48 @@ pub fn bothShiftsHeld(self: *const Self) bool {
     return self.lshift.load(.seq_cst) > 0 and self.rshift.load(.seq_cst) > 0;
 }
 
-// One-shot probe: is SPACE held on any open evdev device RIGHT NOW?
-// Uses EVIOCGKEY ioctl — kernel returns the current held-state of
-// every key on the device. Does NOT depend on the event-stream
-// thread having started or having seen the press. Safe to call
-// even if start() hasn't been called yet (just opens zero devices
-// → returns false).
-//
-// Why ioctl instead of tracking SPACE through the event loop: the
-// boot-jingle probe fires within the first ~2s of greeter init,
-// before the user has any reason to expect typing to register. The
-// event thread might not have processed early presses yet. EVIOCGKEY
-// returns the instantaneous kernel state with no latency.
-pub fn spaceHeldNow(self: *const Self) bool {
+// keyd's virtual keyboard (uinput device, typically /dev/input/event26
+// on this machine) conflates LSHIFT and RSHIFT bits: a physical
+// RIGHT-shift press shows up as LSHIFT on the virtual device. We need
+// L vs R distinction, so when probing held-state we skip any device
+// whose EVIOCGNAME contains "keyd virtual" and trust only the raw HID
+// evdev nodes (e.g. event13 = "Framework Laptop 16 Keyboard Module").
+// EVIOCGKEY on the raw device returns the actual physical key bitmap
+// even when keyd has EVIOCGRAB'd the event stream.
+fn deviceIsKeydVirtual(fd: i32) bool {
+    var name_buf: [256]u8 = undefined;
+    @memset(&name_buf, 0);
+    _ = std.os.linux.ioctl(@intCast(fd), EVIOCGNAME_256, @intFromPtr(&name_buf));
+    const len = std.mem.indexOfScalar(u8, &name_buf, 0) orelse name_buf.len;
+    return std.mem.indexOf(u8, name_buf[0..len], "keyd virtual") != null;
+}
+
+// Generic single-key held-state probe. Iterates open evdev fds,
+// EVIOCGKEY's each, and returns true if `key_code` is set on any
+// non-keyd-virtual device. memset-before-ioctl means an error leaves
+// all bits zero — safe default of "not held".
+fn keyHeldOnRealDevice(self: *const Self, key_code: u16) bool {
     var key_bits: [KEY_BIT_BYTES]u8 = undefined;
     for (self.fds.items) |fd| {
-        // memset BEFORE the ioctl so an EBADF/EINVAL/etc leaves the
-        // buffer all-zero — the bit check then returns false, the
-        // safe default (jingle plays, no surprise silencing).
+        if (deviceIsKeydVirtual(@intCast(fd))) continue;
         @memset(&key_bits, 0);
         _ = std.os.linux.ioctl(@intCast(fd), EVIOCGKEY_96, @intFromPtr(&key_bits));
-        const byte_idx: usize = KEY_SPACE >> 3;
-        const bit_idx: u3 = @intCast(KEY_SPACE & 7);
+        const byte_idx: usize = key_code >> 3;
+        const bit_idx: u3 = @intCast(key_code & 7);
         if ((key_bits[byte_idx] & (@as(u8, 1) << bit_idx)) != 0) return true;
     }
     return false;
+}
+
+// Distinguished L vs R held-state probes for the boot-jingle silence
+// gate. Either-or semantics: caller decides whether to mute on L
+// only, R only, or either.
+pub fn lshiftHeldNow(self: *const Self) bool {
+    return self.keyHeldOnRealDevice(KEY_LEFTSHIFT);
+}
+
+pub fn rshiftHeldNow(self: *const Self) bool {
+    return self.keyHeldOnRealDevice(KEY_RIGHTSHIFT);
 }
 
 fn scanDevices(self: *Self) !void {
@@ -216,8 +236,17 @@ test "EVIOCGKEY_96 encodes to the expected ioctl number" {
     try testing.expectEqual(@as(u32, 0x80604518), EVIOCGKEY_96);
 }
 
-test "spaceHeldNow returns false with no devices open" {
+test "EVIOCGNAME_256 encodes to the expected ioctl number" {
+    // _IOC(READ=2, 'E'=0x45, 0x06, 256)
+    //   = (2<<30) | (256<<16) | (0x45<<8) | 0x06
+    //   = 0x80000000 | 0x01000000 | 0x00004500 | 0x00000006
+    //   = 0x81004506
+    try testing.expectEqual(@as(u32, 0x81004506), EVIOCGNAME_256);
+}
+
+test "lshiftHeldNow + rshiftHeldNow return false with no devices open" {
     var st = init(testing.allocator);
     defer st.deinit();
-    try testing.expect(!st.spaceHeldNow());
+    try testing.expect(!st.lshiftHeldNow());
+    try testing.expect(!st.rshiftHeldNow());
 }
