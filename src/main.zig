@@ -31,6 +31,7 @@ const DurFile = @import("animations/DurFile.zig");
 const GameOfLife = @import("animations/GameOfLife.zig");
 const Matrix = @import("animations/Matrix.zig");
 const Lockdown = @import("animations/Lockdown.zig");
+const BootJingle = @import("animations/BootJingle.zig");
 const InputState = @import("InputState.zig");
 const auth = @import("auth.zig");
 const DebugMenu = @import("components/DebugMenu.zig");
@@ -159,6 +160,11 @@ const UiState = struct {
     // configured key alone demands (typically Ctrl+Shift+F10).
     input_state: InputState,
     input_state_available: bool,
+    // Boot-jingle silence-prompt overlay. Fires once at greeter
+    // init: shows centred "HOLD SPACE FOR SILENCE" with countdown
+    // bar, probes SPACE via EVIOCGKEY after the react window, and
+    // spawns the mpv launcher unless the user held SPACE.
+    boot_jingle: BootJingle,
     // Auth-only knobs (--auth-only / --state CLI flags). When
     // auth_only_mode is true and PAM succeeds, ly writes session info
     // to auth_only_state_path and exits 0 instead of forking the
@@ -820,6 +826,7 @@ pub fn main(init: std.process.Init) !void {
         try state.log_file.info(state.io, "input", "evdev L+R gate unavailable: {s}", .{@errorName(e)});
     };
     if (state.input_state.fds.items.len > 0) state.input_state_available = true;
+    state.boot_jingle = BootJingle.init(state.allocator, &state.buffer);
     // Defers fire LIFO, so register deinit FIRST and stop SECOND.
     // That way stop() (which joins the polling thread) runs before
     // deinit() (which closes the fds the thread is reading from);
@@ -1322,6 +1329,15 @@ pub fn main(init: std.process.Init) !void {
                 &state.password_label,
                 &state.box,
             );
+            // Boot-jingle shares the matrix_suppressed hook so the
+            // rain stays black behind the prompt during the react
+            // window; cleared automatically when the intro reaches
+            // .done.
+            state.boot_jingle.attachHooks(
+                state.io,
+                &state.input_state,
+                &matrix_storage.?.suppressed,
+            );
             animation = matrix_storage.?.widget();
         },
         .colormix => {
@@ -1559,6 +1575,12 @@ pub fn main(init: std.process.Init) !void {
     var debug_layer = [_]*Widget{state.debug_menu.widget()};
     try widgets.append(state.allocator, &debug_layer);
 
+    // Layer 6: boot-jingle prompt. Topmost so it covers the entire
+    // greeter during the react window. No-op draw once the intro
+    // reaches .done — zero cost when inactive.
+    var boot_jingle_layer = [_]*Widget{state.boot_jingle.widget()};
+    try widgets.append(state.allocator, &boot_jingle_layer);
+
     for (state.custom_binds.items) |*item| {
         try state.buffer.registerGlobalKeybind(state.io, item.key, &customCommand, item);
     }
@@ -1631,6 +1653,19 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (state.is_autologin) _ = try authenticate(&state);
+
+    // Kick off the boot-jingle prompt right before we enter the
+    // event loop. Skipped if autologin already authenticated above
+    // (we'd be tearing the greeter down before the react window
+    // could finish). start() fires once per Ly process; the per-frame
+    // updateWidget drives the phase transitions thereafter.
+    if (!state.is_autologin) {
+        if (interop.getTimeOfDay()) |tt| {
+            const now_f = @as(f64, @floatFromInt(tt.seconds)) +
+                @as(f64, @floatFromInt(tt.microseconds)) / 1_000_000.0;
+            state.boot_jingle.start(now_f);
+        } else |_| {}
+    }
 
     const active_widget = switch (default_input) {
         .info_line => info_line_widget,

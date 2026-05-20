@@ -41,6 +41,17 @@ const InputEvent = extern struct {
 const EV_KEY: u16 = 1;
 const KEY_LEFTSHIFT: u16 = 42;
 const KEY_RIGHTSHIFT: u16 = 54;
+const KEY_SPACE: u16 = 57;
+
+// Linux KEY_MAX = 0x2FF (767), so the held-keys bitmap from
+// EVIOCGKEY fits in 96 bytes ((767 >> 3) + 1).
+const KEY_BIT_BYTES: usize = 96;
+
+// EVIOCGKEY(len) = _IOR('E', 0x18, char[len])
+//   _IOC(dir=2 read, type='E', nr=0x18, size=len)
+//   = (dir<<30) | (size<<16) | (type<<8) | nr
+const EVIOCGKEY_96: u32 =
+    (@as(u32, 2) << 30) | (@as(u32, KEY_BIT_BYTES) << 16) | (@as(u32, 'E') << 8) | 0x18;
 
 
 allocator: Allocator,
@@ -88,6 +99,33 @@ pub fn deinit(self: *Self) void {
 
 pub fn bothShiftsHeld(self: *const Self) bool {
     return self.lshift.load(.seq_cst) > 0 and self.rshift.load(.seq_cst) > 0;
+}
+
+// One-shot probe: is SPACE held on any open evdev device RIGHT NOW?
+// Uses EVIOCGKEY ioctl — kernel returns the current held-state of
+// every key on the device. Does NOT depend on the event-stream
+// thread having started or having seen the press. Safe to call
+// even if start() hasn't been called yet (just opens zero devices
+// → returns false).
+//
+// Why ioctl instead of tracking SPACE through the event loop: the
+// boot-jingle probe fires within the first ~2s of greeter init,
+// before the user has any reason to expect typing to register. The
+// event thread might not have processed early presses yet. EVIOCGKEY
+// returns the instantaneous kernel state with no latency.
+pub fn spaceHeldNow(self: *const Self) bool {
+    var key_bits: [KEY_BIT_BYTES]u8 = undefined;
+    for (self.fds.items) |fd| {
+        // memset BEFORE the ioctl so an EBADF/EINVAL/etc leaves the
+        // buffer all-zero — the bit check then returns false, the
+        // safe default (jingle plays, no surprise silencing).
+        @memset(&key_bits, 0);
+        _ = std.os.linux.ioctl(@intCast(fd), EVIOCGKEY_96, @intFromPtr(&key_bits));
+        const byte_idx: usize = KEY_SPACE >> 3;
+        const bit_idx: u3 = @intCast(KEY_SPACE & 7);
+        if ((key_bits[byte_idx] & (@as(u8, 1) << bit_idx)) != 0) return true;
+    }
+    return false;
 }
 
 fn scanDevices(self: *Self) !void {
@@ -168,4 +206,18 @@ test "bothShiftsHeld reflects counter state" {
 
 test "InputEvent is 24 bytes on 64-bit" {
     try testing.expectEqual(@as(usize, 24), @sizeOf(InputEvent));
+}
+
+test "EVIOCGKEY_96 encodes to the expected ioctl number" {
+    // Hand-computed: _IOC(READ=2, 'E'=0x45, 0x18, 96)
+    //   = (2<<30) | (96<<16) | (0x45<<8) | 0x18
+    //   = 0x80000000 | 0x00600000 | 0x00004500 | 0x00000018
+    //   = 0x80604518
+    try testing.expectEqual(@as(u32, 0x80604518), EVIOCGKEY_96);
+}
+
+test "spaceHeldNow returns false with no devices open" {
+    var st = init(testing.allocator);
+    defer st.deinit();
+    try testing.expect(!st.spaceHeldNow());
 }
