@@ -340,24 +340,25 @@ fn drawReactPrompt(self: *BootJingle) void {
         drawCentred("for silence", cx, cy + 1, FG_DIM);
     }
 
-    // Countdown bar. Cyan-draining when not held; pinned solid red
-    // when held (gate is closed — keep holding until the bar empties
-    // since the probe checks state at REACT_SEC).
+    // Countdown bar — always drains so the user can see the probe
+    // moment approaching. Colour swaps cyan→red on hold so the
+    // "you're muting" state is unmistakable, but the draining width
+    // stays the same. Held + bar empty = probe just fired, jingle
+    // is silenced.
     const elapsed = self.last_now - self.phase_started;
     const bar_w: usize = 24;
     const remain = @max(@as(f64, 0.0), @min(@as(f64, 1.0), 1.0 - elapsed / REACT_SEC));
-    const filled: usize = if (any_held) bar_w else @intFromFloat(remain * @as(f64, @floatFromInt(bar_w)));
+    const filled: usize = @intFromFloat(remain * @as(f64, @floatFromInt(bar_w)));
     const bar_x: usize = if (cx >= bar_w / 2) cx - bar_w / 2 else 0;
     const bar_y = cy + 3;
     var k: usize = 0;
     while (k < bar_w) : (k += 1) {
         const ch: u32 = if (k < filled) '█' else '░';
-        const fg: u32 = if (any_held)
-            FG_HOLD_HI
-        else if (k < filled)
-            FG_ACCENT
-        else
-            FG_DIM;
+        const fg: u32 = if (any_held) (
+            if (k < filled) FG_HOLD_HI else FG_HOLD_LO
+        ) else (
+            if (k < filled) FG_ACCENT else FG_DIM
+        );
         TerminalBuffer.drawCharMultiple(ch, bar_x + k, bar_y, 1, fg, BG);
     }
 }
