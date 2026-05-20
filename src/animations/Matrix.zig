@@ -90,6 +90,36 @@ const GLYPH_POOL = [_]u32{
 
 const Matrix = @This();
 
+// Free-falling warning particle injected into the rain when the user
+// holds both shifts (priming the reboot/shutdown gate). Drawn on top
+// of the regular rain layer so it doesn't have to fit into the column
+// state machine.
+pub const WarnParticle = struct {
+    alive: bool = false,
+    // x is a CELL column. We spawn aligned to the same x%2 cadence
+    // the rain uses so the particle reads as "part of the rain".
+    x: u16 = 0,
+    y: u16 = 0,
+    // Float-accumulator vertical velocity (cells per frame). Mirrors
+    // the rain-column speed model so warning particles feel like they
+    // belong to the rain rather than a separate animation.
+    vy: f32 = 0,
+    accum: f32 = 0,
+    ch: u32 = 0x26A0, // ⚠ WARNING SIGN
+};
+
+// Cap on simultaneous warning particles. 24 is enough density to read
+// as "the rain has warnings in it" without filling the screen.
+const WARN_CAP: usize = 24;
+
+// Per-frame probability of spawning a new warning particle while
+// warn_mode is on.
+const WARN_SPAWN_PROB: f32 = 0.35;
+
+// Warning glyph foreground colour. Same red used by the box border
+// when both shifts are held.
+const WARN_FG: u32 = 0x01FF4040;
+
 pub const Dot = struct {
     value: ?usize,
     is_head: bool,
@@ -282,6 +312,15 @@ overlay_drop_peak_prob: f32,
 // 0 = no scrambling; small values give a subtle "data corrupting"
 // flicker before the line falls away.
 overlay_scramble_prob: f32,
+// Live "danger mode" indicator. main.zig writes this every frame
+// from positionWidgets based on InputState.bothShiftsHeld(). When
+// true, stepWarnParticles spawns ⚠ warning glyphs at random columns
+// near the top of the screen; they fall with the rain (own velocity
+// table) until they exit the screen. Going false stops new spawns
+// but doesn't kill existing particles — they finish their fall, so
+// the user releasing both shifts smoothly returns to a quiet rain.
+warn_mode: bool = false,
+warn_particles: [WARN_CAP]WarnParticle = [_]WarnParticle{.{}} ** WARN_CAP,
 
 pub fn init(
     allocator: Allocator,
@@ -1062,10 +1101,75 @@ fn draw(self: *Matrix) void {
     self.stepColumns();
     self.tickGlitches();
     self.decayOverlay();
+    self.stepWarnParticles();
 
     var x: usize = 0;
     while (x < buf_width) : (x += 2) {
         self.renderColumn(x, buf_width, buf_height);
+    }
+
+    // Warning particles render on top of the rain so they survive
+    // any per-cell blanking inside renderColumn.
+    self.drawWarnParticles();
+}
+
+// Advance + spawn warning particles. Called once per draw frame.
+// Always advances existing particles (so they keep falling even
+// after warn_mode flips back to false); only spawns new ones when
+// warn_mode is true.
+fn stepWarnParticles(self: *Matrix) void {
+    const buf_w = self.terminal_buffer.width;
+    const buf_h = self.terminal_buffer.height;
+    if (buf_w == 0 or buf_h == 0) return;
+
+    // Advance existing particles. Float-accumulator model so a vy of
+    // e.g. 0.4 visibly slows the fall — matches rain column semantics.
+    for (&self.warn_particles) |*p| {
+        if (!p.alive) continue;
+        p.accum += p.vy;
+        while (p.accum >= 1.0) {
+            p.accum -= 1.0;
+            const new_y: i32 = @as(i32, @intCast(p.y)) + 1;
+            if (new_y >= @as(i32, @intCast(buf_h))) {
+                p.alive = false;
+                break;
+            }
+            p.y = @intCast(new_y);
+        }
+    }
+
+    if (!self.warn_mode) return;
+    if (self.terminal_buffer.random.float(f32) >= WARN_SPAWN_PROB) return;
+
+    // Find first free slot. If full, drop the spawn — particles will
+    // free up as they fall off the bottom.
+    for (&self.warn_particles) |*p| {
+        if (p.alive) continue;
+        // x aligned to the rain's even-column cadence (rain steps x
+        // by 2 in the render loop). Pick a random even column.
+        const cols: usize = @max(1, buf_w / 2);
+        const col = self.terminal_buffer.random.uintLessThan(usize, cols);
+        p.alive = true;
+        p.x = @intCast(col * 2);
+        p.y = 0;
+        // Vertical speed in the same range as rain (speed_min..speed_max)
+        // so warnings feel native to the column they're in.
+        const span: f32 = @max(0.01, self.speed_max - self.speed_min);
+        p.vy = self.speed_min + self.terminal_buffer.random.float(f32) * span;
+        p.accum = 0;
+        p.ch = 0x26A0; // ⚠
+        return;
+    }
+}
+
+fn drawWarnParticles(self: *const Matrix) void {
+    const buf_w = self.terminal_buffer.width;
+    const buf_h = self.terminal_buffer.height;
+    for (self.warn_particles) |p| {
+        if (!p.alive) continue;
+        if (p.x >= buf_w or p.y >= buf_h) continue;
+        const cell = Cell.init(p.ch, WARN_FG, 0x00000000);
+        cell.put(p.x, p.y);
     }
 }
 

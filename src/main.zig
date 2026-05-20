@@ -697,15 +697,21 @@ pub fn main(init: std.process.Init) !void {
     defer state.mod_hint_label.deinit();
 
     if (!state.config.hide_key_hints) {
+        // The configured shutdown_key/restart_key strings are also
+        // used to register the keybind (line ~1622), so they stay
+        // as parseable termbox specs like "Shift+F10". But the
+        // ACTION is gated behind the L+R both-shifts evdev check
+        // (antiMisclickAllowed). To telegraph that to the user the
+        // displayed hint replaces "Shift+" with "Both Shifts+".
         try state.shutdown_label.setTextAlloc(
             state.allocator,
-            "{s} {s} ",
-            .{ state.config.shutdown_key, state.lang.shutdown },
+            "Both Shifts+{s} {s} ",
+            .{ stripShiftPrefix(state.config.shutdown_key), state.lang.shutdown },
         );
         try state.restart_label.setTextAlloc(
             state.allocator,
-            "{s} {s} ",
-            .{ state.config.restart_key, state.lang.restart },
+            "Both Shifts+{s} {s} ",
+            .{ stripShiftPrefix(state.config.restart_key), state.lang.restart },
         );
         try state.toggle_password_label.setTextAlloc(
             state.allocator,
@@ -2443,6 +2449,17 @@ fn authenticate(ptr: *anyopaque) !bool {
 // visible info-line warning. When evdev isn't available, the
 // configured key alone (Ctrl+Shift+F10 by default) provides basic
 // anti-misclick.
+// Strip a "Shift+" or "Ctrl+Shift+" prefix so the displayed hint
+// reads "Both Shifts+F10" instead of "Both Shifts+Shift+F10". Robust
+// against the user using either spec since we only need the trailing
+// F-key for display purposes.
+fn stripShiftPrefix(key: []const u8) []const u8 {
+    if (std.mem.lastIndexOf(u8, key, "+")) |i| {
+        return key[i + 1 ..];
+    }
+    return key;
+}
+
 fn antiMisclickAllowed(state: *UiState) bool {
     if (!state.input_state_available) return true;
     return state.input_state.bothShiftsHeld();
@@ -2776,6 +2793,19 @@ fn updateSessionSpecifier(self: *Label, ptr: *anyopaque) !void {
 
 fn positionWidgets(ptr: *anyopaque) !void {
     var state: *UiState = @ptrCast(@alignCast(ptr));
+
+    // Live danger-state poll. While both shifts are held the user is
+    // priming the reboot/shutdown gate — flip the login-box border
+    // red and turn on warning-particle spawn in the matrix rain so
+    // the visual confirms the gate is armed. Released = back to
+    // config-default border colour; matrix stops spawning new
+    // warnings (existing ones finish their fall, see Matrix
+    // stepWarnParticles).
+    const both_shifts: bool =
+        if (state.input_state_available) state.input_state.bothShiftsHeld() else false;
+    const DANGER_BORDER: u32 = 0x01FF4040;
+    state.box.border_fg = if (both_shifts) DANGER_BORDER else state.config.border_fg;
+    if (state.matrix_ref) |m| m.warn_mode = both_shifts;
 
     // Offsets for custom bind placement. Declared here instead of the
     // below if stmt as we need these for `battery_label` positioning.

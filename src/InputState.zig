@@ -101,7 +101,13 @@ pub fn deinit(self: *Self) void {
 }
 
 pub fn bothShiftsHeld(self: *const Self) bool {
-    return self.lshift.load(.seq_cst) > 0 and self.rshift.load(.seq_cst) > 0;
+    // Use the EVIOCGKEY-based real-device probes rather than the
+    // event-stream counters: counters get conflated by keyd's
+    // virtual keyboard (RSHIFT-only press sets the LSHIFT counter
+    // via uinput), which would let a single-RSHIFT pass this gate.
+    // The kernel-state probes read the physical bitmap on real
+    // HID devices, so they're conflation-free.
+    return self.lshiftHeldNow() and self.rshiftHeldNow();
 }
 
 // keyd's virtual keyboard (uinput device, typically /dev/input/event26
