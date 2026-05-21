@@ -98,8 +98,17 @@ const Matrix = @This();
 // state machine.
 pub const WarnKind = enum(u8) { icon, text };
 
+// Two-phase lifecycle. Frozen particles are stationary visible markers
+// while the user holds both shifts. The moment the user releases (or
+// warn_mode otherwise flips off) every frozen particle transitions to
+// scrambling and is committed to its fall — it WILL NOT return to
+// frozen if the user presses both shifts again. The held-press just
+// spawns NEW frozen particles in fresh slots to compensate.
+pub const WarnPhase = enum(u8) { frozen, scrambling };
+
 pub const WarnParticle = struct {
     alive: bool = false,
+    phase: WarnPhase = .frozen,
     kind: WarnKind = .icon,
     // x is a CELL column. We spawn aligned to the same x%2 cadence
     // the rain uses so the particle reads as "part of the rain".
@@ -1176,80 +1185,90 @@ fn draw(self: *Matrix) void {
     self.drawWarnParticles();
 }
 
-// Step + spawn warning particles. Three-phase behaviour:
+// Step + spawn warning particles. Lifecycle:
 //
-//   rising edge      → burst-fill every empty slot in one frame so
-//   (false → true)     the danger field appears INSTANTLY. Each
-//                      particle gets a random fall_delay in
-//                      [0, WARN_RELEASE_DELAY_MAX] so on release the
-//                      drain is staggered rather than synchronized.
+//   falling edge       Every frozen particle is committed to
+//   (true → false)     scrambling — sets its phase, rolls a fresh
+//                      fall_delay. Once a particle is scrambling it
+//                      finishes its fall regardless of further
+//                      warn_mode toggles.
 //
-//   warn_mode TRUE   → field is frozen. No movement, no top-up
-//                      (cap is full from the rising edge).
+//   warn_mode TRUE     Keep the FROZEN particle count topped up at
+//                      warn_icon_cap. Existing scrambling particles
+//                      are left alone — re-pressing shifts spawns
+//                      fresh frozen markers in NEW empty slots.
 //
-//   warn_mode FALSE  → each particle ticks down its fall_delay; once
-//                      at zero it advances at its pre-baked vy and
-//                      exits off the bottom. Random delays mean
-//                      different particles start falling at different
-//                      times, making the drain look organic.
+//   warn_mode FALSE    Per-frame: scrambling particles tick their
+//                      release delay; once expired, advance y at the
+//                      pre-baked vy. Frozen particles (rare in this
+//                      state — only present if warn_mode just flipped)
+//                      stay where they are until next falling edge.
+//                      In normal flow there are none here.
 fn stepWarnParticles(self: *Matrix) void {
     const buf_w = self.terminal_buffer.width;
     const buf_h = self.terminal_buffer.height;
     if (buf_w == 0 or buf_h == 0) return;
 
-    const rising_edge = self.warn_mode and !self.prev_warn_mode;
+    const falling_edge = !self.warn_mode and self.prev_warn_mode;
     self.prev_warn_mode = self.warn_mode;
 
-    if (rising_edge) {
-        // Burst-fill first warn_icon_cap empty slots this frame.
-        const cap: usize = @min(@as(usize, self.warn_icon_cap), WARN_MAX_CAP);
-        const want_text = self.warn_text_show;
-        const want_icons = self.warn_icons_show;
-        if (!want_text and !want_icons) return;
-        var filled: usize = 0;
+    if (falling_edge) {
         for (&self.warn_particles) |*p| {
-            if (filled >= cap) break;
-            if (p.alive) {
-                filled += 1;
-                continue;
-            }
-            // Pick kind: if both channels enabled, ~40% are text tags
-            // (the rest are single ⚠ icons). Otherwise force the
-            // enabled kind.
-            const pick_text: bool = if (want_text and want_icons)
-                (self.terminal_buffer.random.float(f32) < 0.40)
-            else
-                want_text;
-            p.kind = if (pick_text) .text else .icon;
-
-            const row = self.terminal_buffer.random.uintLessThan(usize, buf_h);
-            const cols: usize = @max(1, buf_w / 2);
-            const col = self.terminal_buffer.random.uintLessThan(usize, cols);
-            p.alive = true;
-            p.x = @intCast(col * 2);
-            p.y = @intCast(row);
-            const span: f32 = @max(0.01, self.speed_max - self.speed_min);
-            p.vy = self.speed_min + self.terminal_buffer.random.float(f32) * span;
-            p.accum = 0;
-            p.ch = 0x26A0; // ⚠
-            p.text_idx = @intCast(self.terminal_buffer.random.uintLessThan(usize, WARN_TEXTS.len));
+            if (!p.alive) continue;
+            if (p.phase != .frozen) continue;
+            p.phase = .scrambling;
             const max_delay: u16 = @max(1, self.warn_release_delay_max);
             p.fall_delay = self.terminal_buffer.random.uintLessThan(u16, max_delay);
-            filled += 1;
         }
-        return;
     }
 
+    // While held: spawn frozen particles into empty slots until
+    // FROZEN-count reaches the cap. Scrambling particles still
+    // occupy slots but DON'T count toward the cap — that's how
+    // compensation works when the user presses again mid-drain.
     if (self.warn_mode) {
-        // Held — field stays frozen; no top-up because the rising
-        // edge already filled every slot.
-        return;
+        const want_text = self.warn_text_show;
+        const want_icons = self.warn_icons_show;
+        if (want_text or want_icons) {
+            const cap: usize = @min(@as(usize, self.warn_icon_cap), WARN_MAX_CAP);
+            var frozen_count: usize = 0;
+            for (self.warn_particles) |p| {
+                if (p.alive and p.phase == .frozen) frozen_count += 1;
+            }
+            var need: usize = if (frozen_count < cap) cap - frozen_count else 0;
+            if (need > 0) {
+                for (&self.warn_particles) |*p| {
+                    if (need == 0) break;
+                    if (p.alive) continue;
+                    const pick_text: bool = if (want_text and want_icons)
+                        (self.terminal_buffer.random.float(f32) < 0.40)
+                    else
+                        want_text;
+                    p.kind = if (pick_text) .text else .icon;
+                    p.phase = .frozen;
+                    const row = self.terminal_buffer.random.uintLessThan(usize, buf_h);
+                    const cols: usize = @max(1, buf_w / 2);
+                    const col = self.terminal_buffer.random.uintLessThan(usize, cols);
+                    p.alive = true;
+                    p.x = @intCast(col * 2);
+                    p.y = @intCast(row);
+                    const span: f32 = @max(0.01, self.speed_max - self.speed_min);
+                    p.vy = self.speed_min + self.terminal_buffer.random.float(f32) * span;
+                    p.accum = 0;
+                    p.ch = 0x26A0;
+                    p.text_idx = @intCast(self.terminal_buffer.random.uintLessThan(usize, WARN_TEXTS.len));
+                    p.fall_delay = 0; // unused for frozen; rolled at falling edge
+                    need -= 1;
+                }
+            }
+        }
     }
 
-    // Released — advance, but each particle waits out its own
-    // fall_delay before starting to move.
+    // Advance every scrambling particle. Runs regardless of warn_mode
+    // so re-pressing shifts cannot pause an in-flight scramble.
     for (&self.warn_particles) |*p| {
         if (!p.alive) continue;
+        if (p.phase != .scrambling) continue;
         if (p.fall_delay > 0) {
             p.fall_delay -= 1;
             continue;
@@ -1268,7 +1287,12 @@ fn stepWarnParticles(self: *Matrix) void {
 }
 
 
-fn drawWarnParticles(self: *const Matrix) void {
+// Random per-glyph corruption chance while a particle is scrambling.
+// Each frame each cell of the text rolls a fresh random replacement
+// with this probability — gives the "characters falling apart" feel.
+const WARN_SCRAMBLE_PROB: f32 = 0.45;
+
+fn drawWarnParticles(self: *Matrix) void {
     if (!self.warn_enabled) return;
     const buf_w = self.terminal_buffer.width;
     const buf_h = self.terminal_buffer.height;
@@ -1279,7 +1303,17 @@ fn drawWarnParticles(self: *const Matrix) void {
             .icon => {
                 if (!self.warn_icons_show) continue;
                 if (p.x >= buf_w) continue;
-                Cell.init(p.ch, WARN_FG, 0x00000000).put(p.x, p.y);
+                var ch: u32 = p.ch;
+                if (p.phase == .scrambling and
+                    self.terminal_buffer.random.float(f32) < WARN_SCRAMBLE_PROB)
+                {
+                    // Debris pool — visually reads as the icon
+                    // breaking apart.
+                    const debris = [_]u32{ '*', '.', '!', '?', '#', '+', 0x00B7 };
+                    const ix = self.terminal_buffer.random.uintLessThan(usize, debris.len);
+                    ch = debris[ix];
+                }
+                Cell.init(ch, WARN_FG, 0x00000000).put(p.x, p.y);
             },
             .text => {
                 if (!self.warn_text_show) continue;
@@ -1287,7 +1321,24 @@ fn drawWarnParticles(self: *const Matrix) void {
                 const text = WARN_TEXTS[idx];
                 const tw = TerminalBuffer.strWidth(text);
                 if (p.x >= buf_w or p.x + tw > buf_w) continue;
-                TerminalBuffer.drawText(text, p.x, p.y, WARN_FG, 0x00000000);
+                if (p.phase == .frozen) {
+                    TerminalBuffer.drawText(text, p.x, p.y, WARN_FG, 0x00000000);
+                } else {
+                    // Scrambling — render char-by-char, each cell
+                    // has WARN_SCRAMBLE_PROB chance of being a
+                    // random printable ASCII instead of the
+                    // original glyph.
+                    var ci: usize = 0;
+                    var utf8 = (std.unicode.Utf8View.init(text) catch return).iterator();
+                    while (utf8.nextCodepoint()) |cp| : (ci += 1) {
+                        var rendered: u32 = cp;
+                        if (self.terminal_buffer.random.float(f32) < WARN_SCRAMBLE_PROB) {
+                            const r = self.terminal_buffer.random.int(u16);
+                            rendered = 33 + @as(u32, @mod(r, 94));
+                        }
+                        Cell.init(rendered, WARN_FG, 0x00000000).put(p.x + ci, p.y);
+                    }
+                }
             },
         }
     }
