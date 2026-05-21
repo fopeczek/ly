@@ -1125,17 +1125,50 @@ fn draw(self: *Matrix) void {
     self.drawWarnParticles();
 }
 
-// Advance + spawn warning particles. Called once per draw frame.
-// Always advances existing particles (so they keep falling even
-// after warn_mode flips back to false); only spawns new ones when
-// warn_mode is true.
+// Step + spawn warning particles. Two-mode behaviour:
+//
+//   warn_mode TRUE  → particles FREEZE in place. They keep spawning
+//                     at random positions across the screen until the
+//                     cap is reached, building a static "danger field"
+//                     while the user holds the gate.
+//
+//   warn_mode FALSE → no new spawns. Existing particles advance at
+//                     rain-column speeds and exit off the bottom of
+//                     the screen. The user sees the danger field
+//                     drain away as the rain.
 fn stepWarnParticles(self: *Matrix) void {
     const buf_w = self.terminal_buffer.width;
     const buf_h = self.terminal_buffer.height;
     if (buf_w == 0 or buf_h == 0) return;
 
-    // Advance existing particles. Float-accumulator model so a vy of
-    // e.g. 0.4 visibly slows the fall — matches rain column semantics.
+    if (self.warn_mode) {
+        // Frozen field — only spawn new particles, don't advance
+        // existing ones. They appear at random (col, row) so the
+        // visual reads as "warnings injected into the rain layer"
+        // rather than dripping from the top.
+        if (self.terminal_buffer.random.float(f32) >= WARN_SPAWN_PROB) return;
+        for (&self.warn_particles) |*p| {
+            if (p.alive) continue;
+            const cols: usize = @max(1, buf_w / 2);
+            const col = self.terminal_buffer.random.uintLessThan(usize, cols);
+            const row = self.terminal_buffer.random.uintLessThan(usize, buf_h);
+            p.alive = true;
+            p.x = @intCast(col * 2);
+            p.y = @intCast(row);
+            // Pre-compute fall velocity so when the gate releases
+            // the field drains at varied rain-like speeds.
+            const span: f32 = @max(0.01, self.speed_max - self.speed_min);
+            p.vy = self.speed_min + self.terminal_buffer.random.float(f32) * span;
+            p.accum = 0;
+            p.ch = 0x26A0; // ⚠
+            return;
+        }
+        return;
+    }
+
+    // warn_mode just flipped off (or has been off) — advance each
+    // particle at its pre-baked vy. Particles that exit the bottom
+    // free their slot.
     for (&self.warn_particles) |*p| {
         if (!p.alive) continue;
         p.accum += p.vy;
@@ -1148,29 +1181,6 @@ fn stepWarnParticles(self: *Matrix) void {
             }
             p.y = @intCast(new_y);
         }
-    }
-
-    if (!self.warn_mode) return;
-    if (self.terminal_buffer.random.float(f32) >= WARN_SPAWN_PROB) return;
-
-    // Find first free slot. If full, drop the spawn — particles will
-    // free up as they fall off the bottom.
-    for (&self.warn_particles) |*p| {
-        if (p.alive) continue;
-        // x aligned to the rain's even-column cadence (rain steps x
-        // by 2 in the render loop). Pick a random even column.
-        const cols: usize = @max(1, buf_w / 2);
-        const col = self.terminal_buffer.random.uintLessThan(usize, cols);
-        p.alive = true;
-        p.x = @intCast(col * 2);
-        p.y = 0;
-        // Vertical speed in the same range as rain (speed_min..speed_max)
-        // so warnings feel native to the column they're in.
-        const span: f32 = @max(0.01, self.speed_max - self.speed_min);
-        p.vy = self.speed_min + self.terminal_buffer.random.float(f32) * span;
-        p.accum = 0;
-        p.ch = 0x26A0; // ⚠
-        return;
     }
 }
 
