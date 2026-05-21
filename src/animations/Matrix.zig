@@ -96,7 +96,14 @@ const Matrix = @This();
 // holds both shifts (priming the reboot/shutdown gate). Drawn on top
 // of the regular rain layer so it doesn't have to fit into the column
 // state machine.
-pub const WarnKind = enum(u8) { icon, text };
+// icon : single-cell ⚠ (or debris while scrambling)
+// text : multi-cell bracketed tag like [WARNING]; only frozen — on
+//        release it EXPLODES into a row of `char` particles
+// char : single character that fell out of a text on release. Falls
+//        + scrambles with text-style ASCII corruption (not icon
+//        debris) so the visual reads as the letter itself coming
+//        apart, not as random debris.
+pub const WarnKind = enum(u8) { icon, text, char };
 
 // Two-phase lifecycle. Frozen particles are stationary visible markers
 // while the user holds both shifts. The moment the user releases (or
@@ -143,10 +150,12 @@ const WARN_TEXTS = [_][]const u8{
 };
 
 // Hard upper bound on warning particle slots. Runtime warn_icon_cap
-// clamps the active count below this. Keeping the array fixed-size at
-// the max means changing the cap at runtime is a one-line write, no
-// reallocation.
-const WARN_MAX_CAP: usize = 48;
+// clamps the active FROZEN count below this. Big enough to hold the
+// initial frozen field (up to ~48) plus every character that gets
+// exploded from text particles on release (each [WARNING] = 9 char
+// particles), with headroom for re-presses spawning new frozen ones
+// alongside still-falling letter debris.
+const WARN_MAX_CAP: usize = 256;
 
 // Warning glyph foreground colour. Same red used by the box border
 // when both shifts are held.
@@ -365,12 +374,24 @@ warn_enabled: bool = true,
 warn_border_show: bool = true,
 warn_text_show: bool = true,
 warn_icons_show: bool = true,
-// Active particle slot count. Clamped to WARN_MAX_CAP. 0 = none.
+// Active FROZEN particle count target (slots filled while held).
+// Total alive may exceed this when re-pressing during a drain —
+// fresh frozen ones spawn on top of still-falling letter debris.
+// Clamped to WARN_MAX_CAP / 2 so there's always room to explode
+// every text into chars without slot exhaustion.
 warn_icon_cap: u8 = 24,
 // Max random per-particle release delay (frames). The slowest-to-
 // start particle takes this long to begin falling after the user
 // releases both shifts. 150 ≈ 3s at 50fps. Zero = synchronous fall.
 warn_release_delay_max: u16 = 150,
+// Base fall speed (cells per frame) for warning particles. Each
+// particle gets a random ±30% jitter around this on spawn so a
+// single [WARNING] explodes into letters falling at varied speeds.
+warn_fall_speed: f32 = 0.5,
+// Per-cell, per-frame probability of swapping a scrambling
+// particle's glyph for a random replacement. 0 = no scrambling
+// (smooth fall); 1 = full chaos every frame.
+warn_scramble_prob: f32 = 0.45,
 // Shift-watch hooks. Matrix.update is called every frame, so we use
 // it to poll bothShiftsHeld(). When true, flip warn_mode (drives the
 // ⚠ particle spawn) AND overwrite *shift_watch_box_border_fg with
@@ -994,6 +1015,8 @@ fn saveImpl(self: *Matrix, io: std.Io) !void {
     try w.interface.print("warn_icons_show={d}\n", .{@as(u8, if (self.warn_icons_show) 1 else 0)});
     try w.interface.print("warn_icon_cap={d}\n", .{self.warn_icon_cap});
     try w.interface.print("warn_release_delay_max={d}\n", .{self.warn_release_delay_max});
+    try w.interface.print("warn_fall_speed={d:.4}\n", .{self.warn_fall_speed});
+    try w.interface.print("warn_scramble_prob={d:.4}\n", .{self.warn_scramble_prob});
     try w.interface.flush();
 }
 
@@ -1071,6 +1094,8 @@ fn loadImpl(self: *Matrix, io: std.Io) !void {
         else if (std.mem.eql(u8, key, "warn_icons_show")) self.warn_icons_show = (std.fmt.parseInt(u8, val, 10) catch 1) != 0
         else if (std.mem.eql(u8, key, "warn_icon_cap")) self.warn_icon_cap = std.fmt.parseInt(u8, val, 10) catch self.warn_icon_cap
         else if (std.mem.eql(u8, key, "warn_release_delay_max")) self.warn_release_delay_max = std.fmt.parseInt(u16, val, 10) catch self.warn_release_delay_max
+        else if (std.mem.eql(u8, key, "warn_fall_speed")) self.warn_fall_speed = std.fmt.parseFloat(f32, val) catch self.warn_fall_speed
+        else if (std.mem.eql(u8, key, "warn_scramble_prob")) self.warn_scramble_prob = std.fmt.parseFloat(f32, val) catch self.warn_scramble_prob
         // overlay_fall_step removed in 2026-05 (hardcoded step=1).
         // Silently ignore the key in old prefs files — no else-if so
         // it falls into the unknown-key drop path above.
@@ -1213,12 +1238,63 @@ fn stepWarnParticles(self: *Matrix) void {
     self.prev_warn_mode = self.warn_mode;
 
     if (falling_edge) {
+        // Two-pass falling-edge handling:
+        //   pass 1: collect every frozen text particle's location so
+        //           we can iterate without modifying-while-iterating;
+        //           also kill the originals and transition frozen
+        //           icons to scrambling in place.
+        //   pass 2: spawn one .char particle per letter of each
+        //           collected text, each at its own (x+i, y) with
+        //           a slightly jittered fall speed so the letters
+        //           drift apart visually as they fall.
+        var exp_x: [WARN_MAX_CAP]u16 = undefined;
+        var exp_y: [WARN_MAX_CAP]u16 = undefined;
+        var exp_text_idx: [WARN_MAX_CAP]u8 = undefined;
+        var n_exp: usize = 0;
+        const max_delay: u16 = @max(1, self.warn_release_delay_max);
         for (&self.warn_particles) |*p| {
             if (!p.alive) continue;
             if (p.phase != .frozen) continue;
-            p.phase = .scrambling;
-            const max_delay: u16 = @max(1, self.warn_release_delay_max);
-            p.fall_delay = self.terminal_buffer.random.uintLessThan(u16, max_delay);
+            if (p.kind == .text) {
+                if (n_exp < WARN_MAX_CAP) {
+                    exp_x[n_exp] = p.x;
+                    exp_y[n_exp] = p.y;
+                    exp_text_idx[n_exp] = p.text_idx;
+                    n_exp += 1;
+                }
+                p.alive = false;
+            } else {
+                p.phase = .scrambling;
+                p.fall_delay = self.terminal_buffer.random.uintLessThan(u16, max_delay);
+            }
+        }
+        // Pass 2: explode collected texts into .char particles.
+        var ji: usize = 0;
+        while (ji < n_exp) : (ji += 1) {
+            const tidx = @min(@as(usize, exp_text_idx[ji]), WARN_TEXTS.len - 1);
+            const text = WARN_TEXTS[tidx];
+            var utf8_iter = (std.unicode.Utf8View.init(text) catch continue).iterator();
+            var ci: usize = 0;
+            while (utf8_iter.nextCodepoint()) |cp| : (ci += 1) {
+                for (&self.warn_particles) |*q| {
+                    if (q.alive) continue;
+                    q.alive = true;
+                    q.kind = .char;
+                    q.phase = .scrambling;
+                    q.x = exp_x[ji] + @as(u16, @intCast(ci));
+                    q.y = exp_y[ji];
+                    // Per-letter ±30% jitter so the row visibly
+                    // fragments — letters drift to different rows
+                    // within a few frames.
+                    const jitter = 0.7 + self.terminal_buffer.random.float(f32) * 0.6;
+                    q.vy = self.warn_fall_speed * jitter;
+                    q.accum = 0;
+                    q.ch = cp;
+                    q.text_idx = 0;
+                    q.fall_delay = self.terminal_buffer.random.uintLessThan(u16, max_delay);
+                    break;
+                }
+            }
         }
     }
 
@@ -1252,8 +1328,12 @@ fn stepWarnParticles(self: *Matrix) void {
                     p.alive = true;
                     p.x = @intCast(col * 2);
                     p.y = @intCast(row);
-                    const span: f32 = @max(0.01, self.speed_max - self.speed_min);
-                    p.vy = self.speed_min + self.terminal_buffer.random.float(f32) * span;
+                    // Frozen particles get a pre-baked fall speed
+                    // jittered ±30% around warn_fall_speed, used if
+                    // (when icon) or by the per-char explosion if
+                    // (when text) on the next falling edge.
+                    const jitter = 0.7 + self.terminal_buffer.random.float(f32) * 0.6;
+                    p.vy = self.warn_fall_speed * jitter;
                     p.accum = 0;
                     p.ch = 0x26A0;
                     p.text_idx = @intCast(self.terminal_buffer.random.uintLessThan(usize, WARN_TEXTS.len));
@@ -1287,15 +1367,11 @@ fn stepWarnParticles(self: *Matrix) void {
 }
 
 
-// Random per-glyph corruption chance while a particle is scrambling.
-// Each frame each cell of the text rolls a fresh random replacement
-// with this probability — gives the "characters falling apart" feel.
-const WARN_SCRAMBLE_PROB: f32 = 0.45;
-
 fn drawWarnParticles(self: *Matrix) void {
     if (!self.warn_enabled) return;
     const buf_w = self.terminal_buffer.width;
     const buf_h = self.terminal_buffer.height;
+    const scramble_p = self.warn_scramble_prob;
     for (self.warn_particles) |p| {
         if (!p.alive) continue;
         if (p.y >= buf_h) continue;
@@ -1305,10 +1381,8 @@ fn drawWarnParticles(self: *Matrix) void {
                 if (p.x >= buf_w) continue;
                 var ch: u32 = p.ch;
                 if (p.phase == .scrambling and
-                    self.terminal_buffer.random.float(f32) < WARN_SCRAMBLE_PROB)
+                    self.terminal_buffer.random.float(f32) < scramble_p)
                 {
-                    // Debris pool — visually reads as the icon
-                    // breaking apart.
                     const debris = [_]u32{ '*', '.', '!', '?', '#', '+', 0x00B7 };
                     const ix = self.terminal_buffer.random.uintLessThan(usize, debris.len);
                     ch = debris[ix];
@@ -1316,29 +1390,30 @@ fn drawWarnParticles(self: *Matrix) void {
                 Cell.init(ch, WARN_FG, 0x00000000).put(p.x, p.y);
             },
             .text => {
+                // Only frozen text particles render this branch; on
+                // release they're exploded into .char particles in
+                // stepWarnParticles. Defensive: also handle a stale
+                // scrambling .text by rendering as-is (shouldn't
+                // happen in steady state).
                 if (!self.warn_text_show) continue;
                 const idx: usize = @min(@as(usize, p.text_idx), WARN_TEXTS.len - 1);
                 const text = WARN_TEXTS[idx];
                 const tw = TerminalBuffer.strWidth(text);
                 if (p.x >= buf_w or p.x + tw > buf_w) continue;
-                if (p.phase == .frozen) {
-                    TerminalBuffer.drawText(text, p.x, p.y, WARN_FG, 0x00000000);
-                } else {
-                    // Scrambling — render char-by-char, each cell
-                    // has WARN_SCRAMBLE_PROB chance of being a
-                    // random printable ASCII instead of the
-                    // original glyph.
-                    var ci: usize = 0;
-                    var utf8 = (std.unicode.Utf8View.init(text) catch return).iterator();
-                    while (utf8.nextCodepoint()) |cp| : (ci += 1) {
-                        var rendered: u32 = cp;
-                        if (self.terminal_buffer.random.float(f32) < WARN_SCRAMBLE_PROB) {
-                            const r = self.terminal_buffer.random.int(u16);
-                            rendered = 33 + @as(u32, @mod(r, 94));
-                        }
-                        Cell.init(rendered, WARN_FG, 0x00000000).put(p.x + ci, p.y);
-                    }
+                TerminalBuffer.drawText(text, p.x, p.y, WARN_FG, 0x00000000);
+            },
+            .char => {
+                // Exploded text letter. Always scrambling — uses the
+                // text-style ASCII corruption so the letter visibly
+                // fractures as it falls.
+                if (!self.warn_text_show) continue;
+                if (p.x >= buf_w) continue;
+                var ch: u32 = p.ch;
+                if (self.terminal_buffer.random.float(f32) < scramble_p) {
+                    const r = self.terminal_buffer.random.int(u16);
+                    ch = 33 + @as(u32, @mod(r, 94));
                 }
+                Cell.init(ch, WARN_FG, 0x00000000).put(p.x, p.y);
             },
         }
     }

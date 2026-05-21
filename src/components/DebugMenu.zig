@@ -77,6 +77,8 @@ pub const Item = enum {
     danger_icons_show,
     danger_icon_cap,
     danger_release_delay,
+    danger_fall_speed,
+    danger_scramble_prob,
 
     pub fn label(self: Item) []const u8 {
         // Labels are padded to 16 chars so the value column lines
@@ -126,6 +128,8 @@ pub const Item = enum {
             .danger_icons_show => "warn icons      ",
             .danger_icon_cap => "icon count      ",
             .danger_release_delay => "release stagger ",
+            .danger_fall_speed => "fall speed      ",
+            .danger_scramble_prob => "scramble rate   ",
         };
     }
 
@@ -179,6 +183,8 @@ pub const Item = enum {
             .danger_icons_show => "Spawn red \xe2\x9a\xa0 icons\nscattered across the\nscreen while both\nshifts are held; they\nfall with the rain\non release.",
             .danger_icon_cap => "How many \xe2\x9a\xa0 icons\nshould appear at\nonce. 0 = none.\nClamped to 48.",
             .danger_release_delay => "Max random per-icon\ndelay (frames) before\nstart of fall after\nshift release. Higher\n= more staggered drain.",
+            .danger_fall_speed => "How fast the warning\nparticles drop, in\ncells per frame. Each\nparticle gets \xc2\xb130%\njitter so letters of\nan exploded [WARNING]\ndrift apart at\ndifferent speeds.",
+            .danger_scramble_prob => "Per-cell, per-frame\nchance a falling\nwarning glyph swaps\nto a random char.\n0 = clean fall.\n1 = constant chaos.",
         };
     }
 
@@ -200,14 +206,18 @@ pub const Tab = enum {
     danger,
 
     pub fn name(self: Tab) []const u8 {
+        // Short labels so the tab strip stays inside the panel
+        // without bumping panel_w on every new tab. Reasonable
+        // upper bound: 7 tabs * 7 chars (including brackets) = 49,
+        // well under panel_w=66.
         return switch (self) {
             .rain => "Rain",
-            .glitches => "Glitches",
-            .errors => "Errors",
-            .lockout => "Lockout",
-            .animations => "Animations",
-            .bootup => "Bootup",
-            .danger => "Danger",
+            .glitches => "Glitch",
+            .errors => "Errs",
+            .lockout => "Lock",
+            .animations => "Anim",
+            .bootup => "Boot",
+            .danger => "Warn",
         };
     }
 
@@ -248,6 +258,8 @@ pub const Tab = enum {
                 .danger_icons_show,
                 .danger_icon_cap,
                 .danger_release_delay,
+                .danger_fall_speed,
+                .danger_scramble_prob,
             },
         };
     }
@@ -469,6 +481,8 @@ pub fn adjustScaled(self: *DebugMenu, m: *Matrix, delta: i8, step_scale: f32) Ac
         .danger_icons_show => { m.warn_icons_show = !m.warn_icons_show; },
         .danger_icon_cap => m.warn_icon_cap = u8_adjust(m.warn_icon_cap, int_step, 0, 48),
         .danger_release_delay => m.warn_release_delay_max = u16_adjust(m.warn_release_delay_max, int_step, 0, 600),
+        .danger_fall_speed => m.warn_fall_speed = std.math.clamp(m.warn_fall_speed + @as(f32, @floatFromInt(delta)) * 0.05 * step_scale, 0.0, 2.0),
+        .danger_scramble_prob => m.warn_scramble_prob = std.math.clamp(m.warn_scramble_prob + @as(f32, @floatFromInt(delta)) * 0.02 * step_scale, 0.0, 1.0),
         .readout_locked, .readout_auth_fails => {},
         .lockout_animation => {
             // Cycle through animation types regardless of delta sign.
@@ -577,6 +591,8 @@ pub fn formatValue(
         .danger_icons_show => try std.fmt.bufPrint(buf, "{s}", .{if (m.warn_icons_show) "yes" else "no"}),
         .danger_icon_cap => try std.fmt.bufPrint(buf, "{d}", .{m.warn_icon_cap}),
         .danger_release_delay => try std.fmt.bufPrint(buf, "{d}f (~{d:.1}s)", .{ m.warn_release_delay_max, @as(f32, @floatFromInt(m.warn_release_delay_max)) / 50.0 }),
+        .danger_fall_speed => try std.fmt.bufPrint(buf, "{d:.2} cells/frame", .{m.warn_fall_speed}),
+        .danger_scramble_prob => try std.fmt.bufPrint(buf, "{d:.2}", .{m.warn_scramble_prob}),
     };
 }
 
