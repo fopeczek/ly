@@ -96,8 +96,11 @@ const Matrix = @This();
 // holds both shifts (priming the reboot/shutdown gate). Drawn on top
 // of the regular rain layer so it doesn't have to fit into the column
 // state machine.
+pub const WarnKind = enum(u8) { icon, text };
+
 pub const WarnParticle = struct {
     alive: bool = false,
+    kind: WarnKind = .icon,
     // x is a CELL column. We spawn aligned to the same x%2 cadence
     // the rain uses so the particle reads as "part of the rain".
     x: u16 = 0,
@@ -109,9 +112,25 @@ pub const WarnParticle = struct {
     accum: f32 = 0,
     // Frames to wait before this particle starts falling after the
     // shift gate releases. Random per-particle so the drain looks
-    // organic instead of every ⚠ moving in lockstep.
+    // organic instead of every particle moving in lockstep.
     fall_delay: u16 = 0,
+    // Used only for .icon kind. For .text kind the rendered string
+    // is the constant WARN_TEXT[text_idx].
     ch: u32 = 0x26A0, // ⚠ WARNING SIGN
+    // Index into WARN_TEXTS picked at spawn time. Stays stable so the
+    // same string falls together when the gate releases.
+    text_idx: u8 = 0,
+};
+
+// Short bracketed strings used as scattered [warning]-tags through
+// the rain. Mixed widths feel more error-log-like than one repeated
+// string. Picked at spawn time per .text particle.
+const WARN_TEXTS = [_][]const u8{
+    "[WARNING]",
+    "[WARN]",
+    "[!!]",
+    "[ALERT]",
+    "[ERROR]",
 };
 
 // Hard upper bound on warning particle slots. Runtime warn_icon_cap
@@ -1152,10 +1171,9 @@ fn draw(self: *Matrix) void {
         self.renderColumn(x, buf_width, buf_height);
     }
 
-    // Warning particles + [WARNING] banner render on top of the rain
-    // so they survive any per-cell blanking inside renderColumn.
+    // Warning particles render on top of the rain so they survive
+    // any per-cell blanking inside renderColumn.
     self.drawWarnParticles();
-    self.drawWarningText();
 }
 
 // Step + spawn warning particles. Three-phase behaviour:
@@ -1185,6 +1203,9 @@ fn stepWarnParticles(self: *Matrix) void {
     if (rising_edge) {
         // Burst-fill first warn_icon_cap empty slots this frame.
         const cap: usize = @min(@as(usize, self.warn_icon_cap), WARN_MAX_CAP);
+        const want_text = self.warn_text_show;
+        const want_icons = self.warn_icons_show;
+        if (!want_text and !want_icons) return;
         var filled: usize = 0;
         for (&self.warn_particles) |*p| {
             if (filled >= cap) break;
@@ -1192,9 +1213,18 @@ fn stepWarnParticles(self: *Matrix) void {
                 filled += 1;
                 continue;
             }
+            // Pick kind: if both channels enabled, ~40% are text tags
+            // (the rest are single ⚠ icons). Otherwise force the
+            // enabled kind.
+            const pick_text: bool = if (want_text and want_icons)
+                (self.terminal_buffer.random.float(f32) < 0.40)
+            else
+                want_text;
+            p.kind = if (pick_text) .text else .icon;
+
+            const row = self.terminal_buffer.random.uintLessThan(usize, buf_h);
             const cols: usize = @max(1, buf_w / 2);
             const col = self.terminal_buffer.random.uintLessThan(usize, cols);
-            const row = self.terminal_buffer.random.uintLessThan(usize, buf_h);
             p.alive = true;
             p.x = @intCast(col * 2);
             p.y = @intCast(row);
@@ -1202,6 +1232,7 @@ fn stepWarnParticles(self: *Matrix) void {
             p.vy = self.speed_min + self.terminal_buffer.random.float(f32) * span;
             p.accum = 0;
             p.ch = 0x26A0; // ⚠
+            p.text_idx = @intCast(self.terminal_buffer.random.uintLessThan(usize, WARN_TEXTS.len));
             const max_delay: u16 = @max(1, self.warn_release_delay_max);
             p.fall_delay = self.terminal_buffer.random.uintLessThan(u16, max_delay);
             filled += 1;
@@ -1236,31 +1267,29 @@ fn stepWarnParticles(self: *Matrix) void {
     }
 }
 
-// Big bracketed text painted near the top of the screen while
-// warn_mode is on. Independent toggle so users who only want the
-// border can disable just this.
-fn drawWarningText(self: *const Matrix) void {
-    if (!self.warn_enabled or !self.warn_text_show) return;
-    if (!self.warn_mode) return;
-    const buf_w = self.terminal_buffer.width;
-    if (buf_w == 0) return;
-    const text = "⚠  [  W A R N I N G  ]  ⚠";
-    const text_w = TerminalBuffer.strWidth(text);
-    if (text_w >= buf_w) return;
-    const x = (buf_w - text_w) / 2;
-    const y: usize = 2; // near top, leaves header line above
-    TerminalBuffer.drawText(text, x, y, WARN_FG, 0x00000000);
-}
 
 fn drawWarnParticles(self: *const Matrix) void {
-    if (!self.warn_enabled or !self.warn_icons_show) return;
+    if (!self.warn_enabled) return;
     const buf_w = self.terminal_buffer.width;
     const buf_h = self.terminal_buffer.height;
     for (self.warn_particles) |p| {
         if (!p.alive) continue;
-        if (p.x >= buf_w or p.y >= buf_h) continue;
-        const cell = Cell.init(p.ch, WARN_FG, 0x00000000);
-        cell.put(p.x, p.y);
+        if (p.y >= buf_h) continue;
+        switch (p.kind) {
+            .icon => {
+                if (!self.warn_icons_show) continue;
+                if (p.x >= buf_w) continue;
+                Cell.init(p.ch, WARN_FG, 0x00000000).put(p.x, p.y);
+            },
+            .text => {
+                if (!self.warn_text_show) continue;
+                const idx: usize = @min(@as(usize, p.text_idx), WARN_TEXTS.len - 1);
+                const text = WARN_TEXTS[idx];
+                const tw = TerminalBuffer.strWidth(text);
+                if (p.x >= buf_w or p.x + tw > buf_w) continue;
+                TerminalBuffer.drawText(text, p.x, p.y, WARN_FG, 0x00000000);
+            },
+        }
     }
 }
 

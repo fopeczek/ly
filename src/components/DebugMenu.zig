@@ -175,7 +175,7 @@ pub const Item = enum {
             .action_test_full_intro => "Replay the full boot\nintro (prompt + audio\n+ ack). Behaves exactly\nas if you'd just booted.",
             .danger_enabled => "Master toggle for the\nboth-shifts visual\nfeedback. Off = no\nborder colour change,\nno text, no warning\nicons regardless of\nthe sub-toggles.",
             .danger_border_show => "Flip the login box\nborder to red while\nboth shifts are held.",
-            .danger_text_show => "Show the [WARNING]\nbanner near the top\nof the screen while\nboth shifts are held.",
+            .danger_text_show => "Scatter short red\n[WARNING]/[WARN]/[!!]\ntags across the rain\nwhile both shifts are\nheld; they fall with\nthe rain on release.",
             .danger_icons_show => "Spawn red \xe2\x9a\xa0 icons\nscattered across the\nscreen while both\nshifts are held; they\nfall with the rain\non release.",
             .danger_icon_cap => "How many \xe2\x9a\xa0 icons\nshould appear at\nonce. 0 = none.\nClamped to 48.",
             .danger_release_delay => "Max random per-icon\ndelay (frames) before\nstart of fall after\nshift release. Higher\n= more staggered drain.",
