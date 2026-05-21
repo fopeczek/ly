@@ -4,13 +4,16 @@
 #
 # Dual-mode audio:
 #   * REAL BOOT: ly-dm runs as root; pipewire/wireplumber haven't
-#     started for any user yet. raw ALSA default device IS the
-#     hardware. mpv --audio-device=alsa works.
+#     started for any user yet. The ALSA "default" PCM is configured
+#     on this machine to route through the pipewire shim, so opening
+#     "default" without pipewire running fails with "Host is down"
+#     (proven via /var/log/alterra-jingle.log on the 2026-05-21
+#     boot). Bypass with the hardware-direct sysdefault PCM, which
+#     speaks straight to the codec without the shim.
 #   * TEST (tty3 harness): ly-dm runs as root inside kmscon while
 #     sway+pipewire are LIVE on tty1 owned by uid 1000. Pipewire
-#     holds ALSA exclusive → mpv as root sees EBUSY ("Host is down"
-#     in ALSA error vocabulary). We detect the user pipewire socket
-#     and route mpv through it as the user, sharing the same audio
+#     holds ALSA exclusive. We detect the user pipewire socket and
+#     route mpv through it as the user, sharing the same audio
 #     stack their session uses.
 #
 # Daemonisation: nohup+disown so the parent (ly-dm) reaps the bash
@@ -18,8 +21,6 @@
 #
 # DIAGNOSTIC LOG: every invocation appends to /var/log/alterra-jingle.log
 # with a timestamp + which path was taken + mpv's full stdout/stderr.
-# Helpful when audio fails silently at real boot (where output is
-# otherwise lost to /dev/null).
 
 set -u
 
@@ -27,6 +28,12 @@ LOG=/var/log/alterra-jingle.log
 USER_UID=1000
 USER_NAME=mikolaj
 JINGLE=/usr/local/share/alterra/jingle.mp3
+
+# Hardware-direct ALSA device. `aplay -L` on this machine reports
+# this as the only sysdefault entry. Bypasses the pipewire-alsa
+# shim that "default" routes through, so opening it succeeds even
+# when no audio server is running.
+ALSA_HW_DEVICE="alsa/sysdefault:CARD=Generic_1"
 
 ts() { date +"%Y-%m-%dT%H:%M:%S.%3N"; }
 
@@ -45,8 +52,8 @@ if [ -S "/run/user/$USER_UID/pipewire-0" ] || \
         mpv --no-config --no-video "$JINGLE" \
         </dev/null >> "$LOG" 2>&1 &
 else
-    echo "$(ts) [launcher] path=raw-alsa (no user session detected)" >> "$LOG"
-    nohup mpv --no-config --no-video --audio-device=alsa "$JINGLE" \
+    echo "$(ts) [launcher] path=raw-alsa device=$ALSA_HW_DEVICE" >> "$LOG"
+    nohup mpv --no-config --no-video --audio-device="$ALSA_HW_DEVICE" "$JINGLE" \
         </dev/null >> "$LOG" 2>&1 &
 fi
 disown
