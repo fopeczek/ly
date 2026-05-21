@@ -70,6 +70,13 @@ pub const Item = enum {
     boot_jingle_enabled,
     action_test_jingle_sound,
     action_test_full_intro,
+    // Danger tab (both-shifts visual feedback)
+    danger_enabled,
+    danger_border_show,
+    danger_text_show,
+    danger_icons_show,
+    danger_icon_cap,
+    danger_release_delay,
 
     pub fn label(self: Item) []const u8 {
         // Labels are padded to 16 chars so the value column lines
@@ -112,6 +119,13 @@ pub const Item = enum {
             .boot_jingle_enabled => "boot jingle     ",
             .action_test_jingle_sound => "[ test sound    ]",
             .action_test_full_intro => "[ replay intro  ]",
+            // Danger
+            .danger_enabled => "feedback        ",
+            .danger_border_show => "red box border  ",
+            .danger_text_show => "[WARNING] text  ",
+            .danger_icons_show => "warn icons      ",
+            .danger_icon_cap => "icon count      ",
+            .danger_release_delay => "release stagger ",
         };
     }
 
@@ -159,6 +173,12 @@ pub const Item = enum {
             .boot_jingle_enabled => "Play the boot jingle\n+ silence prompt at\ngreeter init?\nUse \xe2\x86\x90/\xe2\x86\x92 to toggle.\nPersists across reboots.",
             .action_test_jingle_sound => "Play the jingle audio\nonce, right now. No\nvisual prompt.",
             .action_test_full_intro => "Replay the full boot\nintro (prompt + audio\n+ ack). Behaves exactly\nas if you'd just booted.",
+            .danger_enabled => "Master toggle for the\nboth-shifts visual\nfeedback. Off = no\nborder colour change,\nno text, no warning\nicons regardless of\nthe sub-toggles.",
+            .danger_border_show => "Flip the login box\nborder to red while\nboth shifts are held.",
+            .danger_text_show => "Show the [WARNING]\nbanner near the top\nof the screen while\nboth shifts are held.",
+            .danger_icons_show => "Spawn red \xe2\x9a\xa0 icons\nscattered across the\nscreen while both\nshifts are held; they\nfall with the rain\non release.",
+            .danger_icon_cap => "How many \xe2\x9a\xa0 icons\nshould appear at\nonce. 0 = none.\nClamped to 48.",
+            .danger_release_delay => "Max random per-icon\ndelay (frames) before\nstart of fall after\nshift release. Higher\n= more staggered drain.",
         };
     }
 
@@ -177,6 +197,7 @@ pub const Tab = enum {
     lockout,
     animations,
     bootup,
+    danger,
 
     pub fn name(self: Tab) []const u8 {
         return switch (self) {
@@ -186,6 +207,7 @@ pub const Tab = enum {
             .lockout => "Lockout",
             .animations => "Animations",
             .bootup => "Bootup",
+            .danger => "Danger",
         };
     }
 
@@ -219,11 +241,19 @@ pub const Tab = enum {
                 .action_test_jingle_sound,
                 .action_test_full_intro,
             },
+            .danger => &[_]Item{
+                .danger_enabled,
+                .danger_border_show,
+                .danger_text_show,
+                .danger_icons_show,
+                .danger_icon_cap,
+                .danger_release_delay,
+            },
         };
     }
 };
 
-const TABS = [_]Tab{ .rain, .glitches, .errors, .lockout, .animations, .bootup };
+const TABS = [_]Tab{ .rain, .glitches, .errors, .lockout, .animations, .bootup, .danger };
 
 // Two-mode navigation. In .nav, arrow keys cycle items / tabs and
 // Enter "opens" the selected item for editing. In .edit, up/down
@@ -433,6 +463,12 @@ pub fn adjustScaled(self: *DebugMenu, m: *Matrix, delta: i8, step_scale: f32) Ac
                 r.boot_jingle_prefs_changed = true;
             }
         },
+        .danger_enabled => { m.warn_enabled = !m.warn_enabled; },
+        .danger_border_show => { m.warn_border_show = !m.warn_border_show; },
+        .danger_text_show => { m.warn_text_show = !m.warn_text_show; },
+        .danger_icons_show => { m.warn_icons_show = !m.warn_icons_show; },
+        .danger_icon_cap => m.warn_icon_cap = u8_adjust(m.warn_icon_cap, int_step, 0, 48),
+        .danger_release_delay => m.warn_release_delay_max = u16_adjust(m.warn_release_delay_max, int_step, 0, 600),
         .readout_locked, .readout_auth_fails => {},
         .lockout_animation => {
             // Cycle through animation types regardless of delta sign.
@@ -535,6 +571,12 @@ pub fn formatValue(
         .readout_auth_fails => try std.fmt.bufPrint(buf, "{d}", .{auth_fails}),
         .lockout_animation => try std.fmt.bufPrint(buf, "{s}", .{lockdown_anim_name}),
         .boot_jingle_enabled => try std.fmt.bufPrint(buf, "<unavail>", .{}),
+        .danger_enabled => try std.fmt.bufPrint(buf, "{s}", .{if (m.warn_enabled) "yes" else "no"}),
+        .danger_border_show => try std.fmt.bufPrint(buf, "{s}", .{if (m.warn_border_show) "yes" else "no"}),
+        .danger_text_show => try std.fmt.bufPrint(buf, "{s}", .{if (m.warn_text_show) "yes" else "no"}),
+        .danger_icons_show => try std.fmt.bufPrint(buf, "{s}", .{if (m.warn_icons_show) "yes" else "no"}),
+        .danger_icon_cap => try std.fmt.bufPrint(buf, "{d}", .{m.warn_icon_cap}),
+        .danger_release_delay => try std.fmt.bufPrint(buf, "{d}f (~{d:.1}s)", .{ m.warn_release_delay_max, @as(f32, @floatFromInt(m.warn_release_delay_max)) / 50.0 }),
     };
 }
 
@@ -773,9 +815,17 @@ test "Bootup tab actions classified correctly" {
     try testing.expect(Item.action_test_full_intro.isAction());
 }
 
-test "TABS includes bootup as the last tab" {
-    try testing.expectEqual(@as(usize, 6), TABS.len);
+test "TABS includes bootup and danger as the last tabs" {
+    try testing.expectEqual(@as(usize, 7), TABS.len);
     try testing.expectEqual(Tab.bootup, TABS[5]);
+    try testing.expectEqual(Tab.danger, TABS[6]);
+}
+
+test "Danger tab exposes six items in expected order" {
+    const items = Tab.items(.danger);
+    try testing.expectEqual(@as(usize, 6), items.len);
+    try testing.expectEqual(Item.danger_enabled, items[0]);
+    try testing.expectEqual(Item.danger_release_delay, items[5]);
 }
 
 test "u8_adjust clamps to bounds" {

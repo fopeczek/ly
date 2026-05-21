@@ -114,14 +114,11 @@ pub const WarnParticle = struct {
     ch: u32 = 0x26A0, // ⚠ WARNING SIGN
 };
 
-// Cap on simultaneous warning particles. 24 is enough density to read
-// as "the rain has warnings in it" without filling the screen.
-const WARN_CAP: usize = 24;
-
-// Max random per-particle release delay (frames). 150 ≈ 3s at 50fps —
-// the slowest-to-start particle takes this long to begin falling
-// after the user releases both shifts.
-const WARN_RELEASE_DELAY_MAX: u16 = 150;
+// Hard upper bound on warning particle slots. Runtime warn_icon_cap
+// clamps the active count below this. Keeping the array fixed-size at
+// the max means changing the cap at runtime is a one-line write, no
+// reallocation.
+const WARN_MAX_CAP: usize = 48;
 
 // Warning glyph foreground colour. Same red used by the box border
 // when both shifts are held.
@@ -328,10 +325,24 @@ overlay_scramble_prob: f32,
 // the user releasing both shifts smoothly returns to a quiet rain.
 warn_mode: bool = false,
 // Previous-frame warn_mode value. Used to detect the rising edge
-// (false → true) so we can burst-fill all WARN_CAP slots in one
+// (false → true) so we can burst-fill all warn_icon_cap slots in one
 // frame for an instant danger-field appearance.
 prev_warn_mode: bool = false,
-warn_particles: [WARN_CAP]WarnParticle = [_]WarnParticle{.{}} ** WARN_CAP,
+warn_particles: [WARN_MAX_CAP]WarnParticle = [_]WarnParticle{.{}} ** WARN_MAX_CAP,
+// Master kill-switch for the entire both-shifts danger feedback.
+// When false, none of border/text/icons paint and warn_mode stays
+// false regardless of input state.
+warn_enabled: bool = true,
+// Independent visibility toggles for each feedback channel.
+warn_border_show: bool = true,
+warn_text_show: bool = true,
+warn_icons_show: bool = true,
+// Active particle slot count. Clamped to WARN_MAX_CAP. 0 = none.
+warn_icon_cap: u8 = 24,
+// Max random per-particle release delay (frames). The slowest-to-
+// start particle takes this long to begin falling after the user
+// releases both shifts. 150 ≈ 3s at 50fps. Zero = synchronous fall.
+warn_release_delay_max: u16 = 150,
 // Shift-watch hooks. Matrix.update is called every frame, so we use
 // it to poll bothShiftsHeld(). When true, flip warn_mode (drives the
 // ⚠ particle spawn) AND overwrite *shift_watch_box_border_fg with
@@ -949,6 +960,12 @@ fn saveImpl(self: *Matrix, io: std.Io) !void {
     try w.interface.print("overlay_decay_frames={d}\n", .{self.overlay_decay_frames});
     try w.interface.print("overlay_drop_peak_prob={d:.4}\n", .{self.overlay_drop_peak_prob});
     try w.interface.print("overlay_scramble_prob={d:.4}\n", .{self.overlay_scramble_prob});
+    try w.interface.print("warn_enabled={d}\n", .{@as(u8, if (self.warn_enabled) 1 else 0)});
+    try w.interface.print("warn_border_show={d}\n", .{@as(u8, if (self.warn_border_show) 1 else 0)});
+    try w.interface.print("warn_text_show={d}\n", .{@as(u8, if (self.warn_text_show) 1 else 0)});
+    try w.interface.print("warn_icons_show={d}\n", .{@as(u8, if (self.warn_icons_show) 1 else 0)});
+    try w.interface.print("warn_icon_cap={d}\n", .{self.warn_icon_cap});
+    try w.interface.print("warn_release_delay_max={d}\n", .{self.warn_release_delay_max});
     try w.interface.flush();
 }
 
@@ -1020,6 +1037,12 @@ fn loadImpl(self: *Matrix, io: std.Io) !void {
         else if (std.mem.eql(u8, key, "overlay_decay_frames")) self.overlay_decay_frames = std.fmt.parseInt(u16, val, 10) catch self.overlay_decay_frames
         else if (std.mem.eql(u8, key, "overlay_drop_peak_prob")) self.overlay_drop_peak_prob = std.fmt.parseFloat(f32, val) catch self.overlay_drop_peak_prob
         else if (std.mem.eql(u8, key, "overlay_scramble_prob")) self.overlay_scramble_prob = std.fmt.parseFloat(f32, val) catch self.overlay_scramble_prob
+        else if (std.mem.eql(u8, key, "warn_enabled")) self.warn_enabled = (std.fmt.parseInt(u8, val, 10) catch 1) != 0
+        else if (std.mem.eql(u8, key, "warn_border_show")) self.warn_border_show = (std.fmt.parseInt(u8, val, 10) catch 1) != 0
+        else if (std.mem.eql(u8, key, "warn_text_show")) self.warn_text_show = (std.fmt.parseInt(u8, val, 10) catch 1) != 0
+        else if (std.mem.eql(u8, key, "warn_icons_show")) self.warn_icons_show = (std.fmt.parseInt(u8, val, 10) catch 1) != 0
+        else if (std.mem.eql(u8, key, "warn_icon_cap")) self.warn_icon_cap = std.fmt.parseInt(u8, val, 10) catch self.warn_icon_cap
+        else if (std.mem.eql(u8, key, "warn_release_delay_max")) self.warn_release_delay_max = std.fmt.parseInt(u16, val, 10) catch self.warn_release_delay_max
         // overlay_fall_step removed in 2026-05 (hardcoded step=1).
         // Silently ignore the key in old prefs files — no else-if so
         // it falls into the unknown-key drop path above.
@@ -1129,9 +1152,10 @@ fn draw(self: *Matrix) void {
         self.renderColumn(x, buf_width, buf_height);
     }
 
-    // Warning particles render on top of the rain so they survive
-    // any per-cell blanking inside renderColumn.
+    // Warning particles + [WARNING] banner render on top of the rain
+    // so they survive any per-cell blanking inside renderColumn.
     self.drawWarnParticles();
+    self.drawWarningText();
 }
 
 // Step + spawn warning particles. Three-phase behaviour:
@@ -1159,9 +1183,15 @@ fn stepWarnParticles(self: *Matrix) void {
     self.prev_warn_mode = self.warn_mode;
 
     if (rising_edge) {
-        // Burst-fill every empty slot this frame.
+        // Burst-fill first warn_icon_cap empty slots this frame.
+        const cap: usize = @min(@as(usize, self.warn_icon_cap), WARN_MAX_CAP);
+        var filled: usize = 0;
         for (&self.warn_particles) |*p| {
-            if (p.alive) continue;
+            if (filled >= cap) break;
+            if (p.alive) {
+                filled += 1;
+                continue;
+            }
             const cols: usize = @max(1, buf_w / 2);
             const col = self.terminal_buffer.random.uintLessThan(usize, cols);
             const row = self.terminal_buffer.random.uintLessThan(usize, buf_h);
@@ -1172,7 +1202,9 @@ fn stepWarnParticles(self: *Matrix) void {
             p.vy = self.speed_min + self.terminal_buffer.random.float(f32) * span;
             p.accum = 0;
             p.ch = 0x26A0; // ⚠
-            p.fall_delay = self.terminal_buffer.random.uintLessThan(u16, WARN_RELEASE_DELAY_MAX);
+            const max_delay: u16 = @max(1, self.warn_release_delay_max);
+            p.fall_delay = self.terminal_buffer.random.uintLessThan(u16, max_delay);
+            filled += 1;
         }
         return;
     }
@@ -1204,7 +1236,24 @@ fn stepWarnParticles(self: *Matrix) void {
     }
 }
 
+// Big bracketed text painted near the top of the screen while
+// warn_mode is on. Independent toggle so users who only want the
+// border can disable just this.
+fn drawWarningText(self: *const Matrix) void {
+    if (!self.warn_enabled or !self.warn_text_show) return;
+    if (!self.warn_mode) return;
+    const buf_w = self.terminal_buffer.width;
+    if (buf_w == 0) return;
+    const text = "⚠  [  W A R N I N G  ]  ⚠";
+    const text_w = TerminalBuffer.strWidth(text);
+    if (text_w >= buf_w) return;
+    const x = (buf_w - text_w) / 2;
+    const y: usize = 2; // near top, leaves header line above
+    TerminalBuffer.drawText(text, x, y, WARN_FG, 0x00000000);
+}
+
 fn drawWarnParticles(self: *const Matrix) void {
+    if (!self.warn_enabled or !self.warn_icons_show) return;
     const buf_w = self.terminal_buffer.width;
     const buf_h = self.terminal_buffer.height;
     for (self.warn_particles) |p| {
@@ -1351,15 +1400,22 @@ fn update(self: *Matrix, _: *anyopaque) !void {
 
     // Per-frame shift-watch poll. When the user holds both shifts
     // (priming the shutdown/reboot keybind), flip warn_mode on so
-    // ⚠ particles start spawning into the rain, and overwrite the
-    // login box's border colour with danger red. Released = warn_mode
-    // off (no new spawns; existing particles finish their fall) and
-    // border restored to its config-default colour.
+    // ⚠ particles + [WARNING] banner paint, and overwrite the login
+    // box's border colour with danger red. Released = warn_mode off
+    // (existing particles finish their fall) and border restored.
+    //
+    // warn_enabled master gate suppresses every channel — when off,
+    // warn_mode stays false and the border keeps its config colour
+    // regardless of input.
     if (self.shift_watch_input_state) |is| {
-        const both = is.bothShiftsHeld();
+        const both = self.warn_enabled and is.bothShiftsHeld();
         self.warn_mode = both;
         if (self.shift_watch_box_border_fg) |p| {
-            p.* = if (both) self.shift_watch_border_danger else self.shift_watch_border_normal;
+            if (both and self.warn_border_show) {
+                p.* = self.shift_watch_border_danger;
+            } else {
+                p.* = self.shift_watch_border_normal;
+            }
         }
     }
 }
