@@ -107,6 +107,10 @@ pub const WarnParticle = struct {
     // belong to the rain rather than a separate animation.
     vy: f32 = 0,
     accum: f32 = 0,
+    // Frames to wait before this particle starts falling after the
+    // shift gate releases. Random per-particle so the drain looks
+    // organic instead of every ⚠ moving in lockstep.
+    fall_delay: u16 = 0,
     ch: u32 = 0x26A0, // ⚠ WARNING SIGN
 };
 
@@ -114,9 +118,10 @@ pub const WarnParticle = struct {
 // as "the rain has warnings in it" without filling the screen.
 const WARN_CAP: usize = 24;
 
-// Per-frame probability of spawning a new warning particle while
-// warn_mode is on.
-const WARN_SPAWN_PROB: f32 = 0.35;
+// Max random per-particle release delay (frames). 150 ≈ 3s at 50fps —
+// the slowest-to-start particle takes this long to begin falling
+// after the user releases both shifts.
+const WARN_RELEASE_DELAY_MAX: u16 = 150;
 
 // Warning glyph foreground colour. Same red used by the box border
 // when both shifts are held.
@@ -322,6 +327,10 @@ overlay_scramble_prob: f32,
 // but doesn't kill existing particles — they finish their fall, so
 // the user releasing both shifts smoothly returns to a quiet rain.
 warn_mode: bool = false,
+// Previous-frame warn_mode value. Used to detect the rising edge
+// (false → true) so we can burst-fill all WARN_CAP slots in one
+// frame for an instant danger-field appearance.
+prev_warn_mode: bool = false,
 warn_particles: [WARN_CAP]WarnParticle = [_]WarnParticle{.{}} ** WARN_CAP,
 // Shift-watch hooks. Matrix.update is called every frame, so we use
 // it to poll bothShiftsHeld(). When true, flip warn_mode (drives the
@@ -1125,28 +1134,32 @@ fn draw(self: *Matrix) void {
     self.drawWarnParticles();
 }
 
-// Step + spawn warning particles. Two-mode behaviour:
+// Step + spawn warning particles. Three-phase behaviour:
 //
-//   warn_mode TRUE  → particles FREEZE in place. They keep spawning
-//                     at random positions across the screen until the
-//                     cap is reached, building a static "danger field"
-//                     while the user holds the gate.
+//   rising edge      → burst-fill every empty slot in one frame so
+//   (false → true)     the danger field appears INSTANTLY. Each
+//                      particle gets a random fall_delay in
+//                      [0, WARN_RELEASE_DELAY_MAX] so on release the
+//                      drain is staggered rather than synchronized.
 //
-//   warn_mode FALSE → no new spawns. Existing particles advance at
-//                     rain-column speeds and exit off the bottom of
-//                     the screen. The user sees the danger field
-//                     drain away as the rain.
+//   warn_mode TRUE   → field is frozen. No movement, no top-up
+//                      (cap is full from the rising edge).
+//
+//   warn_mode FALSE  → each particle ticks down its fall_delay; once
+//                      at zero it advances at its pre-baked vy and
+//                      exits off the bottom. Random delays mean
+//                      different particles start falling at different
+//                      times, making the drain look organic.
 fn stepWarnParticles(self: *Matrix) void {
     const buf_w = self.terminal_buffer.width;
     const buf_h = self.terminal_buffer.height;
     if (buf_w == 0 or buf_h == 0) return;
 
-    if (self.warn_mode) {
-        // Frozen field — only spawn new particles, don't advance
-        // existing ones. They appear at random (col, row) so the
-        // visual reads as "warnings injected into the rain layer"
-        // rather than dripping from the top.
-        if (self.terminal_buffer.random.float(f32) >= WARN_SPAWN_PROB) return;
+    const rising_edge = self.warn_mode and !self.prev_warn_mode;
+    self.prev_warn_mode = self.warn_mode;
+
+    if (rising_edge) {
+        // Burst-fill every empty slot this frame.
         for (&self.warn_particles) |*p| {
             if (p.alive) continue;
             const cols: usize = @max(1, buf_w / 2);
@@ -1155,22 +1168,29 @@ fn stepWarnParticles(self: *Matrix) void {
             p.alive = true;
             p.x = @intCast(col * 2);
             p.y = @intCast(row);
-            // Pre-compute fall velocity so when the gate releases
-            // the field drains at varied rain-like speeds.
             const span: f32 = @max(0.01, self.speed_max - self.speed_min);
             p.vy = self.speed_min + self.terminal_buffer.random.float(f32) * span;
             p.accum = 0;
             p.ch = 0x26A0; // ⚠
-            return;
+            p.fall_delay = self.terminal_buffer.random.uintLessThan(u16, WARN_RELEASE_DELAY_MAX);
         }
         return;
     }
 
-    // warn_mode just flipped off (or has been off) — advance each
-    // particle at its pre-baked vy. Particles that exit the bottom
-    // free their slot.
+    if (self.warn_mode) {
+        // Held — field stays frozen; no top-up because the rising
+        // edge already filled every slot.
+        return;
+    }
+
+    // Released — advance, but each particle waits out its own
+    // fall_delay before starting to move.
     for (&self.warn_particles) |*p| {
         if (!p.alive) continue;
+        if (p.fall_delay > 0) {
+            p.fall_delay -= 1;
+            continue;
+        }
         p.accum += p.vy;
         while (p.accum >= 1.0) {
             p.accum -= 1.0;
