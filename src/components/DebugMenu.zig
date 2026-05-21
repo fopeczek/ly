@@ -206,18 +206,14 @@ pub const Tab = enum {
     danger,
 
     pub fn name(self: Tab) []const u8 {
-        // Short labels so the tab strip stays inside the panel
-        // without bumping panel_w on every new tab. Reasonable
-        // upper bound: 7 tabs * 7 chars (including brackets) = 49,
-        // well under panel_w=66.
         return switch (self) {
             .rain => "Rain",
-            .glitches => "Glitch",
-            .errors => "Errs",
-            .lockout => "Lock",
-            .animations => "Anim",
-            .bootup => "Boot",
-            .danger => "Warn",
+            .glitches => "Glitches",
+            .errors => "Errors",
+            .lockout => "Lockout",
+            .animations => "Animations",
+            .bootup => "Bootup",
+            .danger => "Danger",
         };
     }
 
@@ -677,30 +673,52 @@ fn drawWidget(self: *DebugMenu) void {
     // Title strip
     putStr(px + 2, py, " SETTINGS ", COL_TAB_ACTIVE, COL_BG);
 
-    // Tabs row at y = py + 2
-    var tx: usize = px + 2;
-    inline for (TABS, 0..) |tab, idx| {
+    // Tab strip — auto-wraps onto extra rows when the joined names
+    // exceed the panel's interior width. Two-pass layout: first walk
+    // every tab to assign (row, x-offset); second pass renders. Keeps
+    // tab names descriptive without forcing panel_w to grow on every
+    // new tab.
+    const max_row_w: usize = panel_w - 4; // leave 2-char margin on each side
+    var tab_row_assign: [TABS.len]u8 = undefined;
+    var tab_x_assign: [TABS.len]usize = undefined;
+    var tab_rows: u8 = 1;
+    var cur_row_w: usize = 0;
+    for (TABS, 0..) |tab_iter, idx| {
+        const tab_w = 2 + tab_iter.name().len; // "[Name]"
+        if (cur_row_w > 0 and cur_row_w + tab_w > max_row_w) {
+            tab_rows += 1;
+            cur_row_w = 0;
+        }
+        tab_row_assign[idx] = tab_rows - 1;
+        tab_x_assign[idx] = cur_row_w;
+        cur_row_w += tab_w;
+    }
+    for (TABS, 0..) |tab_iter, idx| {
         const is_active = idx == self.tab_idx;
         const col_fg: u32 = if (is_active) COL_TAB_ACTIVE else COL_TAB_INACTIVE;
-        const tab_label = tab.name();
-        putStr(tx, py + 2, "[", col_fg, COL_BG);
-        putStr(tx + 1, py + 2, tab_label, col_fg, COL_BG);
-        putStr(tx + 1 + tab_label.len, py + 2, "]", col_fg, COL_BG);
-        tx += 3 + tab_label.len;
+        const tab_label = tab_iter.name();
+        const tx_base = px + 2 + tab_x_assign[idx];
+        const ty = py + 2 + @as(usize, tab_row_assign[idx]);
+        putStr(tx_base, ty, "[", col_fg, COL_BG);
+        putStr(tx_base + 1, ty, tab_label, col_fg, COL_BG);
+        putStr(tx_base + 1 + tab_label.len, ty, "]", col_fg, COL_BG);
     }
 
-    // Horizontal separator under tabs
+    // Horizontal separator under the last tab row.
+    const sep_y = py + 2 + @as(usize, tab_rows);
     var sep_x: usize = 1;
     while (sep_x < panel_w - 1) : (sep_x += 1) {
-        Cell.init(0x2500, COL_BORDER, COL_BG).put(px + sep_x, py + 3);
+        Cell.init(0x2500, COL_BORDER, COL_BG).put(px + sep_x, sep_y);
     }
 
-    // Items list starts y = py + 4
+    // Items list starts one row below the separator. Each extra tab
+    // row eats one row of items space.
+    const items_start_y = sep_y + 1;
     const tab = self.currentTab();
     const items = tab.items();
     var val_buf: [32]u8 = undefined;
     for (items, 0..) |item, idx| {
-        const row_y = py + 4 + idx;
+        const row_y = items_start_y + idx;
         // -3 instead of -2: reserve TWO inner rows above the border —
         // one for the Shift/Ctrl modifier hint, one for the nav hint.
         if (row_y >= py + panel_h - 3) break;
