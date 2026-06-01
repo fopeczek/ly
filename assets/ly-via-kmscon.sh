@@ -84,7 +84,7 @@ while :; do
 
     /usr/bin/kmscon \
         --vt="$VT_NUM" \
-        --seats=seat0 \
+        \
         --gpus=all \
         --no-switchvt \
         --login \
